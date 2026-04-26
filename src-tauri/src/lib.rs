@@ -459,26 +459,104 @@ fn mount_disc_image(
     image_path: String,
     state: tauri::State<MountedImages>,
 ) -> Result<MountResult, String> {
-    let out = Command::new("hdiutil")
-        .args(["attach", &image_path])
-        .output()
-        .map_err(|e| format!("hdiutil failed: {e}"))?;
+    #[cfg(target_os = "macos")]
+    {
+        let out = Command::new("hdiutil")
+            .args(["attach", &image_path])
+            .output()
+            .map_err(|e| format!("hdiutil failed: {e}"))?;
 
-    if !out.status.success() {
-        return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
-    }
-
-    let text = String::from_utf8_lossy(&out.stdout);
-    for line in text.lines().rev() {
-        let parts: Vec<&str> = line.splitn(3, '\t').collect();
-        if parts.len() == 3 && !parts[2].trim().is_empty() {
-            let device = parts[0].trim().to_string();
-            let mount_point = parts[2].trim().to_string();
-            state.0.lock().unwrap().push(device.clone());
-            return Ok(MountResult { mount_point, device });
+        if !out.status.success() {
+            return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
         }
+
+        let text = String::from_utf8_lossy(&out.stdout);
+        for line in text.lines().rev() {
+            let parts: Vec<&str> = line.splitn(3, '\t').collect();
+            if parts.len() == 3 && !parts[2].trim().is_empty() {
+                let device = parts[0].trim().to_string();
+                let mount_point = parts[2].trim().to_string();
+                state.0.lock().unwrap().push(device.clone());
+                return Ok(MountResult { mount_point, device });
+            }
+        }
+        Err("Could not determine mount point".to_string())
     }
-    Err("Could not determine mount point".to_string())
+
+    #[cfg(target_os = "windows")]
+    {
+        let escaped = image_path.replace('\'', "''");
+        let script = format!(
+            "$d = Mount-DiskImage -ImagePath '{escaped}' -PassThru; ($d | Get-Volume).DriveLetter"
+        );
+        let out = Command::new("powershell")
+            .args(["-NoProfile", "-Command", &script])
+            .output()
+            .map_err(|e| format!("Mount-DiskImage failed: {e}"))?;
+
+        if !out.status.success() {
+            return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
+        }
+
+        let letter = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if letter.is_empty() {
+            return Err("Could not determine drive letter".to_string());
+        }
+        let mount_point = format!("{letter}:\\");
+        state.0.lock().unwrap().push(image_path.clone());
+        Ok(MountResult { mount_point, device: image_path })
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let loop_out = Command::new("udisksctl")
+            .args(["loop-setup", "-f", &image_path])
+            .output()
+            .map_err(|e| format!("udisksctl loop-setup failed: {e}"))?;
+
+        if !loop_out.status.success() {
+            return Err(String::from_utf8_lossy(&loop_out.stderr).trim().to_string());
+        }
+
+        // Output: "Mapped file /path as /dev/loop0."
+        let loop_text = String::from_utf8_lossy(&loop_out.stdout);
+        let loop_device = loop_text
+            .split_whitespace()
+            .last()
+            .unwrap_or("")
+            .trim_end_matches('.')
+            .to_string();
+
+        if !loop_device.starts_with("/dev/loop") {
+            return Err(format!("Unexpected loop-setup output: {loop_text}"));
+        }
+
+        let mount_out = Command::new("udisksctl")
+            .args(["mount", "-b", &loop_device])
+            .output()
+            .map_err(|e| format!("udisksctl mount failed: {e}"))?;
+
+        if !mount_out.status.success() {
+            return Err(String::from_utf8_lossy(&mount_out.stderr).trim().to_string());
+        }
+
+        // Output: "Mounted /dev/loop0 at /media/user/label."
+        let mount_text = String::from_utf8_lossy(&mount_out.stdout);
+        let mount_point = mount_text
+            .split(" at ")
+            .nth(1)
+            .unwrap_or("")
+            .trim()
+            .trim_end_matches('.')
+            .to_string();
+
+        if mount_point.is_empty() {
+            return Err("Could not determine mount point".to_string());
+        }
+
+        state.0.lock().unwrap().push(loop_device.clone());
+        Ok(MountResult { mount_point, device: loop_device })
+    }
 }
 
 #[tauri::command]
@@ -486,13 +564,43 @@ fn unmount_disc_image(
     device: String,
     state: tauri::State<MountedImages>,
 ) -> Result<(), String> {
-    let out = Command::new("hdiutil")
-        .args(["detach", &device, "-quiet"])
-        .output()
-        .map_err(|e| format!("hdiutil detach failed: {e}"))?;
+    #[cfg(target_os = "macos")]
+    {
+        let out = Command::new("hdiutil")
+            .args(["detach", &device, "-quiet"])
+            .output()
+            .map_err(|e| format!("hdiutil detach failed: {e}"))?;
 
-    if !out.status.success() {
-        return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
+        if !out.status.success() {
+            return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let escaped = device.replace('\'', "''");
+        let script = format!("Dismount-DiskImage -ImagePath '{escaped}'");
+        let out = Command::new("powershell")
+            .args(["-NoProfile", "-Command", &script])
+            .output()
+            .map_err(|e| format!("Dismount-DiskImage failed: {e}"))?;
+
+        if !out.status.success() {
+            return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let _ = Command::new("udisksctl").args(["unmount", "-b", &device]).output();
+        let out = Command::new("udisksctl")
+            .args(["loop-delete", "-b", &device])
+            .output()
+            .map_err(|e| format!("udisksctl loop-delete failed: {e}"))?;
+
+        if !out.status.success() {
+            return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
+        }
     }
 
     state.0.lock().unwrap().retain(|d| d != &device);
@@ -500,10 +608,26 @@ fn unmount_disc_image(
 }
 
 fn detach_all(devices: &[String]) {
+    #[cfg(target_os = "macos")]
     for device in devices {
         let _ = Command::new("hdiutil")
             .args(["detach", device, "-quiet", "-force"])
             .output();
+    }
+
+    #[cfg(target_os = "windows")]
+    for device in devices {
+        let escaped = device.replace('\'', "''");
+        let script = format!("Dismount-DiskImage -ImagePath '{escaped}'");
+        let _ = Command::new("powershell")
+            .args(["-NoProfile", "-Command", &script])
+            .output();
+    }
+
+    #[cfg(target_os = "linux")]
+    for device in devices {
+        let _ = Command::new("udisksctl").args(["unmount", "-b", device]).output();
+        let _ = Command::new("udisksctl").args(["loop-delete", "-b", device]).output();
     }
 }
 

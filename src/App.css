@@ -292,13 +292,16 @@ body {
 .file-table tr:hover td { background: var(--bg-row-hover); }
 
 .col-name { }
-.col-lba, .col-size, .col-size_bytes, .col-modified { color: var(--text-muted); font-size: 12px; }
+.col-lba, .col-size, .col-modified { color: var(--text-muted); font-size: 12px; }
+.col-size { text-align: right; padding-right: 12px; }
+th.col-size { text-align: right; }
 
 .entry-icon { margin-right: 6px; font-size: 13px; }
 .row-dir { cursor: pointer; }
 .row-dir td { color: var(--text-bright); }
 
 .col-save { text-align: center; padding: 2px 4px; }
+th.col-save { text-align: center; }
 
 .btn-save {
   background: transparent;

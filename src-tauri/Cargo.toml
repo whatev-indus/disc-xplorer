@@ -26,5 +26,4 @@ serde_json = "1"
 iso9660 = { path = "crates/iso9660" }
 encoding_rs = "0.8"
 flac-bound = { version = "0.3", features = ["libflac-nobuild"], default-features = false }
-libflac-sys = { version = "0.2", features = ["build-flac"], default-features = false }
 

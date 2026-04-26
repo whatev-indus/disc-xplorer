@@ -52,7 +52,21 @@ jobs:
             librsvg2-dev \
             patchelf \
             libssl-dev \
-            libgtk-3-dev
+            libgtk-3-dev \
+            libflac-dev
+
+      - name: Install macOS audio dependencies
+        if: matrix.platform == 'macos-14'
+        run: brew install flac
+
+      - name: Install Windows audio dependencies
+        if: matrix.platform == 'windows-latest'
+        shell: powershell
+        run: |
+          git -C $env:VCPKG_INSTALLATION_ROOT pull
+          vcpkg install flac:x64-windows-static-md
+          $libPath = "$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows-static-md\lib"
+          echo "LIB=$libPath;$env:LIB" >> $env:GITHUB_ENV
 
       - name: Install frontend dependencies
         run: npm install

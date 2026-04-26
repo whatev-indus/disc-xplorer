@@ -71,6 +71,7 @@ jobs:
             -DBUILD_CXXLIBS=OFF `
             -DBUILD_EXAMPLES=OFF `
             -DBUILD_TESTING=OFF `
+            -DINSTALL_MANPAGES=OFF `
             -DCMAKE_BUILD_TYPE=Release
           cmake --build flac-build --config Release
           $libFile = Get-ChildItem -Recurse -Path flac-build -Name "FLAC.lib" | Select-Object -First 1

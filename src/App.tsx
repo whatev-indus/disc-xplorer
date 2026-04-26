@@ -620,12 +620,14 @@ function App() {
     { key: "save", label: "Save" },
   ];
 
+  const showAudioSave = audioEntries.some(e => !e.is_data);
+
   const audioCols: { key: keyof ColWidths; label: string }[] = [
     { key: "name", label: "Track" },
     { key: "lba", label: "Start Sector" },
     { key: "size", label: "Duration" },
     { key: "modified", label: "Format" },
-    { key: "save", label: "Save" },
+    ...(showAudioSave ? [{ key: "save" as keyof ColWidths, label: "Save" }] : []),
   ];
 
   const cols = viewMode === "audio" ? audioCols : fsCols;
@@ -672,6 +674,8 @@ function App() {
             <button className="btn-icon" onClick={navigateUp} disabled={currentPath === "/"} title="Up">↑</button>
           </>
         )}
+        <a className="btn-prerelease" href="https://github.com/whatev-indus/disc-xplorer-releases/releases" target="_blank" rel="noreferrer">PRE-RELEASE BUILD! CLICK TO UPDATE</a>
+        <button className="btn-settings" title="Settings">⚙</button>
       </div>
 
       {(imagePath || viewMode === "empty-drive") && (
@@ -748,9 +752,11 @@ function App() {
                         <td className="col-lba">{entry.start_lba.toLocaleString()}</td>
                         <td className="col-size">{entry.is_data ? formatSize(entry.size_bytes) : formatDuration(entry.num_sectors)}</td>
                         <td className="col-modified">{entry.format}</td>
-                        <td className="col-save">
-                          <button className="btn-save" title="Save as WAV" onClick={() => saveAudioTrack(entry)}>⬇</button>
-                        </td>
+                        {showAudioSave && (
+                          <td className="col-save">
+                            {!entry.is_data && <button className="btn-save" title="Save as WAV" onClick={() => saveAudioTrack(entry)}>⬇</button>}
+                          </td>
+                        )}
                       </tr>
                     ))
                   : entries.map((entry) => (

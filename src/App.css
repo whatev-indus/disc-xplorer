@@ -53,11 +53,28 @@ body {
 .toolbar {
   display: flex;
   align-items: center;
-  gap: 4px;
   padding: 6px 10px;
   background: var(--bg-toolbar);
   border-bottom: 1px solid var(--border);
   flex-shrink: 0;
+}
+
+.toolbar-left {
+  flex: 1;
+}
+
+.toolbar-center {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.toolbar-right {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 6px;
 }
 
 .btn-prerelease {
@@ -77,11 +94,10 @@ body {
 .btn-prerelease:hover { background: #e74c3c; }
 
 .btn-settings {
-  margin-left: auto;
   background: transparent;
   border: none;
   color: var(--text-muted);
-  font-size: 22px;
+  font-size: 28px;
   cursor: pointer;
   padding: 0 4px;
   line-height: 1;
@@ -145,6 +161,59 @@ body {
   height: 20px;
   background: var(--border);
   margin: 0 4px;
+}
+
+/* ── Settings panel ── */
+
+.settings-panel {
+  background: var(--bg-toolbar);
+  border-bottom: 1px solid var(--border);
+  padding: 8px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+.settings-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.settings-label {
+  font-size: 12px;
+  color: var(--text-muted);
+  white-space: nowrap;
+  min-width: 180px;
+}
+
+.settings-path-btn {
+  font-size: 12px;
+  max-width: 400px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.settings-radio-group {
+  display: flex;
+  gap: 16px;
+}
+
+.settings-radio {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 12px;
+  color: var(--text);
+  cursor: pointer;
+  user-select: none;
+}
+
+.settings-radio input[type="radio"] {
+  accent-color: var(--accent);
+  cursor: pointer;
 }
 
 /* ── Drive picker ── */
@@ -321,6 +390,8 @@ body {
 
 .col-name { }
 .col-lba, .col-size, .col-modified { color: var(--text-muted); font-size: 12px; }
+.col-lba { text-align: right; padding-right: 12px; }
+th.col-lba { text-align: right; }
 .col-size { text-align: right; padding-right: 12px; }
 th.col-size { text-align: right; }
 
@@ -422,8 +493,29 @@ th.col-save { text-align: center; }
   flex-shrink: 0;
   border-top: 1px solid #005a9e;
   display: flex;
-  justify-content: space-between;
   align-items: center;
+}
+
+.statusbar-left {
+  flex: 1;
+}
+
+.statusbar-right {
+  flex: 1;
+  display: flex;
+  justify-content: flex-end;
+}
+
+.statusbar-brand {
+  color: #fff;
+  opacity: 0.75;
+  text-decoration: none;
+  font-size: 11px;
+}
+
+.statusbar-brand:hover {
+  opacity: 1;
+  text-decoration: underline;
 }
 
 .statusbar-version {

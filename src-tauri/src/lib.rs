@@ -1,3 +1,4 @@
+use flac_bound::FlacEncoder;
 use iso9660::{ISO9660, ISO9660Reader, ISODirectory, DirectoryEntry};
 use serde::Serialize;
 use std::fs::{self, File};
@@ -881,30 +882,27 @@ fn write_wav_header(file: &mut File, data_size: u32) -> io::Result<()> {
     Ok(())
 }
 
-#[tauri::command]
-fn save_audio_track(cue_path: String, track_number: u32, dest_path: String) -> Result<(), String> {
-    let tracks = get_cue_tracks(cue_path)?;
+// 1 MB per chunk — divisible by 4 (stereo 16-bit frame = 4 bytes)
+const AUDIO_CHUNK: usize = 1 << 20;
 
-    let track = tracks.iter()
-        .find(|t| t.number == track_number && !t.is_data)
-        .ok_or_else(|| format!("Audio track {track_number} not found"))?;
-
-    let audio_bytes = (track.num_sectors * RAW_SECTOR_SIZE) as u32;
-
-    let mut dest = File::create(&dest_path)
-        .map_err(|e| format!("Cannot create WAV: {e}"))?;
-    write_wav_header(&mut dest, audio_bytes)
-        .map_err(|e| format!("WAV header error: {e}"))?;
-
+fn open_audio_src(track: &TrackInfo) -> Result<(File, u64), String> {
     let mut src = File::open(&track.bin_path)
         .map_err(|e| format!("Cannot open BIN: {e}"))?;
     src.seek(SeekFrom::Start(track.start_lba * RAW_SECTOR_SIZE))
         .map_err(|e| format!("Seek error: {e}"))?;
+    Ok((src, track.num_sectors * RAW_SECTOR_SIZE))
+}
 
-    let mut remaining = audio_bytes as u64;
-    let mut buf = vec![0u8; 65536];
+fn save_audio_as_wav(track: &TrackInfo, dest_path: &str) -> Result<(), String> {
+    let (mut src, total_bytes) = open_audio_src(track)?;
+    let mut dest = File::create(dest_path)
+        .map_err(|e| format!("Cannot create WAV: {e}"))?;
+    write_wav_header(&mut dest, total_bytes as u32)
+        .map_err(|e| format!("WAV header error: {e}"))?;
+    let mut remaining = total_bytes;
+    let mut buf = vec![0u8; AUDIO_CHUNK];
     while remaining > 0 {
-        let to_read = remaining.min(buf.len() as u64) as usize;
+        let to_read = remaining.min(AUDIO_CHUNK as u64) as usize;
         let n = src.read(&mut buf[..to_read])
             .map_err(|e| format!("Read error: {e}"))?;
         if n == 0 { break; }
@@ -912,8 +910,51 @@ fn save_audio_track(cue_path: String, track_number: u32, dest_path: String) -> R
             .map_err(|e| format!("Write error: {e}"))?;
         remaining -= n as u64;
     }
-
     Ok(())
+}
+
+fn save_audio_as_flac(track: &TrackInfo, dest_path: &str) -> Result<(), String> {
+    let (mut src, total_bytes) = open_audio_src(track)?;
+    let total_frames = total_bytes / 4; // stereo 16-bit
+
+    let mut enc = FlacEncoder::new()
+        .ok_or_else(|| "FLAC encoder allocation failed".to_string())?
+        .channels(2)
+        .bits_per_sample(16)
+        .sample_rate(44100)
+        .compression_level(8)
+        .total_samples_estimate(total_frames)
+        .init_file(&PathBuf::from(dest_path))
+        .map_err(|e| format!("FLAC encoder init failed: {e:?}"))?;
+
+    let mut remaining = total_bytes;
+    let mut buf = vec![0u8; AUDIO_CHUNK];
+    while remaining > 0 {
+        let to_read = remaining.min(AUDIO_CHUNK as u64) as usize;
+        src.read_exact(&mut buf[..to_read])
+            .map_err(|e| format!("Read error: {e}"))?;
+        let samples: Vec<i32> = buf[..to_read].chunks_exact(2)
+            .map(|b| i16::from_le_bytes([b[0], b[1]]) as i32)
+            .collect();
+        enc.process_interleaved(&samples, (samples.len() / 2) as u32)
+            .map_err(|_| "FLAC process error".to_string())?;
+        remaining -= to_read as u64;
+    }
+    enc.finish().map_err(|_| "FLAC finish error".to_string())?;
+    Ok(())
+}
+
+
+#[tauri::command]
+fn save_audio_track(cue_path: String, track_number: u32, dest_path: String, format: String) -> Result<(), String> {
+    let tracks = get_cue_tracks(cue_path)?;
+    let track = tracks.iter()
+        .find(|t| t.number == track_number && !t.is_data)
+        .ok_or_else(|| format!("Audio track {track_number} not found"))?;
+    match format.as_str() {
+        "flac" => save_audio_as_flac(track, &dest_path),
+        _      => save_audio_as_wav(track, &dest_path),
+    }
 }
 
 // ── Optical drive listing ─────────────────────────────────────────────────────

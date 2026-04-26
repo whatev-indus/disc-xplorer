@@ -1,0 +1,805 @@
+import { useState, useCallback, useRef, useEffect } from "react";
+import { invoke } from "@tauri-apps/api/core";
+import { open, save } from "@tauri-apps/plugin-dialog";
+import "./App.css";
+
+interface DiscEntry {
+  name: string;
+  is_dir: boolean;
+  lba: number;
+  size: number;
+  size_bytes: number;
+  modified: string;
+}
+
+interface AudioEntry {
+  track_number: number;
+  name: string;
+  start_lba: number;
+  num_sectors: number;
+  size_bytes: number;
+  format: string;
+  is_data: boolean;
+}
+
+interface DriveInfo {
+  name: string;
+  device_path: string;
+  has_disc: boolean;
+  volume_name: string | null;
+}
+
+type NodeType = "root" | "session" | "data_track" | "audio_track" | "filesystem" | "dir";
+type ViewMode = "filesystem" | "audio" | "empty-drive";
+
+interface TreeNode {
+  name: string;
+  path: string;
+  nodeType: NodeType;
+  children: TreeNode[] | null;
+  expanded: boolean;
+}
+
+interface TrackInfo {
+  number: number;
+  is_data: boolean;
+  mode: string;
+  start_lba: number;
+  num_sectors: number;
+  session: number;
+  bin_path: string;
+}
+
+interface MountResult {
+  mount_point: string;
+  device: string;
+}
+
+interface ColWidths {
+  name: number;
+  lba: number;
+  size: number;
+  size_bytes: number;
+  modified: number;
+  save: number;
+}
+
+function formatSize(bytes: number): string {
+  if (bytes === 0) return "—";
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function formatDuration(sectors: number): string {
+  if (sectors === 0) return "—";
+  const totalSeconds = Math.floor(sectors / 75);
+  const m = Math.floor(totalSeconds / 60);
+  const s = totalSeconds % 60;
+  const f = sectors % 75;
+  return `${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}.${String(f).padStart(2, "0")}`;
+}
+
+function isMountable(path: string): boolean {
+  const lower = path.toLowerCase();
+  return lower.endsWith(".iso") || lower.endsWith(".img") || lower.endsWith(".dmg") || lower.endsWith(".cdr");
+}
+
+function TreeItem({
+  node, imagePath, selectedPath, onSelect, onToggle, depth,
+}: {
+  node: TreeNode; imagePath: string; selectedPath: string;
+  onSelect: (path: string) => void; onToggle: (path: string) => void; depth: number;
+}) {
+  const isAudio = node.nodeType === "audio_track";
+  const isSession = node.nodeType === "session";
+  const isDataTrack = node.nodeType === "data_track";
+  const isFilesystem = node.nodeType === "filesystem";
+
+  const icon = isSession || isDataTrack ? "📀"
+    : isAudio ? "🎵"
+    : isFilesystem ? "🗂️"
+    : node.nodeType === "dir" ? "📁"
+    : "💿";
+
+  const alwaysExpanded = isSession;
+  const noArrow = isAudio || isFilesystem || alwaysExpanded;
+
+  function handleClick() {
+    onSelect(node.path);
+    if (!isAudio && !isFilesystem && !isSession) onToggle(node.path);
+  }
+
+  return (
+    <div>
+      <div
+        className={[
+          "tree-item",
+          node.path === selectedPath ? "tree-item--selected" : "",
+          isAudio ? "tree-item--audio" : "",
+          isSession ? "tree-item--session" : "",
+          isFilesystem ? "tree-item--filesystem" : "",
+        ].filter(Boolean).join(" ")}
+        style={{ paddingLeft: `${depth * 16 + 8}px` }}
+        onClick={handleClick}
+      >
+        <span className="tree-arrow">
+          {noArrow ? " " : (node.children === null ? " " : node.expanded ? "▾" : "▶")}
+        </span>
+        <span className="tree-icon">{icon}</span>
+        <span className="tree-label">{node.name}</span>
+      </div>
+      {(alwaysExpanded || node.expanded) && node.children && (
+        <div>
+          {node.children.map((child) => (
+            <TreeItem key={child.path} node={child} imagePath={imagePath}
+              selectedPath={selectedPath} onSelect={onSelect} onToggle={onToggle}
+              depth={depth + 1} />
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function App() {
+  const [imagePath, setImagePath] = useState<string | null>(null);
+  const [sourceImagePath, setSourceImagePath] = useState<string | null>(null);
+  const [imageName, setImageName] = useState<string>("");
+  const [currentPath, setCurrentPath] = useState("/");
+  const [entries, setEntries] = useState<DiscEntry[]>([]);
+  const [audioEntries, setAudioEntries] = useState<AudioEntry[]>([]);
+  const [viewMode, setViewMode] = useState<ViewMode>("filesystem");
+  const [emptyDriveName, setEmptyDriveName] = useState<string | null>(null);
+  const [tree, setTree] = useState<TreeNode[]>([]);
+  const [cueTracks, setCueTracks] = useState<TrackInfo[]>([]);
+  const [sidebarPath, setSidebarPath] = useState<string>("");
+  const [error, setError] = useState<string | null>(null);
+  const [statusText, setStatusText] = useState("No disc loaded");
+  const [mountedDevice, setMountedDevice] = useState<string | null>(null);
+  const [drives, setDrives] = useState<DriveInfo[]>([]);
+  const [showDriveMenu, setShowDriveMenu] = useState(false);
+  const [loadingDrives, setLoadingDrives] = useState(false);
+  const [colWidths, setColWidths] = useState<ColWidths>({
+    name: 280, lba: 80, size: 90, size_bytes: 120, modified: 160, save: 56,
+  });
+  const dragRef = useRef<{ col: keyof ColWidths; startX: number; startWidth: number } | null>(null);
+  const driveMenuRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    function handleOutsideClick(e: MouseEvent) {
+      if (driveMenuRef.current && !driveMenuRef.current.contains(e.target as Node)) {
+        setShowDriveMenu(false);
+      }
+    }
+    if (showDriveMenu) document.addEventListener("mousedown", handleOutsideClick);
+    return () => document.removeEventListener("mousedown", handleOutsideClick);
+  }, [showDriveMenu]);
+
+  function onResizeStart(col: keyof ColWidths, e: React.MouseEvent) {
+    e.preventDefault();
+    dragRef.current = { col, startX: e.clientX, startWidth: colWidths[col] };
+    function onMove(e: MouseEvent) {
+      if (!dragRef.current) return;
+      const delta = e.clientX - dragRef.current.startX;
+      setColWidths((prev) => ({
+        ...prev,
+        [dragRef.current!.col]: Math.max(48, dragRef.current!.startWidth + delta),
+      }));
+    }
+    function onUp() {
+      dragRef.current = null;
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+    }
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+  }
+
+  const navIdRef = useRef(0);
+
+  const loadDirectory = useCallback(async (imgPath: string, dirPath: string, fsLabel = "") => {
+    const myId = ++navIdRef.current;
+    setError(null);
+    try {
+      const result = await invoke<DiscEntry[]>("list_disc_contents", { imagePath: imgPath, dirPath });
+      if (navIdRef.current !== myId) return;
+      const sorted = result.sort((a, b) => {
+        if (a.is_dir !== b.is_dir) return a.is_dir ? -1 : 1;
+        return a.name.localeCompare(b.name);
+      });
+      setEntries(sorted);
+      setAudioEntries([]);
+      setViewMode("filesystem");
+      setCurrentPath(dirPath);
+      const dirs = sorted.filter((e) => e.is_dir).length;
+      const files = sorted.filter((e) => !e.is_dir).length;
+      setStatusText(`${dirs} folder${dirs !== 1 ? "s" : ""}, ${files} file${files !== 1 ? "s" : ""}${fsLabel ? ` · ${fsLabel}` : ""}`);
+    } catch (e) {
+      if (navIdRef.current !== myId) return;
+      setError(String(e));
+    }
+  }, []);
+
+  function buildAudioEntries(tracks: TrackInfo[]): AudioEntry[] {
+    return tracks.map((t) => ({
+      track_number: t.number,
+      name: `Track ${String(t.number).padStart(2, "0")}`,
+      start_lba: t.start_lba,
+      num_sectors: t.num_sectors,
+      size_bytes: t.is_data ? t.num_sectors * 2048 : t.num_sectors * 2352,
+      format: t.is_data ? t.mode : "CD Audio · 44.1 kHz · 16-bit · Stereo",
+      is_data: t.is_data,
+    }));
+  }
+
+  async function openImage() {
+    const selected = await open({
+      filters: [{ name: "Disc Images", extensions: ["iso", "img", "cue", "mds"] }],
+    });
+    if (!selected) return;
+    const path = selected as string;
+    const name = path.split("/").pop() ?? path;
+    setImagePath(path);
+    setSourceImagePath(path);
+    setImageName(name);
+    setError(null);
+    setEmptyDriveName(null);
+
+    const lowerPath = path.toLowerCase();
+    const isCue = lowerPath.endsWith(".cue");
+    const isMds = lowerPath.endsWith(".mds");
+
+    if (isCue || isMds) {
+      const [tracks, filesystems] = await Promise.all([
+        isMds
+          ? invoke<TrackInfo[]>("get_mds_tracks", { mdsPath: path })
+          : invoke<TrackInfo[]>("get_cue_tracks", { cuePath: path }),
+        invoke<string[]>("get_disc_filesystems", { imagePath: path }).catch(() => ["ISO 9660"]),
+      ]);
+      setCueTracks(tracks);
+      setSidebarPath("__root");
+
+      const sessions = [...new Set(tracks.map((t) => t.session))].sort((a, b) => a - b);
+      const multiSession = sessions.length > 1;
+
+      const makeFsChildren = (): TreeNode[] =>
+        filesystems.map((fs) => ({
+          name: fs,
+          path: `__fs_${fs.toLowerCase().replace(/ /g, "_")}`,
+          nodeType: "filesystem" as NodeType,
+          children: null,
+          expanded: false,
+        }));
+
+      const makeTrackNode = (t: TrackInfo): TreeNode => t.is_data
+        ? {
+            name: t.mode === "CDI/PREGAP"
+              ? `Track ${String(t.number).padStart(2, "0")} Pregap — CD-i`
+              : `Track ${String(t.number).padStart(2, "0")} — ${t.mode}`,
+            path: `__track_${t.number}`,
+            nodeType: "data_track",
+            children: makeFsChildren(),
+            expanded: true,
+          }
+        : {
+            name: `Track ${String(t.number).padStart(2, "0")} — ${t.mode}`,
+            path: `__audio_${t.number}`,
+            nodeType: "audio_track",
+            children: null,
+            expanded: false,
+          };
+
+      const trackNodes: TreeNode[] = multiSession
+        ? sessions.map((s): TreeNode => {
+            const sessionTracks = tracks.filter((t) => t.session === s);
+            const hasData = sessionTracks.some((t) => t.is_data);
+            return {
+              name: `Session ${s} — ${hasData ? "Data" : "Audio"}`,
+              path: `__session_${s}`,
+              nodeType: "session",
+              children: sessionTracks.map(makeTrackNode),
+              expanded: true,
+            };
+          })
+        : tracks.map(makeTrackNode);
+
+      const rootNode: TreeNode = {
+        name, path: "__root", nodeType: "root", children: trackNodes, expanded: true,
+      };
+      setTree([rootNode]);
+
+      // Show audio tracks on initial open; user navigates to data tracks via sidebar.
+      const audio = buildAudioEntries(tracks);
+      const audioCount = audio.filter((e) => !e.is_data).length;
+      if (audio.length > 0) {
+        navIdRef.current++;
+        setAudioEntries(audio);
+        setEntries([]);
+        setViewMode("audio");
+        setStatusText(`${audioCount} audio track${audioCount !== 1 ? "s" : ""}${audio.length > audioCount ? `, ${audio.length - audioCount} data track` : ""}`);
+      } else {
+        // Data-only disc: load the filesystem immediately.
+        await loadDirectory(path, "/");
+      }
+    } else {
+      setCueTracks([]);
+      setSidebarPath("/");
+      const rootNode: TreeNode = { name, path: "/", nodeType: "root", children: null, expanded: false };
+      setTree([rootNode]);
+      await loadDirectory(path, "/");
+      const result = await invoke<DiscEntry[]>("list_disc_contents", { imagePath: path, dirPath: "/" });
+      const subDirs = result
+        .filter((e) => e.is_dir)
+        .map((e): TreeNode => ({ name: e.name, path: `/${e.name}`, nodeType: "dir", children: null, expanded: false }));
+      setTree([{ ...rootNode, expanded: true, children: subDirs }]);
+    }
+  }
+
+  async function mountImage() {
+    if (!sourceImagePath) return;
+    try {
+      const result = await invoke<MountResult>("mount_disc_image", { imagePath: sourceImagePath });
+      setMountedDevice(result.device);
+      setError(null);
+      // Keep browsing via the source image using our own readers — macOS may not
+      // be able to read the mounted filesystem (e.g. UDF 2.50 is unsupported).
+      // The mount makes the device visible in Finder/Disk Utility.
+      const name = imageName; // already set from the source image
+      const rootNode: TreeNode = { name, path: "/", nodeType: "root", children: null, expanded: false };
+      setTree([rootNode]);
+      await loadDirectory(sourceImagePath, "/");
+      const entries2 = await invoke<DiscEntry[]>("list_disc_contents", { imagePath: sourceImagePath, dirPath: "/" });
+      const subDirs = entries2.filter(e => e.is_dir).map(e => ({
+        name: e.name, path: `/${e.name}`, nodeType: "dir" as NodeType, children: null, expanded: false,
+      }));
+      setTree([{ ...rootNode, expanded: true, children: subDirs }]);
+    } catch (e) {
+      setError(String(e));
+    }
+  }
+
+  async function unmountImage() {
+    if (!mountedDevice) return;
+    try {
+      await invoke("unmount_disc_image", { device: mountedDevice });
+    } catch (e) {
+      setError(String(e));
+    }
+    setMountedDevice(null);
+    // Keep the disc image open in the app after unmounting.
+  }
+
+  async function openDisc() {
+    setLoadingDrives(true);
+    setShowDriveMenu(true);
+    try {
+      const result = await invoke<DriveInfo[]>("list_optical_drives");
+      setDrives(result);
+    } catch (e) {
+      setError(String(e));
+      setShowDriveMenu(false);
+    } finally {
+      setLoadingDrives(false);
+    }
+  }
+
+  async function selectDrive(drive: DriveInfo) {
+    setShowDriveMenu(false);
+    setError(null);
+
+    if (!drive.has_disc) {
+      setViewMode("empty-drive");
+      setEmptyDriveName(drive.name);
+      setSourceImagePath(null);
+      setImagePath(null);
+      setImageName("");
+      setEntries([]);
+      setAudioEntries([]);
+      setTree([]);
+      setStatusText("No disc loaded");
+      return;
+    }
+
+    const name = drive.volume_name || drive.name;
+    setSourceImagePath(null);
+    setImagePath(drive.device_path);
+    setImageName(name);
+    setEmptyDriveName(null);
+
+    const rootNode: TreeNode = { name, path: "/", nodeType: "root", children: null, expanded: false };
+    setTree([rootNode]);
+    await loadDirectory(drive.device_path, "/");
+
+    try {
+      const result = await invoke<DiscEntry[]>("list_disc_contents", {
+        imagePath: drive.device_path, dirPath: "/",
+      });
+      const subDirs = result
+        .filter((e) => e.is_dir)
+        .map((e): TreeNode => ({
+          name: e.name, path: `/${e.name}`, nodeType: "dir", children: null, expanded: false,
+        }));
+      setTree([{ ...rootNode, expanded: true, children: subDirs }]);
+    } catch {
+      // Tree build failed; directory already loaded above
+    }
+  }
+
+  async function dumpDisc() {
+    if (!imagePath) return;
+    const destPath = await open({ directory: true, title: "Choose destination for disc dump" });
+    if (!destPath) return;
+    const discName = imageName.replace(/\.[^/.]+$/, "") || "disc";
+    try {
+      await invoke("save_directory", {
+        imagePath,
+        dirPath: "/",
+        destPath: `${destPath}/${discName}`,
+      });
+    } catch (e) {
+      setError(String(e));
+    }
+  }
+
+  async function handleTreeToggle(nodePath: string) {
+    if (!imagePath) return;
+
+    if (nodePath.startsWith("__track_")) {
+      function toggleExpanded(nodes: TreeNode[]): TreeNode[] {
+        return nodes.map((n) => {
+          if (n.path === nodePath) return { ...n, expanded: !n.expanded };
+          if (n.children) return { ...n, children: toggleExpanded(n.children) };
+          return n;
+        });
+      }
+      setTree(toggleExpanded(tree));
+      return;
+    }
+
+    if (nodePath.startsWith("__")) return;
+
+    async function expandNode(nodes: TreeNode[]): Promise<TreeNode[]> {
+      return Promise.all(nodes.map(async (node) => {
+        if (node.path !== nodePath) {
+          return { ...node, children: node.children ? await expandNode(node.children) : null };
+        }
+        if (node.expanded) return { ...node, expanded: false };
+        let children = node.children;
+        if (children === null) {
+          const result = await invoke<DiscEntry[]>("list_disc_contents", { imagePath, dirPath: nodePath });
+          children = result
+            .filter((e) => e.is_dir)
+            .map((e): TreeNode => ({
+              name: e.name,
+              path: nodePath === "/" ? `/${e.name}` : `${nodePath}/${e.name}`,
+              nodeType: "dir",
+              children: null,
+              expanded: false,
+            }));
+        }
+        return { ...node, expanded: true, children };
+      }));
+    }
+    setTree(await expandNode(tree));
+  }
+
+  function findNodeByPath(nodes: TreeNode[], target: string): TreeNode | null {
+    for (const n of nodes) {
+      if (n.path === target) return n;
+      if (n.children) {
+        const found = findNodeByPath(n.children, target);
+        if (found) return found;
+      }
+    }
+    return null;
+  }
+
+  function handleTreeSelect(path: string) {
+    if (!imagePath) return;
+
+    if (path === "__root") {
+      setSidebarPath("__root");
+      const audio = buildAudioEntries(cueTracks);
+      const audioCount = audio.filter((e) => !e.is_data).length;
+      if (audio.length > 0) {
+        navIdRef.current++;
+        setAudioEntries(audio);
+        setEntries([]);
+        setViewMode("audio");
+        setCurrentPath("__root");
+        setStatusText(`${audioCount} audio track${audioCount !== 1 ? "s" : ""}${audio.length > audioCount ? `, ${audio.length - audioCount} data track` : ""}`);
+      } else {
+        loadDirectory(imagePath, "/");
+      }
+      return;
+    }
+
+    if (path.startsWith("__session_")) {
+      setSidebarPath(path);
+      const sessionNum = parseInt(path.replace("__session_", ""), 10);
+      const sessionTracks = cueTracks.filter((t) => t.session === sessionNum);
+      navIdRef.current++;
+      const audio = buildAudioEntries(sessionTracks);
+      const audioCount = audio.filter((e) => !e.is_data).length;
+      setAudioEntries(audio);
+      setEntries([]);
+      setViewMode("audio");
+      setCurrentPath(path);
+      setStatusText(`Session ${sessionNum} — ${audioCount} audio track${audioCount !== 1 ? "s" : ""}${audio.length > audioCount ? `, ${audio.length - audioCount} data track` : ""}`);
+      return;
+    }
+
+    if (path.startsWith("__audio_")) {
+      setSidebarPath(path);
+      const trackNum = parseInt(path.replace("__audio_", ""), 10);
+      const track = cueTracks.find((t) => t.number === trackNum && !t.is_data);
+      if (track) {
+        navIdRef.current++;
+        const audio = buildAudioEntries([track]);
+        setAudioEntries(audio);
+        setEntries([]);
+        setViewMode("audio");
+        setCurrentPath(path);
+        setStatusText(`Track ${String(track.number).padStart(2, "0")} — ${track.mode}`);
+      }
+      return;
+    }
+
+    if (path.startsWith("__track_")) {
+      setSidebarPath(path);
+      return;
+    }
+
+    if (path.startsWith("__fs_")) {
+      setSidebarPath(path);
+      const fsName = findNodeByPath(tree, path)?.name ?? "";
+      loadDirectory(imagePath, "/", fsName);
+      return;
+    }
+
+    if (!path.startsWith("__")) loadDirectory(imagePath, path);
+  }
+
+  async function saveEntry(entry: DiscEntry) {
+    if (!imagePath) return;
+    const entryPath = currentPath === "/" ? `/${entry.name}` : `${currentPath}/${entry.name}`;
+
+    if (entry.is_dir) {
+      const destPath = await open({ directory: true, title: `Choose destination for "${entry.name}"` });
+      if (!destPath) return;
+      try {
+        await invoke("save_directory", { imagePath, dirPath: entryPath, destPath: `${destPath}/${entry.name}` });
+      } catch (e) { setError(String(e)); }
+    } else {
+      const destPath = await save({ defaultPath: entry.name });
+      if (!destPath) return;
+      try {
+        await invoke("save_file", { imagePath, filePath: entryPath, destPath });
+      } catch (e) { setError(String(e)); }
+    }
+  }
+
+  async function saveAudioTrack(entry: AudioEntry) {
+    if (!imagePath) return;
+    const defaultName = `${entry.name}.wav`;
+    const destPath = await save({
+      defaultPath: defaultName,
+      filters: [{ name: "WAV Audio", extensions: ["wav"] }],
+    });
+    if (!destPath) return;
+    try {
+      await invoke("save_audio_track", {
+        cuePath: imagePath,
+        trackNumber: entry.track_number,
+        destPath,
+      });
+    } catch (e) { setError(String(e)); }
+  }
+
+  function navigateUp() {
+    if (!imagePath || currentPath === "/" || viewMode === "audio") return;
+    const parent = currentPath.substring(0, currentPath.lastIndexOf("/")) || "/";
+    loadDirectory(imagePath, parent);
+  }
+
+  const breadcrumbs = currentPath === "/" || viewMode === "audio"
+    ? [{ label: imageName || "Root", path: "/" }]
+    : [
+        { label: imageName || "Root", path: "/" },
+        ...currentPath.split("/").filter(Boolean).map((part, i, arr) => ({
+          label: part,
+          path: "/" + arr.slice(0, i + 1).join("/"),
+        })),
+      ];
+
+  const fsCols: { key: keyof ColWidths; label: string }[] = [
+    { key: "name", label: "Name" },
+    { key: "lba", label: "LBA" },
+    { key: "size", label: "Size" },
+    { key: "size_bytes", label: "Size (Bytes)" },
+    { key: "modified", label: "Modified" },
+    { key: "save", label: "Save" },
+  ];
+
+  const audioCols: { key: keyof ColWidths; label: string }[] = [
+    { key: "name", label: "Track" },
+    { key: "lba", label: "Start Sector" },
+    { key: "size", label: "Duration" },
+    { key: "size_bytes", label: "PCM Size" },
+    { key: "modified", label: "Format" },
+    { key: "save", label: "Save WAV" },
+  ];
+
+  const cols = viewMode === "audio" ? audioCols : fsCols;
+
+  return (
+    <div className="app">
+      <div className="toolbar">
+        <button className="btn-open" onClick={openImage}>Open Disc Image</button>
+        {mountedDevice
+          ? <button className="btn-open btn-open-secondary btn-unmount" onClick={unmountImage}>Unmount Disc Image</button>
+          : sourceImagePath && isMountable(sourceImagePath)
+            ? <button className="btn-open btn-open-secondary" onClick={mountImage}>Mount Disc Image</button>
+            : null
+        }
+        <div className="separator" />
+        <div className="drive-menu-wrap" ref={driveMenuRef}>
+          <button className="btn-open btn-open-secondary" onClick={openDisc}>Open Disc from Drive ▾</button>
+          {showDriveMenu && (
+            <div className="drive-menu">
+              {loadingDrives ? (
+                <div className="drive-menu-item drive-menu-loading">Detecting drives…</div>
+              ) : drives.length === 0 ? (
+                <div className="drive-menu-item drive-menu-empty">No optical drives found</div>
+              ) : (
+                drives.map((d) => (
+                  <div key={d.device_path} className="drive-menu-item" onClick={() => selectDrive(d)}>
+                    <span className="drive-item-name">{d.name}</span>
+                    <span className={`drive-item-disc ${d.has_disc ? "" : "drive-item-disc--empty"}`}>
+                      {d.has_disc ? (d.volume_name || "Disc inserted") : "No disc"}
+                    </span>
+                  </div>
+                ))
+              )}
+            </div>
+          )}
+        </div>
+        <div className="separator" />
+        <button className="btn-dump" onClick={dumpDisc} disabled={!imagePath} title="Extract all disc contents to a folder">
+          Dump Disc
+        </button>
+        {imagePath && viewMode === "filesystem" && (
+          <>
+            <div className="separator" />
+            <button className="btn-icon" onClick={navigateUp} disabled={currentPath === "/"} title="Up">↑</button>
+          </>
+        )}
+      </div>
+
+      {(imagePath || viewMode === "empty-drive") && (
+        <div className="breadcrumb">
+          {breadcrumbs.map((crumb, i) => (
+            <span key={crumb.path}>
+              {i > 0 && <span className="breadcrumb-sep">›</span>}
+              <span
+                className={`breadcrumb-item ${i === breadcrumbs.length - 1 ? "breadcrumb-item--active" : ""}`}
+                onClick={() => imagePath && i < breadcrumbs.length - 1 && loadDirectory(imagePath, crumb.path)}
+              >{crumb.label}</span>
+            </span>
+          ))}
+        </div>
+      )}
+
+      <div className="main">
+        {imagePath && (
+          <div className="sidebar">
+            {tree.map((node) => (
+              <TreeItem key={node.path} node={node} imagePath={imagePath}
+                selectedPath={sidebarPath} onSelect={handleTreeSelect}
+                onToggle={handleTreeToggle} depth={0} />
+            ))}
+          </div>
+        )}
+
+        <div className="content">
+          {error && <div className="error">{error}</div>}
+
+          {!imagePath && viewMode !== "empty-drive" && (
+            <div className="empty-state">
+              <div className="empty-icon">💿</div>
+              <p>Open a Disc Image or insert a Disc into a Disc Drive to explore its contents.</p>
+              <button onClick={openImage}>Open Disc Image</button>
+            </div>
+          )}
+
+          {viewMode === "empty-drive" && emptyDriveName && (
+            <div className="empty-state">
+              <div className="empty-icon">📀</div>
+              <p>Optical disc drive is empty</p>
+              <span className="empty-drive-name">{emptyDriveName}</span>
+            </div>
+          )}
+
+          {(viewMode === "filesystem" ? entries.length > 0 : audioEntries.length > 0) && (
+            <table className="file-table" style={{ tableLayout: "fixed" }}>
+              <colgroup>
+                {cols.map((c) => <col key={c.key} style={{ width: colWidths[c.key] }} />)}
+              </colgroup>
+              <thead>
+                <tr>
+                  {cols.map((c) => (
+                    <th key={c.key} className={`col-${c.key}`}>
+                      <span className="th-label">{c.label}</span>
+                      <div className="resize-handle" onMouseDown={(e) => onResizeStart(c.key, e)} />
+                    </th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {viewMode === "audio"
+                  ? audioEntries.map((entry) => (
+                      <tr
+                        key={entry.track_number}
+                        className={entry.is_data ? "row-data" : "row-audio"}
+                        onDoubleClick={() => entry.is_data && imagePath && loadDirectory(imagePath, "/")}
+                      >
+                        <td className="col-name">
+                          <span className="entry-icon">{entry.is_data ? "💿" : "🎵"}</span>
+                          {entry.name}
+                        </td>
+                        <td className="col-lba">{entry.start_lba.toLocaleString()}</td>
+                        <td className="col-size">{entry.is_data ? formatSize(entry.size_bytes) : formatDuration(entry.num_sectors)}</td>
+                        <td className="col-size_bytes">{entry.is_data ? `${entry.num_sectors.toLocaleString()} sectors` : formatSize(entry.size_bytes)}</td>
+                        <td className="col-modified">{entry.format}</td>
+                        <td className="col-save">
+                          {entry.is_data
+                            ? <button className="btn-save" title="Browse data track" onClick={() => imagePath && loadDirectory(imagePath, "/")}>▶</button>
+                            : <button className="btn-save" title="Save as WAV" onClick={() => saveAudioTrack(entry)}>⬇</button>
+                          }
+                        </td>
+                      </tr>
+                    ))
+                  : entries.map((entry) => (
+                      <tr
+                        key={`${entry.lba}-${entry.name}`}
+                        className={entry.is_dir ? "row-dir" : "row-file"}
+                        onDoubleClick={() => {
+                          if (!entry.is_dir || !imagePath) return;
+                          const newPath = currentPath === "/" ? `/${entry.name}` : `${currentPath}/${entry.name}`;
+                          loadDirectory(imagePath, newPath);
+                        }}
+                      >
+                        <td className="col-name">
+                          <span className="entry-icon">{entry.is_dir ? "📁" : "📄"}</span>
+                          {entry.name}
+                        </td>
+                        <td className="col-lba">{entry.lba}</td>
+                        <td className="col-size">{formatSize(entry.size)}</td>
+                        <td className="col-size_bytes">{entry.size_bytes.toLocaleString()}</td>
+                        <td className="col-modified">{entry.modified}</td>
+                        <td className="col-save">
+                          <button className="btn-save" title={entry.is_dir ? "Save folder" : "Save file"} onClick={() => saveEntry(entry)}>⬇</button>
+                        </td>
+                      </tr>
+                    ))
+                }
+              </tbody>
+            </table>
+          )}
+
+          {imagePath && viewMode === "filesystem" && entries.length === 0 && !error && (
+            <div className="empty-dir">Empty folder</div>
+          )}
+        </div>
+      </div>
+
+      <div className="statusbar">
+        <span>{statusText}</span>
+        <span className="statusbar-version">v0.0.1</span>
+      </div>
+    </div>
+  );
+}
+
+export default App;

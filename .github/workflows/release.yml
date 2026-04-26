@@ -74,8 +74,10 @@ jobs:
       - name: Package macOS artifact
         if: matrix.platform == 'macos-14'
         run: |
-          APP=$(find src-tauri/target/${{ matrix.target }}/release/bundle/macos -name "*.app" | head -1)
-          zip -r "Disc Xplorer_macOS_ARM_v${{ steps.version.outputs.VERSION }}.zip" "$APP"
+          BUNDLE_DIR="src-tauri/target/${{ matrix.target }}/release/bundle/macos"
+          codesign --force --deep --sign - "$BUNDLE_DIR/Disc Xplorer.app"
+          cd "$BUNDLE_DIR"
+          zip -r "$GITHUB_WORKSPACE/Disc Xplorer_macOS_ARM_v${{ steps.version.outputs.VERSION }}.zip" "Disc Xplorer.app"
 
       - name: Package Windows artifact
         if: matrix.platform == 'windows-latest'

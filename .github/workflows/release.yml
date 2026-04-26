@@ -63,10 +63,9 @@ jobs:
         if: matrix.platform == 'windows-latest'
         shell: powershell
         run: |
-          choco install pkgconfiglite
           vcpkg install flac:x64-windows-static-md
-          $pkgPath = "$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows-static-md\lib\pkgconfig"
-          echo "PKG_CONFIG_PATH=$pkgPath" >> $env:GITHUB_ENV
+          $libPath = "$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows-static-md\lib"
+          echo "RUSTFLAGS=-L native=$libPath" >> $env:GITHUB_ENV
 
       - name: Install frontend dependencies
         run: npm install

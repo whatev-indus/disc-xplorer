@@ -63,9 +63,18 @@ jobs:
         if: matrix.platform == 'windows-latest'
         shell: powershell
         run: |
-          git -C $env:VCPKG_INSTALLATION_ROOT pull
-          vcpkg install flac:x64-windows-static-md
-          $libPath = "$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows-static-md\lib"
+          Invoke-WebRequest -Uri "https://github.com/xiph/flac/archive/refs/tags/1.4.3.zip" -OutFile flac-src.zip
+          Expand-Archive flac-src.zip -DestinationPath .
+          cmake -S flac-1.4.3 -B flac-build `
+            -DBUILD_SHARED_LIBS=OFF `
+            -DWITH_OGG=OFF `
+            -DBUILD_CXXLIBS=OFF `
+            -DBUILD_EXAMPLES=OFF `
+            -DBUILD_TESTING=OFF `
+            -DCMAKE_BUILD_TYPE=Release
+          cmake --build flac-build --config Release
+          $libFile = Get-ChildItem -Recurse -Path flac-build -Name "FLAC.lib" | Select-Object -First 1
+          $libPath = Split-Path (Resolve-Path "flac-build\$libFile")
           echo "LIB=$libPath;$env:LIB" >> $env:GITHUB_ENV
 
       - name: Install frontend dependencies

@@ -162,8 +162,14 @@ function App() {
   const [colWidths, setColWidths] = useState<ColWidths>({
     name: 280, lba: 80, size: 110, modified: 160, save: 56,
   });
+  const [showSettings, setShowSettings] = useState(false);
+  const [audioFormat, setAudioFormat] = useState<"wav" | "flac">("wav");
+  const [defaultDownloadPath, setDefaultDownloadPath] = useState<string>("");
+
   const dragRef = useRef<{ col: keyof ColWidths; startX: number; startWidth: number } | null>(null);
   const driveMenuRef = useRef<HTMLDivElement>(null);
+  const settingsRef = useRef<HTMLDivElement>(null);
+  const settingsGearRef = useRef<HTMLButtonElement>(null);
 
   useEffect(() => {
     function handleOutsideClick(e: MouseEvent) {
@@ -174,6 +180,24 @@ function App() {
     if (showDriveMenu) document.addEventListener("mousedown", handleOutsideClick);
     return () => document.removeEventListener("mousedown", handleOutsideClick);
   }, [showDriveMenu]);
+
+  useEffect(() => {
+    function handleOutsideClick(e: MouseEvent) {
+      if (
+        settingsRef.current && !settingsRef.current.contains(e.target as Node) &&
+        settingsGearRef.current && !settingsGearRef.current.contains(e.target as Node)
+      ) {
+        setShowSettings(false);
+      }
+    }
+    if (showSettings) document.addEventListener("mousedown", handleOutsideClick);
+    return () => document.removeEventListener("mousedown", handleOutsideClick);
+  }, [showSettings]);
+
+  async function pickDownloadLocation() {
+    const dir = await open({ directory: true, title: "Set Default Download Location" });
+    if (dir) setDefaultDownloadPath(dir as string);
+  }
 
   function onResizeStart(col: keyof ColWidths, e: React.MouseEvent) {
     e.preventDefault();
@@ -227,7 +251,7 @@ function App() {
       start_lba: t.start_lba,
       num_sectors: t.num_sectors,
       size_bytes: t.is_data ? t.num_sectors * 2048 : t.num_sectors * 2352,
-      format: t.is_data ? t.mode : "CD Audio · 44.1 kHz · 16-bit · Stereo",
+      format: t.is_data ? t.mode : "CD Audio",
       is_data: t.is_data,
     }));
   }
@@ -565,13 +589,15 @@ function App() {
     const entryPath = currentPath === "/" ? `/${entry.name}` : `${currentPath}/${entry.name}`;
 
     if (entry.is_dir) {
-      const destPath = await open({ directory: true, title: `Choose destination for "${entry.name}"` });
-      if (!destPath) return;
+      const base = defaultDownloadPath || await open({ directory: true, title: `Choose destination for "${entry.name}"` }) as string | null;
+      if (!base) return;
       try {
-        await invoke("save_directory", { imagePath, dirPath: entryPath, destPath: `${destPath}/${entry.name}` });
+        await invoke("save_directory", { imagePath, dirPath: entryPath, destPath: `${base}/${entry.name}` });
       } catch (e) { setError(String(e)); }
     } else {
-      const destPath = await save({ defaultPath: entry.name });
+      const destPath = defaultDownloadPath
+        ? `${defaultDownloadPath}/${entry.name}`
+        : await save({ defaultPath: entry.name });
       if (!destPath) return;
       try {
         await invoke("save_file", { imagePath, filePath: entryPath, destPath });
@@ -581,17 +607,20 @@ function App() {
 
   async function saveAudioTrack(entry: AudioEntry) {
     if (!imagePath) return;
-    const defaultName = `${entry.name}.wav`;
-    const destPath = await save({
-      defaultPath: defaultName,
-      filters: [{ name: "WAV Audio", extensions: ["wav"] }],
-    });
+    const ext = audioFormat;
+    const destPath = defaultDownloadPath
+      ? `${defaultDownloadPath}/${entry.name}.${ext}`
+      : await save({
+          defaultPath: `${entry.name}.${ext}`,
+          filters: [{ name: ext === "flac" ? "FLAC Audio" : "WAV Audio", extensions: [ext] }],
+        });
     if (!destPath) return;
     try {
       await invoke("save_audio_track", {
         cuePath: imagePath,
         trackNumber: entry.track_number,
         destPath,
+        format: ext,
       });
     } catch (e) { setError(String(e)); }
   }
@@ -635,48 +664,78 @@ function App() {
   return (
     <div className="app">
       <div className="toolbar">
-        <button className="btn-open" onClick={openImage}>Open Disc Image</button>
-        {mountedDevice
-          ? <button className="btn-open btn-open-secondary btn-unmount" onClick={unmountImage}>Unmount Disc Image</button>
-          : sourceImagePath && isMountable(sourceImagePath)
-            ? <button className="btn-open btn-open-secondary" onClick={mountImage}>Mount Disc Image</button>
-            : null
-        }
-        <div className="separator" />
-        <div className="drive-menu-wrap" ref={driveMenuRef}>
-          <button className="btn-open btn-open-secondary" onClick={openDisc}>Open Disc from Drive ▾</button>
-          {showDriveMenu && (
-            <div className="drive-menu">
-              {loadingDrives ? (
-                <div className="drive-menu-item drive-menu-loading">Detecting drives…</div>
-              ) : drives.length === 0 ? (
-                <div className="drive-menu-item drive-menu-empty">No optical drives found</div>
-              ) : (
-                drives.map((d) => (
-                  <div key={d.device_path} className="drive-menu-item" onClick={() => selectDrive(d)}>
-                    <span className="drive-item-name">{d.name}</span>
-                    <span className={`drive-item-disc ${d.has_disc ? "" : "drive-item-disc--empty"}`}>
-                      {d.has_disc ? (d.volume_name || "Disc inserted") : "No disc"}
-                    </span>
-                  </div>
-                ))
-              )}
-            </div>
+        <div className="toolbar-left" />
+        <div className="toolbar-center">
+          <button className="btn-open" onClick={openImage}>Open Disc Image</button>
+          {mountedDevice
+            ? <button className="btn-open btn-open-secondary btn-unmount" onClick={unmountImage}>Unmount Disc Image</button>
+            : sourceImagePath && isMountable(sourceImagePath)
+              ? <button className="btn-open btn-open-secondary" onClick={mountImage}>Mount Disc Image</button>
+              : null
+          }
+          <div className="separator" />
+          <div className="drive-menu-wrap" ref={driveMenuRef}>
+            <button className="btn-open btn-open-secondary" onClick={openDisc}>Open Disc from Drive ▾</button>
+            {showDriveMenu && (
+              <div className="drive-menu">
+                {loadingDrives ? (
+                  <div className="drive-menu-item drive-menu-loading">Detecting drives…</div>
+                ) : drives.length === 0 ? (
+                  <div className="drive-menu-item drive-menu-empty">No optical drives found</div>
+                ) : (
+                  drives.map((d) => (
+                    <div key={d.device_path} className="drive-menu-item" onClick={() => selectDrive(d)}>
+                      <span className="drive-item-name">{d.name}</span>
+                      <span className={`drive-item-disc ${d.has_disc ? "" : "drive-item-disc--empty"}`}>
+                        {d.has_disc ? (d.volume_name || "Disc inserted") : "No disc"}
+                      </span>
+                    </div>
+                  ))
+                )}
+              </div>
+            )}
+          </div>
+          {mountedDevice && (
+            <>
+              <div className="separator" />
+              <button className="btn-dump" onClick={dumpDisc} title="Extract all disc contents to a folder">
+                Dump Disc
+              </button>
+            </>
+          )}
+          {imagePath && viewMode === "filesystem" && (
+            <>
+              <div className="separator" />
+              <button className="btn-icon" onClick={navigateUp} disabled={currentPath === "/"} title="Up">↑</button>
+            </>
           )}
         </div>
-        <div className="separator" />
-        <button className="btn-dump" onClick={dumpDisc} disabled={!imagePath} title="Extract all disc contents to a folder">
-          Dump Disc
-        </button>
-        {imagePath && viewMode === "filesystem" && (
-          <>
-            <div className="separator" />
-            <button className="btn-icon" onClick={navigateUp} disabled={currentPath === "/"} title="Up">↑</button>
-          </>
-        )}
-        <a className="btn-prerelease" href="https://github.com/whatev-indus/disc-xplorer-releases/releases" target="_blank" rel="noreferrer">PRE-RELEASE BUILD! CLICK TO UPDATE</a>
-        <button className="btn-settings" title="Settings">⚙</button>
+        <div className="toolbar-right">
+          <a className="btn-prerelease" href="https://github.com/whatev-indus/disc-xplorer/releases" target="_blank" rel="noreferrer">PRE-RELEASE BUILD! CLICK TO UPDATE</a>
+          <button ref={settingsGearRef} className="btn-settings" title="Settings" onClick={() => setShowSettings(s => !s)}>⚙</button>
+        </div>
       </div>
+      {showSettings && (
+        <div className="settings-panel" ref={settingsRef}>
+          <div className="settings-row">
+            <span className="settings-label">Default Download Location</span>
+            <button className="btn-open btn-open-secondary settings-path-btn" onClick={pickDownloadLocation}>
+              {defaultDownloadPath || "Not set — click to choose"}
+            </button>
+          </div>
+          <div className="settings-row">
+            <span className="settings-label">Save Audio (PCM) as</span>
+            <div className="settings-radio-group">
+              {(["wav", "flac"] as const).map(fmt => (
+                <label key={fmt} className="settings-radio">
+                  <input type="radio" name="audioFormat" value={fmt} checked={audioFormat === fmt} onChange={() => setAudioFormat(fmt)} />
+                  .{fmt}
+                </label>
+              ))}
+            </div>
+          </div>
+        </div>
+      )}
 
       {(imagePath || viewMode === "empty-drive") && (
         <div className="breadcrumb">
@@ -793,8 +852,11 @@ function App() {
       </div>
 
       <div className="statusbar">
-        <span>{statusText}</span>
-        <span className="statusbar-version">v0.0.1</span>
+        <span className="statusbar-left">{statusText}</span>
+        <a className="statusbar-brand" href="https://sites.google.com/view/whateverindustries/home" target="_blank" rel="noreferrer">whatev.indus</a>
+        <span className="statusbar-right">
+          <span className="statusbar-version">v0.0.1</span>
+        </span>
       </div>
     </div>
   );

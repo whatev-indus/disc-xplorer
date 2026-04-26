@@ -56,27 +56,59 @@ fn unix_secs_to_string(secs: u64) -> String {
 
 const RAW_SECTOR_SIZE: u64 = 2352;
 
-pub struct BinCueReader {
+struct TrackFile {
     file: File,
     track_offset: u64,
     user_data_offset: u64,
-    // Absolute disc LBA of the sector at track_offset. For session-2 data tracks
-    // the ISO9660 filesystem stores absolute disc LBAs (e.g. 183343), so we must
-    // subtract this value before computing the file seek position.
-    lba_offset: u64,
+    lba_offset: u64,   // for single-BIN legacy mode
+    start_lba: u64,    // absolute disc LBA of first sector (for multi-BIN dispatch)
+    sector_count: u64, // 0 = unknown / unlimited
 }
 
-impl ISO9660Reader for BinCueReader {
+pub struct MultiTrackBinReader {
+    tracks: Vec<TrackFile>,
+    root_idx: usize,
+    multi_bin: bool,
+}
+
+impl MultiTrackBinReader {
+    fn single(file: File, track_offset: u64, user_data_offset: u64, lba_offset: u64) -> Self {
+        MultiTrackBinReader {
+            tracks: vec![TrackFile {
+                file, track_offset, user_data_offset, lba_offset,
+                start_lba: lba_offset, sector_count: 0,
+            }],
+            root_idx: 0,
+            multi_bin: false,
+        }
+    }
+}
+
+impl ISO9660Reader for MultiTrackBinReader {
     fn read_at(&mut self, buf: &mut [u8], lba: u64) -> io::Result<usize> {
-        // The iso9660 crate always asks for LBA 16 (PVD) as a track-relative
-        // address. All subsequent LBAs come from the filesystem structures and
-        // are absolute disc addresses on multisession discs. Subtract lba_offset
-        // only when lba is actually in the session's absolute range; otherwise
-        // (e.g. initial PVD lookup at LBA 16) keep it track-relative.
-        let adjusted = if lba >= self.lba_offset { lba - self.lba_offset } else { lba };
-        let pos = self.track_offset + adjusted * RAW_SECTOR_SIZE + self.user_data_offset;
-        self.file.seek(SeekFrom::Start(pos))?;
-        self.file.read(buf)
+        if !self.multi_bin {
+            // Single-BIN: use lba_offset for multisession compat (same as old BinCueReader).
+            let t = &mut self.tracks[self.root_idx];
+            let adjusted = if lba >= t.lba_offset { lba - t.lba_offset } else { lba };
+            let pos = t.track_offset + adjusted * RAW_SECTOR_SIZE + t.user_data_offset;
+            t.file.seek(SeekFrom::Start(pos))?;
+            return t.file.read(buf);
+        }
+        // Multi-BIN: dispatch by absolute LBA.
+        // LBA < 32 (PVD + early structures) is read track-relatively from the root track.
+        let (idx, adjusted) = if lba < 32 {
+            (self.root_idx, lba)
+        } else {
+            self.tracks.iter().enumerate()
+                .find(|(_, t)| lba >= t.start_lba
+                    && (t.sector_count == 0 || lba < t.start_lba + t.sector_count))
+                .map(|(i, t)| (i, lba - t.start_lba))
+                .unwrap_or((self.root_idx, lba))
+        };
+        let t = &mut self.tracks[idx];
+        let pos = t.track_offset + adjusted * RAW_SECTOR_SIZE + t.user_data_offset;
+        t.file.seek(SeekFrom::Start(pos))?;
+        t.file.read(buf)
     }
 }
 
@@ -86,6 +118,7 @@ struct DataTrack {
     user_data_offset: u64,
     lba_offset: u64,
     descramble: bool,
+    sector_count: u64,
 }
 
 // Read the absolute disc LBA encoded in the MODE1/MODE2 sector header at
@@ -209,9 +242,8 @@ fn parse_cue_for_data_track(cue_path: &Path) -> Result<DataTrack, String> {
     let mut cur_track_type: Option<String> = None;
     let mut cur_index00: u64 = 0;
     let mut cur_index01: Option<u64> = None;
-    // Keep the last data track found so multisession discs yield the session-2 track.
+    let mut first_data: Option<DataTrack> = None;
     let mut last_data: Option<DataTrack> = None;
-    // (bin_path, pregap_start_lba, track_start_lba) for AUDIO tracks with a pregap.
     let mut audio_pregaps: Vec<(PathBuf, u64, u64)> = Vec::new();
 
     macro_rules! flush_audio_pregap {
@@ -268,13 +300,24 @@ fn parse_cue_for_data_track(cue_path: &Path) -> Result<DataTrack, String> {
 
             let track_offset = idx * RAW_SECTOR_SIZE;
             let lba_offset = sector_lba_at(bin, track_offset);
-            last_data = Some(DataTrack { bin_path: bin.clone(), track_offset, user_data_offset, lba_offset, descramble: false });
+            let sector_count = fs::metadata(bin)
+                .map(|m| m.len().saturating_sub(track_offset) / RAW_SECTOR_SIZE)
+                .unwrap_or(0);
+            let dt = DataTrack { bin_path: bin.clone(), track_offset, user_data_offset, lba_offset, descramble: false, sector_count };
+            if first_data.is_none() { first_data = Some(DataTrack { bin_path: dt.bin_path.clone(), track_offset: dt.track_offset, user_data_offset: dt.user_data_offset, lba_offset: dt.lba_offset, descramble: false, sector_count: dt.sector_count }); }
+            last_data = Some(dt);
         }
     }
     flush_audio_pregap!();
 
-    if let Some(dt) = last_data {
-        return Ok(dt);
+    if let Some(last) = last_data {
+        // Photo CD / VCD: last data track has no PVD — filesystem is in the first track.
+        if let Some(first) = first_data {
+            if first.bin_path != last.bin_path && !has_pvd(&last) {
+                return Ok(first);
+            }
+        }
+        return Ok(last);
     }
 
     // No conventional data track — check AUDIO pregaps for scrambled CD-i (CD-i Ready format).
@@ -287,11 +330,70 @@ fn parse_cue_for_data_track(cue_path: &Path) -> Result<DataTrack, String> {
                 user_data_offset: 24,
                 lba_offset: 0,
                 descramble: true,
+                sector_count: 0,
             });
         }
     }
 
     Err("No data track found in CUE sheet".to_string())
+}
+
+fn has_pvd(track: &DataTrack) -> bool {
+    let Ok(mut f) = File::open(&track.bin_path) else { return false };
+    let pos = track.track_offset + 16 * RAW_SECTOR_SIZE + track.user_data_offset;
+    if f.seek(SeekFrom::Start(pos)).is_err() { return false }
+    let mut buf = [0u8; 6];
+    if f.read_exact(&mut buf).is_err() { return false }
+    &buf[1..6] == b"CD001"
+}
+
+// Returns all data tracks from a CUE sheet, ordered as they appear.
+fn parse_cue_all_data_tracks(cue_path: &Path) -> Result<Vec<DataTrack>, String> {
+    let text = fs::read_to_string(cue_path).map_err(|e| format!("Cannot read CUE: {e}"))?;
+    let cue_dir = cue_path.parent().unwrap_or(Path::new("."));
+
+    let mut cur_bin: Option<PathBuf> = None;
+    let mut cur_track_type: Option<String> = None;
+    let mut cur_index01: Option<u64> = None;
+    let mut all_data: Vec<DataTrack> = Vec::new();
+
+    for line in text.lines() {
+        let trimmed = line.trim();
+        let upper = trimmed.to_uppercase();
+
+        if upper.starts_with("FILE ") {
+            if let Some(name) = extract_quoted(trimmed) {
+                cur_bin = Some(cue_dir.join(name));
+            }
+            cur_track_type = None;
+            cur_index01 = None;
+        } else if upper.starts_with("TRACK ") {
+            let parts: Vec<&str> = trimmed.split_whitespace().collect();
+            cur_track_type = parts.get(2).map(|s| s.to_uppercase());
+            cur_index01 = None;
+        } else if let Some(rest) = upper.strip_prefix("INDEX 01 ") {
+            cur_index01 = msf_to_sectors(rest.trim());
+        }
+
+        if let (Some(ref bin), Some(ref mode), Some(idx)) = (&cur_bin, &cur_track_type, cur_index01) {
+            let user_data_offset = if mode.starts_with("MODE1") { 16 }
+                else if mode.starts_with("MODE2") || mode.starts_with("CDI") { 24 }
+                else { continue; };
+
+            let track_offset = idx * RAW_SECTOR_SIZE;
+            if all_data.last().map(|d: &DataTrack| d.bin_path == *bin && d.track_offset == track_offset).unwrap_or(false) {
+                continue;
+            }
+            let lba_offset = sector_lba_at(bin, track_offset);
+            let sector_count = fs::metadata(bin)
+                .map(|m| m.len().saturating_sub(track_offset) / RAW_SECTOR_SIZE)
+                .unwrap_or(0);
+            all_data.push(DataTrack { bin_path: bin.clone(), track_offset, user_data_offset, lba_offset, descramble: false, sector_count });
+        }
+    }
+
+    if all_data.is_empty() { return Err("No data track found in CUE sheet".to_string()); }
+    Ok(all_data)
 }
 
 fn msf_to_sectors(s: &str) -> Option<u64> {
@@ -359,7 +461,7 @@ fn parse_mds_for_data_track(mds_path: &Path) -> Result<DataTrack, String> {
 
         let track_offset = read_u64_le(&data, tb + 0x20);
         let lba_offset = sector_lba_at(&mdf_path, track_offset);
-        return Ok(DataTrack { bin_path: mdf_path, track_offset, user_data_offset, lba_offset, descramble: false });
+        return Ok(DataTrack { bin_path: mdf_path, track_offset, user_data_offset, lba_offset, descramble: false, sector_count: 0 });
     }
 
     Err("No data track found in MDS".to_string())
@@ -970,28 +1072,11 @@ macro_rules! with_fs {
         let path = $image_path.as_str();
         let lower = path.to_lowercase();
         if lower.ends_with(".cue") {
-            let track = parse_cue_for_data_track(Path::new(path))?;
-            let bin = File::open(&track.bin_path)
-                .map_err(|e| format!("Cannot open BIN: {e}"))?;
-            let reader = BinCueReader {
-                file: bin,
-                track_offset: track.track_offset,
-                user_data_offset: track.user_data_offset,
-                lba_offset: track.lba_offset,
-            };
-            let $fs = ISO9660::new(reader).map_err(|e| format!("Invalid disc image: {e}"))?;
+            let $fs = open_iso_fs_for_cue(Path::new(path))?;
             $body
         } else if lower.ends_with(".mds") {
             let track = parse_mds_for_data_track(Path::new(path))?;
-            let mdf = File::open(&track.bin_path)
-                .map_err(|e| format!("Cannot open MDF: {e}"))?;
-            let reader = BinCueReader {
-                file: mdf,
-                track_offset: track.track_offset,
-                user_data_offset: track.user_data_offset,
-                lba_offset: track.lba_offset,
-            };
-            let $fs = ISO9660::new(reader).map_err(|e| format!("Invalid disc image: {e}"))?;
+            let $fs = open_iso_fs(&track)?;
             $body
         } else {
             let file = File::open(path).map_err(|e| format!("Cannot open file: {e}"))?;
@@ -1018,15 +1103,42 @@ fn open_cdi_fs(track: &DataTrack) -> Result<cdi_filesystem::CdiFs, String> {
     cdi_filesystem::CdiFs::new(bin, track.track_offset, track.user_data_offset, track.lba_offset, track.descramble)
 }
 
-fn open_iso_fs(track: &DataTrack) -> Result<ISO9660<BinCueReader>, String> {
+fn open_iso_fs(track: &DataTrack) -> Result<ISO9660<MultiTrackBinReader>, String> {
     let bin = File::open(&track.bin_path).map_err(|e| format!("Cannot open: {e}"))?;
-    let reader = BinCueReader {
-        file: bin,
-        track_offset: track.track_offset,
-        user_data_offset: track.user_data_offset,
-        lba_offset: track.lba_offset,
-    };
+    let reader = MultiTrackBinReader::single(bin, track.track_offset, track.user_data_offset, track.lba_offset);
     ISO9660::new(reader).map_err(|e| format!("Invalid disc image: {e}"))
+}
+
+// Builds an ISO 9660 reader for a CUE sheet, using a multi-BIN reader when the
+// disc has separate data tracks in different BIN files (Photo CD, VCD, etc.).
+fn open_iso_fs_for_cue(cue_path: &Path) -> Result<ISO9660<MultiTrackBinReader>, String> {
+    let all_tracks = parse_cue_all_data_tracks(cue_path)?;
+
+    let use_multi_bin = all_tracks.len() > 1
+        && all_tracks.last().map(|t| !has_pvd(t)).unwrap_or(false)
+        && all_tracks.windows(2).any(|w| w[0].bin_path != w[1].bin_path);
+
+    if use_multi_bin {
+        let mut track_files: Vec<TrackFile> = Vec::with_capacity(all_tracks.len());
+        for dt in all_tracks {
+            let file = File::open(&dt.bin_path).map_err(|e| format!("Cannot open BIN: {e}"))?;
+            track_files.push(TrackFile {
+                file,
+                track_offset: dt.track_offset,
+                user_data_offset: dt.user_data_offset,
+                lba_offset: dt.lba_offset,
+                start_lba: dt.lba_offset,
+                sector_count: dt.sector_count,
+            });
+        }
+        let reader = MultiTrackBinReader { tracks: track_files, root_idx: 0, multi_bin: true };
+        ISO9660::new(reader).map_err(|e| format!("Invalid disc image: {e}"))
+    } else {
+        let dt = all_tracks.into_iter().last().unwrap();
+        let bin = File::open(&dt.bin_path).map_err(|e| format!("Cannot open BIN: {e}"))?;
+        let reader = MultiTrackBinReader::single(bin, dt.track_offset, dt.user_data_offset, dt.lba_offset);
+        ISO9660::new(reader).map_err(|e| format!("Invalid disc image: {e}"))
+    }
 }
 
 #[tauri::command]
@@ -1077,6 +1189,8 @@ fn list_disc_contents(image_path: String, dir_path: String) -> Result<Vec<DiscEn
             open_hfs_fs(&track)?.list_directory(&dir_path)
         } else if udf_filesystem::is_udf_disc(&track.bin_path, track.track_offset, track.user_data_offset) {
             open_udf_fs(&track)?.list_directory(&dir_path)
+        } else if lower.ends_with(".cue") {
+            collect_entries(&open_iso_fs_for_cue(Path::new(path))?, &dir_path)
         } else {
             collect_entries(&open_iso_fs(&track)?, &dir_path)
         }
@@ -1091,7 +1205,7 @@ fn list_disc_contents(image_path: String, dir_path: String) -> Result<Vec<DiscEn
         }
         let file = File::open(path).map_err(|e| format!("Cannot open file: {e}"))?;
         if user_data_offset > 0 {
-            let reader = BinCueReader { file, track_offset: 0, user_data_offset, lba_offset: 0 };
+            let reader = MultiTrackBinReader::single(file, 0, user_data_offset, 0);
             let fs = ISO9660::new(reader).map_err(|e| format!("Invalid disc image: {e}"))?;
             collect_entries(&fs, &dir_path)
         } else {
@@ -1125,6 +1239,8 @@ fn save_file(image_path: String, file_path: String, dest_path: String) -> Result
             open_hfs_fs(&track)?.extract_file(&file_path, &dest_path)
         } else if udf_filesystem::is_udf_disc(&track.bin_path, track.track_offset, track.user_data_offset) {
             open_udf_fs(&track)?.extract_file(&file_path, &dest_path)
+        } else if lower.ends_with(".cue") {
+            extract_file_from_fs(&open_iso_fs_for_cue(Path::new(path))?, &file_path, &dest_path)
         } else {
             extract_file_from_fs(&open_iso_fs(&track)?, &file_path, &dest_path)
         }
@@ -1139,7 +1255,7 @@ fn save_file(image_path: String, file_path: String, dest_path: String) -> Result
         }
         if user_data_offset > 0 {
             let file = File::open(path).map_err(|e| format!("Cannot open file: {e}"))?;
-            let reader = BinCueReader { file, track_offset: 0, user_data_offset, lba_offset: 0 };
+            let reader = MultiTrackBinReader::single(file, 0, user_data_offset, 0);
             let fs = ISO9660::new(reader).map_err(|e| format!("Invalid disc image: {e}"))?;
             extract_file_from_fs(&fs, &file_path, &dest_path)
         } else {
@@ -1176,6 +1292,8 @@ fn save_directory(image_path: String, dir_path: String, dest_path: String) -> Re
             open_hfs_fs(&track)?.extract_directory(&dir_path, &dest_path)
         } else if udf_filesystem::is_udf_disc(&track.bin_path, track.track_offset, track.user_data_offset) {
             open_udf_fs(&track)?.extract_directory(&dir_path, &dest_path)
+        } else if lower.ends_with(".cue") {
+            extract_dir_from_fs(&open_iso_fs_for_cue(Path::new(path))?, &dir_path, &dest_path)
         } else {
             extract_dir_from_fs(&open_iso_fs(&track)?, &dir_path, &dest_path)
         }
@@ -1190,7 +1308,7 @@ fn save_directory(image_path: String, dir_path: String, dest_path: String) -> Re
         }
         if user_data_offset > 0 {
             let file = File::open(path).map_err(|e| format!("Cannot open file: {e}"))?;
-            let reader = BinCueReader { file, track_offset: 0, user_data_offset, lba_offset: 0 };
+            let reader = MultiTrackBinReader::single(file, 0, user_data_offset, 0);
             let fs = ISO9660::new(reader).map_err(|e| format!("Invalid disc image: {e}"))?;
             extract_dir_from_fs(&fs, &dir_path, &dest_path)
         } else {

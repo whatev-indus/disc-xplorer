@@ -59,7 +59,6 @@ interface ColWidths {
   name: number;
   lba: number;
   size: number;
-  size_bytes: number;
   modified: number;
   save: number;
 }
@@ -161,7 +160,7 @@ function App() {
   const [showDriveMenu, setShowDriveMenu] = useState(false);
   const [loadingDrives, setLoadingDrives] = useState(false);
   const [colWidths, setColWidths] = useState<ColWidths>({
-    name: 280, lba: 80, size: 90, size_bytes: 120, modified: 160, save: 56,
+    name: 280, lba: 80, size: 110, modified: 160, save: 56,
   });
   const dragRef = useRef<{ col: keyof ColWidths; startX: number; startWidth: number } | null>(null);
   const driveMenuRef = useRef<HTMLDivElement>(null);
@@ -617,7 +616,6 @@ function App() {
     { key: "name", label: "Name" },
     { key: "lba", label: "LBA" },
     { key: "size", label: "Size" },
-    { key: "size_bytes", label: "Size (Bytes)" },
     { key: "modified", label: "Modified" },
     { key: "save", label: "Save" },
   ];
@@ -626,9 +624,8 @@ function App() {
     { key: "name", label: "Track" },
     { key: "lba", label: "Start Sector" },
     { key: "size", label: "Duration" },
-    { key: "size_bytes", label: "PCM Size" },
     { key: "modified", label: "Format" },
-    { key: "save", label: "Save WAV" },
+    { key: "save", label: "Save" },
   ];
 
   const cols = viewMode === "audio" ? audioCols : fsCols;
@@ -750,13 +747,9 @@ function App() {
                         </td>
                         <td className="col-lba">{entry.start_lba.toLocaleString()}</td>
                         <td className="col-size">{entry.is_data ? formatSize(entry.size_bytes) : formatDuration(entry.num_sectors)}</td>
-                        <td className="col-size_bytes">{entry.is_data ? `${entry.num_sectors.toLocaleString()} sectors` : formatSize(entry.size_bytes)}</td>
                         <td className="col-modified">{entry.format}</td>
                         <td className="col-save">
-                          {entry.is_data
-                            ? <button className="btn-save" title="Browse data track" onClick={() => imagePath && loadDirectory(imagePath, "/")}>▶</button>
-                            : <button className="btn-save" title="Save as WAV" onClick={() => saveAudioTrack(entry)}>⬇</button>
-                          }
+                          <button className="btn-save" title="Save as WAV" onClick={() => saveAudioTrack(entry)}>⬇</button>
                         </td>
                       </tr>
                     ))
@@ -775,8 +768,7 @@ function App() {
                           {entry.name}
                         </td>
                         <td className="col-lba">{entry.lba}</td>
-                        <td className="col-size">{formatSize(entry.size)}</td>
-                        <td className="col-size_bytes">{entry.size_bytes.toLocaleString()}</td>
+                        <td className="col-size">{entry.size_bytes > 0 ? entry.size_bytes.toLocaleString() : "—"}</td>
                         <td className="col-modified">{entry.modified}</td>
                         <td className="col-save">
                           <button className="btn-save" title={entry.is_dir ? "Save folder" : "Save file"} onClick={() => saveEntry(entry)}>⬇</button>

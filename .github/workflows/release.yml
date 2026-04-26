@@ -104,8 +104,6 @@ jobs:
   release:
     needs: build
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
 
     steps:
       - name: Download all artifacts
@@ -124,7 +122,10 @@ jobs:
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.RELEASES_TOKEN }}
         with:
+          repository: whatev-indus/disc-xplorer-releases
           tag_name: ${{ steps.tag.outputs.TAG }}
           name: Disc Xplorer ${{ steps.tag.outputs.TAG }}
           prerelease: ${{ contains(steps.tag.outputs.TAG, '-beta') || contains(steps.tag.outputs.TAG, '-alpha') }}

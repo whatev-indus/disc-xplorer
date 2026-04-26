@@ -1,0 +1,133 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Version tag (e.g. v0.1.0-beta)'
+        required: true
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: macos-14
+            target: aarch64-apple-darwin
+            artifact_suffix: macOS_ARM
+          - platform: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact_suffix: Windows
+          - platform: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            artifact_suffix: Linux
+
+    runs-on: ${{ matrix.platform }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install Linux dependencies
+        if: matrix.platform == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libappindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            libssl-dev \
+            libgtk-3-dev
+
+      - name: Install frontend dependencies
+        run: npm install
+
+      - name: Get app version
+        id: version
+        shell: bash
+        run: |
+          VERSION=$(python3 -c "import json; print(json.load(open('src-tauri/tauri.conf.json'))['version'])")
+          echo "VERSION=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Build Tauri app
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          args: --target ${{ matrix.target }}
+
+      - name: Package macOS artifact
+        if: matrix.platform == 'macos-14'
+        run: |
+          APP=$(find src-tauri/target/${{ matrix.target }}/release/bundle/macos -name "*.app" | head -1)
+          zip -r "Disc Xplorer_macOS_ARM_v${{ steps.version.outputs.VERSION }}.zip" "$APP"
+
+      - name: Package Windows artifact
+        if: matrix.platform == 'windows-latest'
+        shell: powershell
+        run: |
+          $msi = Get-ChildItem -Recurse -Path "src-tauri/target/${{ matrix.target }}/release/bundle/msi" -Filter "*.msi" | Select-Object -First 1
+          Copy-Item $msi.FullName "Disc Xplorer_Windows_v${{ steps.version.outputs.VERSION }}.msi"
+
+      - name: Package Linux artifact
+        if: matrix.platform == 'ubuntu-22.04'
+        run: |
+          APPIMAGE=$(find src-tauri/target/${{ matrix.target }}/release/bundle/appimage -name "*.AppImage" | head -1)
+          cp "$APPIMAGE" "Disc Xplorer_Linux_v${{ steps.version.outputs.VERSION }}.AppImage"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: disc-xplorer-${{ matrix.artifact_suffix }}
+          path: |
+            Disc Xplorer_macOS_ARM_*.zip
+            Disc Xplorer_Windows_*.msi
+            Disc Xplorer_Linux_*.AppImage
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+
+      - name: Get tag name
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "TAG=${{ github.event.inputs.tag }}" >> $GITHUB_OUTPUT
+          else
+            echo "TAG=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.TAG }}
+          name: Disc Xplorer ${{ steps.tag.outputs.TAG }}
+          prerelease: ${{ contains(steps.tag.outputs.TAG, '-beta') || contains(steps.tag.outputs.TAG, '-alpha') }}
+          draft: false
+          files: |
+            Disc Xplorer_macOS_ARM_*.zip
+            Disc Xplorer_Windows_*.msi
+            Disc Xplorer_Linux_*.AppImage

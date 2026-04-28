@@ -1,4 +1,5 @@
 use flac_bound::FlacEncoder;
+use mp3lame_encoder::{Builder as Mp3Builder, DualPcm, FlushNoGap};
 use iso9660::{ISO9660, ISO9660Reader, ISODirectory, DirectoryEntry};
 use serde::Serialize;
 use std::fs::{self, File};
@@ -10,6 +11,7 @@ use tauri::Manager;
 
 mod cdi_filesystem;
 mod hfs_filesystem;
+mod pce_filesystem;
 mod udf_filesystem;
 
 fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), String> {
@@ -141,6 +143,9 @@ fn detect_filesystems_in_bin(bin_path: &Path, track_offset: u64, user_data_offse
     if cdi_filesystem::is_cdi_disc(bin_path, track_offset, user_data_offset, lba_offset, descramble) {
         return vec!["CD-i".to_string()];
     }
+    if pce_filesystem::is_pce_disc(bin_path, track_offset, user_data_offset) {
+        return vec!["PC Engine CD-ROM".to_string()];
+    }
     if hfs_filesystem::is_hfs_disc(bin_path, track_offset, user_data_offset) {
         return vec!["HFS".to_string()];
     }
@@ -187,6 +192,9 @@ fn detect_raw_sector_offset(path: &Path) -> Option<u64> {
 
 fn detect_filesystems_raw(path: &Path) -> Vec<String> {
     let user_data_offset = detect_raw_sector_offset(path).unwrap_or(0);
+    if pce_filesystem::is_pce_disc(path, 0, user_data_offset) {
+        return vec!["PC Engine CD-ROM".to_string()];
+    }
     if hfs_filesystem::is_hfs_disc(path, 0, user_data_offset) {
         return vec!["HFS".to_string()];
     }
@@ -863,6 +871,50 @@ fn get_cue_tracks(cue_path: String) -> Result<Vec<TrackInfo>, String> {
     Ok(pregap_cdi)
 }
 
+// ── Sector View ───────────────────────────────────────────────────────────────
+
+#[derive(Serialize)]
+pub struct SectorData {
+    pub bytes: Vec<u8>,
+    pub sector_size: u32,
+    pub user_data_offset: u32,
+    pub total_sectors: u64,
+    pub lba: u64,
+}
+
+#[tauri::command]
+fn read_sector(image_path: String, lba: u64) -> Result<SectorData, String> {
+    let path = Path::new(&image_path);
+    let lower = image_path.to_lowercase();
+
+    let (file_path, sector_size, user_data_offset): (PathBuf, u64, u64) = if lower.ends_with(".cue") {
+        let track = parse_cue_for_data_track(path)?;
+        (track.bin_path, RAW_SECTOR_SIZE, track.user_data_offset)
+    } else if lower.ends_with(".mds") {
+        let track = parse_mds_for_data_track(path)?;
+        (track.bin_path, RAW_SECTOR_SIZE, track.user_data_offset)
+    } else {
+        let udo = detect_raw_sector_offset(path).unwrap_or(0);
+        (path.to_path_buf(), if udo > 0 { RAW_SECTOR_SIZE } else { 2048u64 }, udo)
+    };
+
+    let file_len = fs::metadata(&file_path)
+        .map_err(|e| format!("Cannot stat image: {e}"))?.len();
+    let total_sectors = file_len / sector_size;
+
+    if total_sectors == 0 { return Err("Image file is empty".to_string()); }
+    if lba >= total_sectors {
+        return Err(format!("Sector {lba} out of range (0–{})", total_sectors - 1));
+    }
+
+    let mut f = File::open(&file_path).map_err(|e| format!("Cannot open: {e}"))?;
+    f.seek(SeekFrom::Start(lba * sector_size)).map_err(|e| format!("Seek error: {e}"))?;
+    let mut bytes = vec![0u8; sector_size as usize];
+    f.read_exact(&mut bytes).map_err(|e| format!("Read error: {e}"))?;
+
+    Ok(SectorData { bytes, sector_size: sector_size as u32, user_data_offset: user_data_offset as u32, total_sectors, lba })
+}
+
 // ── WAV export ────────────────────────────────────────────────────────────────
 
 fn write_wav_header(file: &mut File, data_size: u32) -> io::Result<()> {
@@ -945,6 +997,51 @@ fn save_audio_as_flac(track: &TrackInfo, dest_path: &str) -> Result<(), String> 
 }
 
 
+fn save_audio_as_mp3(track: &TrackInfo, dest_path: &str) -> Result<(), String> {
+    let (mut src, total_bytes) = open_audio_src(track)?;
+
+    let mut enc = Mp3Builder::new()
+        .ok_or_else(|| "MP3 encoder allocation failed".to_string())?
+        .with_num_channels(2).map_err(|e| format!("MP3 set channels: {e:?}"))?
+        .with_sample_rate(44_100).map_err(|e| format!("MP3 set sample rate: {e:?}"))?
+        .with_brate(mp3lame_encoder::Bitrate::Kbps320).map_err(|e| format!("MP3 set bitrate: {e:?}"))?
+        .with_quality(mp3lame_encoder::Quality::Best).map_err(|e| format!("MP3 set quality: {e:?}"))?
+        .build().map_err(|e| format!("MP3 encoder init failed: {e:?}"))?;
+
+    let mut out = std::io::BufWriter::new(
+        File::create(dest_path).map_err(|e| format!("Cannot create MP3: {e}"))?
+    );
+
+    let mut raw = vec![0u8; AUDIO_CHUNK];
+    let mut remaining = total_bytes;
+    while remaining > 0 {
+        let to_read = remaining.min(AUDIO_CHUNK as u64) as usize;
+        src.read_exact(&mut raw[..to_read]).map_err(|e| format!("Read error: {e}"))?;
+        remaining -= to_read as u64;
+
+        let frames = to_read / 4;
+        let mut left = vec![0u16; frames];
+        let mut right = vec![0u16; frames];
+        for i in 0..frames {
+            left[i] = u16::from_le_bytes([raw[i*4],   raw[i*4+1]]);
+            right[i] = u16::from_le_bytes([raw[i*4+2], raw[i*4+3]]);
+        }
+
+        let mut chunk = Vec::with_capacity(mp3lame_encoder::max_required_buffer_size(frames));
+        let n = enc.encode(DualPcm { left: &left, right: &right }, chunk.spare_capacity_mut())
+            .map_err(|e| format!("MP3 encode error: {e:?}"))?;
+        unsafe { chunk.set_len(n); }
+        out.write_all(&chunk).map_err(|e| format!("Write error: {e}"))?;
+    }
+
+    let mut tail = Vec::with_capacity(7200);
+    let n = enc.flush::<FlushNoGap>(tail.spare_capacity_mut())
+        .map_err(|e| format!("MP3 flush error: {e:?}"))?;
+    unsafe { tail.set_len(n); }
+    out.write_all(&tail).map_err(|e| format!("Write error: {e}"))?;
+    Ok(())
+}
+
 #[tauri::command]
 fn save_audio_track(cue_path: String, track_number: u32, dest_path: String, format: String) -> Result<(), String> {
     let tracks = get_cue_tracks(cue_path)?;
@@ -953,6 +1050,7 @@ fn save_audio_track(cue_path: String, track_number: u32, dest_path: String, form
         .ok_or_else(|| format!("Audio track {track_number} not found"))?;
     match format.as_str() {
         "flac" => save_audio_as_flac(track, &dest_path),
+        "mp3"  => save_audio_as_mp3(track, &dest_path),
         _      => save_audio_as_wav(track, &dest_path),
     }
 }
@@ -1144,6 +1242,11 @@ fn open_cdi_fs(track: &DataTrack) -> Result<cdi_filesystem::CdiFs, String> {
     cdi_filesystem::CdiFs::new(bin, track.track_offset, track.user_data_offset, track.lba_offset, track.descramble)
 }
 
+fn open_pce_fs(track: &DataTrack) -> Result<pce_filesystem::PceFs, String> {
+    let bin = File::open(&track.bin_path).map_err(|e| format!("Cannot open: {e}"))?;
+    pce_filesystem::PceFs::new(bin, track.track_offset, track.user_data_offset)
+}
+
 fn open_iso_fs(track: &DataTrack) -> Result<ISO9660<MultiTrackBinReader>, String> {
     let bin = File::open(&track.bin_path).map_err(|e| format!("Cannot open: {e}"))?;
     let reader = MultiTrackBinReader::single(bin, track.track_offset, track.user_data_offset, track.lba_offset);
@@ -1226,6 +1329,8 @@ fn list_disc_contents(image_path: String, dir_path: String) -> Result<Vec<DiscEn
         };
         if cdi_filesystem::is_cdi_disc(&track.bin_path, track.track_offset, track.user_data_offset, track.lba_offset, track.descramble) {
             open_cdi_fs(&track)?.list_directory(&dir_path)
+        } else if pce_filesystem::is_pce_disc(&track.bin_path, track.track_offset, track.user_data_offset) {
+            open_pce_fs(&track)?.list_directory(&dir_path)
         } else if hfs_filesystem::is_hfs_disc(&track.bin_path, track.track_offset, track.user_data_offset) {
             open_hfs_fs(&track)?.list_directory(&dir_path)
         } else if udf_filesystem::is_udf_disc(&track.bin_path, track.track_offset, track.user_data_offset) {
@@ -1238,6 +1343,10 @@ fn list_disc_contents(image_path: String, dir_path: String) -> Result<Vec<DiscEn
     } else {
         let path_obj = Path::new(path);
         let user_data_offset = detect_raw_sector_offset(path_obj).unwrap_or(0);
+        if pce_filesystem::is_pce_disc(path_obj, 0, user_data_offset) {
+            let file = File::open(path).map_err(|e| format!("Cannot open file: {e}"))?;
+            return pce_filesystem::PceFs::new(file, 0, user_data_offset)?.list_directory(&dir_path);
+        }
         if udf_filesystem::is_udf_disc(path_obj, 0, user_data_offset) {
             let file = File::open(path).map_err(|e| format!("Cannot open file: {e}"))?;
             if let Ok(mut udf) = udf_filesystem::UdfFs::new(file, 0, user_data_offset) {
@@ -1276,6 +1385,8 @@ fn save_file(image_path: String, file_path: String, dest_path: String) -> Result
         };
         if cdi_filesystem::is_cdi_disc(&track.bin_path, track.track_offset, track.user_data_offset, track.lba_offset, track.descramble) {
             open_cdi_fs(&track)?.extract_file(&file_path, &dest_path)
+        } else if pce_filesystem::is_pce_disc(&track.bin_path, track.track_offset, track.user_data_offset) {
+            open_pce_fs(&track)?.extract_file(&file_path, &dest_path)
         } else if hfs_filesystem::is_hfs_disc(&track.bin_path, track.track_offset, track.user_data_offset) {
             open_hfs_fs(&track)?.extract_file(&file_path, &dest_path)
         } else if udf_filesystem::is_udf_disc(&track.bin_path, track.track_offset, track.user_data_offset) {
@@ -1288,6 +1399,10 @@ fn save_file(image_path: String, file_path: String, dest_path: String) -> Result
     } else {
         let path_obj = Path::new(path);
         let user_data_offset = detect_raw_sector_offset(path_obj).unwrap_or(0);
+        if pce_filesystem::is_pce_disc(path_obj, 0, user_data_offset) {
+            let file = File::open(path).map_err(|e| format!("Cannot open file: {e}"))?;
+            return pce_filesystem::PceFs::new(file, 0, user_data_offset)?.extract_file(&file_path, &dest_path);
+        }
         if udf_filesystem::is_udf_disc(path_obj, 0, user_data_offset) {
             let file = File::open(path).map_err(|e| format!("Cannot open file: {e}"))?;
             if let Ok(mut udf) = udf_filesystem::UdfFs::new(file, 0, user_data_offset) {
@@ -1329,6 +1444,8 @@ fn save_directory(image_path: String, dir_path: String, dest_path: String) -> Re
         };
         if cdi_filesystem::is_cdi_disc(&track.bin_path, track.track_offset, track.user_data_offset, track.lba_offset, track.descramble) {
             open_cdi_fs(&track)?.extract_directory(&dir_path, &dest_path)
+        } else if pce_filesystem::is_pce_disc(&track.bin_path, track.track_offset, track.user_data_offset) {
+            open_pce_fs(&track)?.extract_directory(&dir_path, &dest_path)
         } else if hfs_filesystem::is_hfs_disc(&track.bin_path, track.track_offset, track.user_data_offset) {
             open_hfs_fs(&track)?.extract_directory(&dir_path, &dest_path)
         } else if udf_filesystem::is_udf_disc(&track.bin_path, track.track_offset, track.user_data_offset) {
@@ -1341,6 +1458,10 @@ fn save_directory(image_path: String, dir_path: String, dest_path: String) -> Re
     } else {
         let path_obj = Path::new(path);
         let user_data_offset = detect_raw_sector_offset(path_obj).unwrap_or(0);
+        if pce_filesystem::is_pce_disc(path_obj, 0, user_data_offset) {
+            let file = File::open(path).map_err(|e| format!("Cannot open file: {e}"))?;
+            return pce_filesystem::PceFs::new(file, 0, user_data_offset)?.extract_directory(&dir_path, &dest_path);
+        }
         if udf_filesystem::is_udf_disc(path_obj, 0, user_data_offset) {
             let file = File::open(path).map_err(|e| format!("Cannot open file: {e}"))?;
             if let Ok(mut udf) = udf_filesystem::UdfFs::new(file, 0, user_data_offset) {
@@ -1375,7 +1496,7 @@ pub fn run() {
             list_disc_contents, save_file, save_directory,
             get_cue_tracks, save_audio_track, list_optical_drives,
             get_mds_tracks, mount_disc_image, unmount_disc_image,
-            get_disc_filesystems
+            get_disc_filesystems, read_sector
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -39,6 +39,36 @@ body {
   height: 100%;
   background: var(--bg);
   overflow: hidden;
+  position: relative;
+}
+
+.drag-overlay {
+  position: absolute;
+  inset: 0;
+  background: rgba(0, 120, 212, 0.18);
+  border: 2px dashed var(--accent);
+  border-radius: 4px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 500;
+  pointer-events: none;
+}
+
+.drag-overlay-inner {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+  color: var(--text-bright);
+  font-size: 15px;
+  font-weight: 500;
+  text-shadow: 0 1px 4px rgba(0,0,0,0.6);
+}
+
+.drag-overlay-icon {
+  font-size: 52px;
+  filter: drop-shadow(0 2px 6px rgba(0,0,0,0.5));
 }
 
 .main {
@@ -541,6 +571,175 @@ th.col-save { text-align: center; }
 .row-data { cursor: pointer; }
 .row-data td { color: var(--text-muted); }
 .row-data .col-name { color: var(--text-bright); }
+
+/* ── Sector View ── */
+
+.sv-modal {
+  width: min(680px, 96vw);
+  max-height: 88vh;
+  display: flex;
+  flex-direction: column;
+}
+
+.sv-nav {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 12px;
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+  background: var(--bg-toolbar);
+}
+
+.sv-nav-label {
+  font-size: 12px;
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+
+.sv-input {
+  width: 88px;
+  padding: 3px 6px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  color: var(--text-bright);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  text-align: right;
+}
+.sv-input:focus { outline: 1px solid var(--accent); border-color: var(--accent); }
+.sv-input::-webkit-inner-spin-button,
+.sv-input::-webkit-outer-spin-button { opacity: 0.4; }
+
+.sv-total {
+  font-size: 11px;
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+
+.sv-nav-btns {
+  display: flex;
+  gap: 2px;
+  margin-left: 4px;
+}
+
+.sv-btn {
+  padding: 3px 8px;
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  color: var(--text);
+  font-size: 11px;
+  cursor: pointer;
+  line-height: 1;
+}
+.sv-btn:hover:not(:disabled) { background: #3a3a3a; color: var(--text-bright); }
+.sv-btn:disabled { opacity: 0.3; cursor: default; }
+
+.sv-info {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  padding: 5px 12px;
+  background: #252526;
+  border-bottom: 1px solid var(--border);
+  font-size: 11px;
+  color: var(--text-muted);
+  flex-shrink: 0;
+  flex-wrap: wrap;
+}
+
+.sv-info-left {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.sv-info strong { color: var(--text-bright); font-weight: 600; }
+
+.sv-badge {
+  padding: 1px 6px;
+  border-radius: 3px;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+}
+.sv-badge-cd  { background: #0a3a5c; color: #9cdcfe; }
+.sv-badge-iso { background: #1a3a1a; color: #9cdc9c; }
+
+.sv-sep { color: var(--border); }
+
+.sv-legend {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-shrink: 0;
+}
+
+.sv-leg {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 10px;
+  color: var(--text-muted);
+}
+
+.sv-swatch {
+  display: inline-block;
+  width: 10px;
+  height: 10px;
+  border-radius: 2px;
+}
+
+.sv-error {
+  margin: 8px 12px;
+  padding: 6px 10px;
+  background: #3a1a1a;
+  border: 1px solid #6e2a2a;
+  border-radius: 4px;
+  color: #f87171;
+  font-size: 12px;
+  flex-shrink: 0;
+}
+
+.sv-hex-area {
+  flex: 1;
+  overflow-y: auto;
+  overflow-x: auto;
+  padding: 8px 12px 12px;
+  background: var(--bg);
+}
+
+.sv-hex-dump {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 18px;
+}
+
+.hex-row {
+  display: block;
+  white-space: pre;
+  color: var(--text);
+  border-radius: 2px;
+}
+.hex-row:hover { background: var(--bg-row-hover); }
+
+.hex-addr { color: #606060; }
+
+/* Byte colour classes */
+.hb-sync { color: #4a4a4a; }
+.hb-hdr  { color: #9cdcfe; }
+.hb-sub  { color: #dcdcaa; }
+.hb-ecc  { color: #505050; }
+
+/* Swatch colours must match */
+.sv-swatch.hb-sync { background: #4a4a4a; }
+.sv-swatch.hb-hdr  { background: #9cdcfe; }
+.sv-swatch.hb-sub  { background: #dcdcaa; }
+.sv-swatch.hb-ecc  { background: #505050; }
 
 /* ── Error ── */
 

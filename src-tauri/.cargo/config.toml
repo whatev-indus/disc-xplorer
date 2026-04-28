@@ -1,2 +1,5 @@
 [target.aarch64-apple-darwin]
 rustflags = ["-L", "/opt/homebrew/lib"]
+
+[build]
+target-dir = "/Volumes/Projects/.cargo-build"

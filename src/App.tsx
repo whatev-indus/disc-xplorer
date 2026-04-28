@@ -1,6 +1,8 @@
 import { useState, useCallback, useRef, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { open, save } from "@tauri-apps/plugin-dialog";
+import { SectorView } from "./SectorView";
 import "./App.css";
 
 interface DiscEntry {
@@ -164,8 +166,10 @@ function App() {
   });
   const [showSettings, setShowSettings] = useState(false);
   const [showLicenses, setShowLicenses] = useState(false);
-  const [audioFormat, setAudioFormat] = useState<"wav" | "flac">("wav");
+  const [audioFormat, setAudioFormat] = useState<"wav" | "flac" | "mp3">("wav");
   const [defaultDownloadPath, setDefaultDownloadPath] = useState<string>("");
+  const [isDragOver, setIsDragOver] = useState(false);
+  const [showSectorView, setShowSectorView] = useState(false);
 
   const dragRef = useRef<{ col: keyof ColWidths; startX: number; startWidth: number } | null>(null);
   const driveMenuRef = useRef<HTMLDivElement>(null);
@@ -257,18 +261,14 @@ function App() {
     }));
   }
 
-  async function openImage() {
-    const selected = await open({
-      filters: [{ name: "Disc Images", extensions: ["iso", "img", "cue", "mds"] }],
-    });
-    if (!selected) return;
-    const path = selected as string;
-    const name = path.split("/").pop() ?? path;
+  async function openImageAtPath(path: string) {
+    const name = path.split(/[/\\]/).pop() ?? path;
     setImagePath(path);
     setSourceImagePath(path);
     setImageName(name);
     setError(null);
     setEmptyDriveName(null);
+    setMountedDevice(null);
 
     const lowerPath = path.toLowerCase();
     const isCue = lowerPath.endsWith(".cue");
@@ -359,6 +359,33 @@ function App() {
       setTree([{ ...rootNode, expanded: true, children: subDirs }]);
     }
   }
+
+  async function openImage() {
+    const selected = await open({
+      filters: [{ name: "Disc Images", extensions: ["iso", "img", "cue", "mds"] }],
+    });
+    if (!selected) return;
+    await openImageAtPath(selected as string);
+  }
+
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    getCurrentWebview().onDragDropEvent((event) => {
+      if (event.payload.type === "drop") {
+        setIsDragOver(false);
+        const supported = ["iso", "img", "cue", "mds"];
+        const path = event.payload.paths.find((p) =>
+          supported.some((ext) => p.toLowerCase().endsWith(`.${ext}`))
+        );
+        if (path) openImageAtPath(path);
+      } else if (event.payload.type === "leave") {
+        setIsDragOver(false);
+      } else {
+        setIsDragOver(true);
+      }
+    }).then((fn) => { unlisten = fn; });
+    return () => { unlisten?.(); };
+  }, []);
 
   async function mountImage() {
     if (!sourceImagePath) return;
@@ -613,7 +640,7 @@ function App() {
       ? `${defaultDownloadPath}/${entry.name}.${ext}`
       : await save({
           defaultPath: `${entry.name}.${ext}`,
-          filters: [{ name: ext === "flac" ? "FLAC Audio" : "WAV Audio", extensions: [ext] }],
+          filters: [{ name: ext === "flac" ? "FLAC Audio" : ext === "mp3" ? "MP3 Audio" : "WAV Audio", extensions: [ext] }],
         });
     if (!destPath) return;
     try {
@@ -664,6 +691,14 @@ function App() {
 
   return (
     <div className="app">
+      {isDragOver && (
+        <div className="drag-overlay">
+          <div className="drag-overlay-inner">
+            <div className="drag-overlay-icon">💿</div>
+            <p>Drop disc image to open</p>
+          </div>
+        </div>
+      )}
       <div className="toolbar">
         <div className="toolbar-left" />
         <div className="toolbar-center">
@@ -710,6 +745,12 @@ function App() {
               <button className="btn-icon" onClick={navigateUp} disabled={currentPath === "/"} title="Up">↑</button>
             </>
           )}
+          {sourceImagePath && (
+            <>
+              <div className="separator" />
+              <button className="btn-icon" onClick={() => setShowSectorView(true)} title="Sector View">🔍</button>
+            </>
+          )}
         </div>
         <div className="toolbar-right">
           <a className="btn-prerelease" href="https://github.com/whatev-indus/disc-xplorer/releases" target="_blank" rel="noreferrer">PRE-RELEASE BUILD! CLICK TO UPDATE</a>
@@ -727,7 +768,7 @@ function App() {
           <div className="settings-row">
             <span className="settings-label">Save Audio (PCM) as</span>
             <div className="settings-radio-group">
-              {(["wav", "flac"] as const).map(fmt => (
+              {(["wav", "flac", "mp3"] as const).map(fmt => (
                 <label key={fmt} className="settings-radio">
                   <input type="radio" name="audioFormat" value={fmt} checked={audioFormat === fmt} onChange={() => setAudioFormat(fmt)} />
                   .{fmt}
@@ -782,6 +823,14 @@ DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
 THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
 (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.`}</pre>
+              <p className="license-package" style={{ marginTop: "16px" }}>LAME — MP3 audio encoding</p>
+              <pre className="license-text">{`Copyright (c) 1999-2011 The L.A.M.E. project
+
+LAME is licensed under the GNU Lesser General Public License (LGPL)
+version 2 or later. This application is licensed under GPL v3, which
+is compatible with and satisfies the requirements of the LGPL.
+
+Source: https://lame.sourceforge.io`}</pre>
               <p className="license-package" style={{ marginTop: "16px" }}>libflac-sys — Rust bindings for libFLAC</p>
               <pre className="license-text">{`Copyright (c) 2020 Matthias Geier. All rights reserved.
 
@@ -815,6 +864,10 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.`}</pre>
             </div>
           </div>
         </div>
+      )}
+
+      {showSectorView && sourceImagePath && (
+        <SectorView imagePath={sourceImagePath} onClose={() => setShowSectorView(false)} />
       )}
 
       {(imagePath || viewMode === "empty-drive") && (
@@ -935,7 +988,7 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.`}</pre>
         <span className="statusbar-left">{statusText}</span>
         <a className="statusbar-brand" href="https://sites.google.com/view/whateverindustries/home" target="_blank" rel="noreferrer">whatev.indus</a>
         <span className="statusbar-right">
-          <span className="statusbar-version">v0.0.1</span>
+          <span className="statusbar-version">v0.1.9</span>
         </span>
       </div>
     </div>

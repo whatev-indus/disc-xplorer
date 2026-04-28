@@ -98,7 +98,7 @@ jobs:
       - name: Package macOS artifact
         if: matrix.platform == 'macos-14'
         run: |
-          BUNDLE_DIR="../.cargo-build/${{ matrix.target }}/release/bundle/macos"
+          BUNDLE_DIR="src-tauri/target/${{ matrix.target }}/release/bundle/macos"
           codesign --force --deep --sign - "$BUNDLE_DIR/Disc Xplorer.app"
           cd "$BUNDLE_DIR"
           zip -r "$GITHUB_WORKSPACE/Disc Xplorer_macOS_ARM_v${{ steps.version.outputs.VERSION }}.zip" "Disc Xplorer.app"
@@ -107,13 +107,13 @@ jobs:
         if: matrix.platform == 'windows-latest'
         shell: powershell
         run: |
-          $msi = Get-ChildItem -Recurse -Path "../.cargo-build/${{ matrix.target }}/release/bundle/msi" -Filter "*.msi" | Select-Object -First 1
+          $msi = Get-ChildItem -Recurse -Path "src-tauri/target/${{ matrix.target }}/release/bundle/msi" -Filter "*.msi" | Select-Object -First 1
           Copy-Item $msi.FullName "Disc Xplorer_Windows_v${{ steps.version.outputs.VERSION }}.msi"
 
       - name: Package Linux artifact
         if: matrix.platform == 'ubuntu-22.04'
         run: |
-          APPIMAGE=$(find ../.cargo-build/${{ matrix.target }}/release/bundle/appimage -name "*.AppImage" | head -1)
+          APPIMAGE=$(find src-tauri/target/${{ matrix.target }}/release/bundle/appimage -name "*.AppImage" | head -1)
           cp "$APPIMAGE" "Disc Xplorer_Linux_v${{ steps.version.outputs.VERSION }}.AppImage"
 
       - name: Upload artifact

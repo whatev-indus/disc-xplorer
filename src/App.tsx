@@ -81,9 +81,11 @@ function formatDuration(sectors: number): string {
   return `${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}.${String(f).padStart(2, "0")}`;
 }
 
-function isMountable(path: string): boolean {
+function isMountable(path: string, platform: string): boolean {
   const lower = path.toLowerCase();
-  return lower.endsWith(".iso") || lower.endsWith(".img") || lower.endsWith(".dmg") || lower.endsWith(".cdr");
+  if (lower.endsWith(".iso") || lower.endsWith(".img") || lower.endsWith(".dmg") || lower.endsWith(".cdr")) return true;
+  if (platform === "linux" && (lower.endsWith(".cue") || lower.endsWith(".mds") || lower.endsWith(".mdx"))) return true;
+  return false;
 }
 
 function TreeItem({
@@ -170,11 +172,16 @@ function App() {
   const [defaultDownloadPath, setDefaultDownloadPath] = useState<string>("");
   const [isDragOver, setIsDragOver] = useState(false);
   const [showSectorView, setShowSectorView] = useState(false);
+  const [platform, setPlatform] = useState<string>("");
 
   const dragRef = useRef<{ col: keyof ColWidths; startX: number; startWidth: number } | null>(null);
   const driveMenuRef = useRef<HTMLDivElement>(null);
   const settingsRef = useRef<HTMLDivElement>(null);
   const settingsGearRef = useRef<HTMLButtonElement>(null);
+
+  useEffect(() => {
+    invoke<string>("get_platform").then(setPlatform);
+  }, []);
 
   useEffect(() => {
     function handleOutsideClick(e: MouseEvent) {
@@ -362,7 +369,7 @@ function App() {
 
   async function openImage() {
     const selected = await open({
-      filters: [{ name: "Disc Images", extensions: ["iso", "img", "cue", "mds"] }],
+      filters: [{ name: "Disc Images", extensions: ["iso", "img", "cue", "mds", "mdx"] }],
     });
     if (!selected) return;
     await openImageAtPath(selected as string);
@@ -373,7 +380,7 @@ function App() {
     getCurrentWebview().onDragDropEvent((event) => {
       if (event.payload.type === "drop") {
         setIsDragOver(false);
-        const supported = ["iso", "img", "cue", "mds"];
+        const supported = ["iso", "img", "cue", "mds", "mdx"];
         const path = event.payload.paths.find((p) =>
           supported.some((ext) => p.toLowerCase().endsWith(`.${ext}`))
         );
@@ -705,7 +712,7 @@ function App() {
           <button className="btn-open" onClick={openImage}>Open Disc Image</button>
           {mountedDevice
             ? <button className="btn-open btn-open-secondary btn-unmount" onClick={unmountImage}>Unmount Disc Image</button>
-            : sourceImagePath && isMountable(sourceImagePath)
+            : sourceImagePath && isMountable(sourceImagePath, platform)
               ? <button className="btn-open btn-open-secondary" onClick={mountImage}>Mount Disc Image</button>
               : null
           }
@@ -988,7 +995,7 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.`}</pre>
         <span className="statusbar-left">{statusText}</span>
         <a className="statusbar-brand" href="https://sites.google.com/view/whateverindustries/home" target="_blank" rel="noreferrer">whatev.indus</a>
         <span className="statusbar-right">
-          <span className="statusbar-version">v0.1.9</span>
+          <span className="statusbar-version">v0.1.10</span>
         </span>
       </div>
     </div>

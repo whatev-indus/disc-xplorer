@@ -722,7 +722,8 @@ impl UdfFs {
         }
 
         for (name, child_lbn, child_part_ref, is_dir) in children {
-            let child_path = dest.join(&name);
+            let name = name.trim_end_matches(|c| c == '/' || c == '\\');
+            let child_path = dest.join(name);
             if is_dir {
                 self.extract_dir_at(child_lbn, child_part_ref, &child_path)?;
             } else {

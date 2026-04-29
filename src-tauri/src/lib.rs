@@ -237,6 +237,8 @@ fn get_disc_filesystems(image_path: String) -> Result<Vec<String>, String> {
     } else if lower.ends_with(".mds") {
         let track = parse_mds_for_data_track(path)?;
         Ok(detect_filesystems_in_bin(&track.bin_path, track.track_offset, track.user_data_offset, track.lba_offset, track.descramble))
+    } else if lower.ends_with(".mdx") {
+        Ok(detect_filesystems_mdx(path))
     } else {
         Ok(detect_filesystems_raw(path))
     }
@@ -418,6 +420,84 @@ fn extract_quoted(line: &str) -> Option<&str> {
     let start = line.find('"')? + 1;
     let end = line[start..].find('"')? + start;
     Some(&line[start..end])
+}
+
+// ── MDX support ───────────────────────────────────────────────────────────────
+
+// MDX (Daemon Tools v2) is a single-file format: 64-byte header + raw sector
+// data + an encrypted descriptor tail.  The sector data is unencrypted, so we
+// can read it directly without touching the tail.
+
+const MDX_DATA_OFFSET: u64 = 0x40; // sector data begins here in every MDX file
+
+fn is_mdx_file(path: &Path) -> bool {
+    let Ok(mut f) = File::open(path) else { return false };
+    let mut buf = [0u8; 17];
+    f.read_exact(&mut buf).is_ok()
+        && &buf[..16] == b"MEDIA DESCRIPTOR"
+        && buf[16] == 0x02
+}
+
+// Returns (sector_size, user_data_offset) for the data section starting at MDX_DATA_OFFSET.
+fn mdx_sector_format(path: &Path) -> (u64, u64) {
+    let Ok(mut f) = File::open(path) else { return (2048, 0) };
+    if f.seek(SeekFrom::Start(MDX_DATA_OFFSET)).is_err() { return (2048, 0) }
+    let mut buf = [0u8; 16];
+    if f.read_exact(&mut buf).is_err() { return (2048, 0) }
+    const SYNC: [u8; 12] = [0x00,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0x00];
+    if buf[..12] == SYNC {
+        (2352, if buf[15] == 2 { 24 } else { 16 })
+    } else {
+        (2048, 0)
+    }
+}
+
+fn parse_mdx_as_data_track(path: &Path) -> DataTrack {
+    let (sector_size, user_data_offset) = mdx_sector_format(path);
+    let lba_offset = if sector_size == 2352 { sector_lba_at(path, MDX_DATA_OFFSET) } else { 0 };
+    DataTrack { bin_path: path.to_path_buf(), track_offset: MDX_DATA_OFFSET, user_data_offset, lba_offset, descramble: false, sector_count: 0 }
+}
+
+// ISO9660Reader for 2048-byte logical MDX sectors (the common case).
+struct MdxReader { file: File }
+
+impl ISO9660Reader for MdxReader {
+    fn read_at(&mut self, buf: &mut [u8], lba: u64) -> io::Result<usize> {
+        self.file.seek(SeekFrom::Start(MDX_DATA_OFFSET + lba * 2048))?;
+        self.file.read(buf)
+    }
+}
+
+fn open_iso_fs_mdx(path: &Path) -> Result<ISO9660<MdxReader>, String> {
+    let file = File::open(path).map_err(|e| format!("Cannot open MDX: {e}"))?;
+    ISO9660::new(MdxReader { file }).map_err(|e| format!("Invalid MDX disc image: {e}"))
+}
+
+fn detect_filesystems_mdx(path: &Path) -> Vec<String> {
+    let (sector_size, user_data_offset) = mdx_sector_format(path);
+    if sector_size == 2352 {
+        return detect_filesystems_in_bin(path, MDX_DATA_OFFSET, user_data_offset, 0, false);
+    }
+    // 2048-byte logical sectors — scan volume descriptors directly.
+    let Ok(mut f) = File::open(path) else { return vec!["ISO 9660".to_string()] };
+    let mut result = vec!["ISO 9660".to_string()];
+    for lba in 17u64..32 {
+        let pos = MDX_DATA_OFFSET + lba * 2048;
+        if f.seek(SeekFrom::Start(pos)).is_err() { break; }
+        let mut buf = [0u8; 2048];
+        if f.read_exact(&mut buf).is_err() { break; }
+        match buf[0] {
+            0xFF => break,
+            0x02 => {
+                let esc = &buf[88..120];
+                if esc.starts_with(b"%/@") || esc.starts_with(b"%/C") || esc.starts_with(b"%/E") {
+                    result.push("Joliet".to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+    result
 }
 
 // ── MDS/MDF support ───────────────────────────────────────────────────────────
@@ -620,6 +700,57 @@ fn mount_disc_image(
 
     #[cfg(target_os = "linux")]
     {
+        let lower = image_path.to_lowercase();
+        let use_cdemu = lower.ends_with(".cue") || lower.ends_with(".mds") || lower.ends_with(".mdx");
+
+        if use_cdemu {
+            let before = sr_devices();
+
+            let load_out = Command::new("cdemu")
+                .args(["load", "0", &image_path])
+                .output()
+                .map_err(|e| format!("cdemu load failed: {e}"))?;
+
+            if !load_out.status.success() {
+                return Err(String::from_utf8_lossy(&load_out.stderr).trim().to_string());
+            }
+
+            // Give the kernel time to expose the virtual device.
+            std::thread::sleep(std::time::Duration::from_millis(1500));
+
+            let after = sr_devices();
+            let new_dev = after.into_iter()
+                .find(|d| !before.contains(d))
+                .ok_or_else(|| "CDemu: virtual drive did not appear as /dev/srN".to_string())?;
+
+            // Mount via udisksctl; fall back to lsblk if auto-mounted by desktop.
+            let mount_out = Command::new("udisksctl")
+                .args(["mount", "-b", &new_dev])
+                .output()
+                .map_err(|e| format!("udisksctl mount failed: {e}"))?;
+
+            let mount_point = if mount_out.status.success() {
+                let text = String::from_utf8_lossy(&mount_out.stdout);
+                text.split(" at ").nth(1).unwrap_or("").trim().trim_end_matches('.').to_string()
+            } else {
+                // Desktop environment may have auto-mounted it — query lsblk.
+                let lsblk = Command::new("lsblk")
+                    .args(["-no", "MOUNTPOINT", &new_dev])
+                    .output()
+                    .map_err(|e| format!("lsblk failed: {e}"))?;
+                String::from_utf8_lossy(&lsblk.stdout).trim().to_string()
+            };
+
+            if mount_point.is_empty() {
+                let _ = Command::new("cdemu").args(["unload", "0"]).output();
+                return Err("CDemu: could not determine mount point".to_string());
+            }
+
+            let device_key = format!("cdemu:0:{new_dev}");
+            state.0.lock().unwrap().push(device_key.clone());
+            return Ok(MountResult { mount_point, device: device_key });
+        }
+
         let loop_out = Command::new("udisksctl")
             .args(["loop-setup", "-f", &image_path])
             .output()
@@ -670,6 +801,19 @@ fn mount_disc_image(
     }
 }
 
+#[cfg(target_os = "linux")]
+fn sr_devices() -> Vec<String> {
+    std::fs::read_dir("/dev")
+        .map(|rd| {
+            rd.filter_map(|e| {
+                let e = e.ok()?;
+                let name = e.file_name().to_string_lossy().into_owned();
+                if name.starts_with("sr") { Some(format!("/dev/{name}")) } else { None }
+            }).collect()
+        })
+        .unwrap_or_default()
+}
+
 #[tauri::command]
 fn unmount_disc_image(
     device: String,
@@ -703,14 +847,28 @@ fn unmount_disc_image(
 
     #[cfg(target_os = "linux")]
     {
-        let _ = Command::new("udisksctl").args(["unmount", "-b", &device]).output();
-        let out = Command::new("udisksctl")
-            .args(["loop-delete", "-b", &device])
-            .output()
-            .map_err(|e| format!("udisksctl loop-delete failed: {e}"))?;
-
-        if !out.status.success() {
-            return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
+        if device.starts_with("cdemu:") {
+            let mut parts = device.splitn(3, ':');
+            let _ = parts.next();
+            let slot = parts.next().unwrap_or("0");
+            let dev = parts.next().unwrap_or("");
+            let _ = Command::new("udisksctl").args(["unmount", "-b", dev]).output();
+            let out = Command::new("cdemu")
+                .args(["unload", slot])
+                .output()
+                .map_err(|e| format!("cdemu unload failed: {e}"))?;
+            if !out.status.success() {
+                return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
+            }
+        } else {
+            let _ = Command::new("udisksctl").args(["unmount", "-b", &device]).output();
+            let out = Command::new("udisksctl")
+                .args(["loop-delete", "-b", &device])
+                .output()
+                .map_err(|e| format!("udisksctl loop-delete failed: {e}"))?;
+            if !out.status.success() {
+                return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
+            }
         }
     }
 
@@ -737,9 +895,26 @@ fn detach_all(devices: &[String]) {
 
     #[cfg(target_os = "linux")]
     for device in devices {
-        let _ = Command::new("udisksctl").args(["unmount", "-b", device]).output();
-        let _ = Command::new("udisksctl").args(["loop-delete", "-b", device]).output();
+        if device.starts_with("cdemu:") {
+            let parts: Vec<&str> = device.splitn(3, ':').collect();
+            let slot = parts.get(1).copied().unwrap_or("0");
+            let dev = parts.get(2).copied().unwrap_or("");
+            let _ = Command::new("udisksctl").args(["unmount", "-b", dev]).output();
+            let _ = Command::new("cdemu").args(["unload", slot]).output();
+        } else {
+            let _ = Command::new("udisksctl").args(["unmount", "-b", device]).output();
+            let _ = Command::new("udisksctl").args(["loop-delete", "-b", device]).output();
+        }
     }
+}
+
+// ── Platform ──────────────────────────────────────────────────────────────────
+
+#[tauri::command]
+fn get_platform() -> &'static str {
+    if cfg!(target_os = "linux") { "linux" }
+    else if cfg!(target_os = "macos") { "macos" }
+    else { "windows" }
 }
 
 // ── CUE track listing ─────────────────────────────────────────────────────────
@@ -887,20 +1062,23 @@ fn read_sector(image_path: String, lba: u64) -> Result<SectorData, String> {
     let path = Path::new(&image_path);
     let lower = image_path.to_lowercase();
 
-    let (file_path, sector_size, user_data_offset): (PathBuf, u64, u64) = if lower.ends_with(".cue") {
+    let (file_path, sector_size, user_data_offset, data_offset): (PathBuf, u64, u64, u64) = if lower.ends_with(".cue") {
         let track = parse_cue_for_data_track(path)?;
-        (track.bin_path, RAW_SECTOR_SIZE, track.user_data_offset)
+        (track.bin_path, RAW_SECTOR_SIZE, track.user_data_offset, 0)
     } else if lower.ends_with(".mds") {
         let track = parse_mds_for_data_track(path)?;
-        (track.bin_path, RAW_SECTOR_SIZE, track.user_data_offset)
+        (track.bin_path, RAW_SECTOR_SIZE, track.user_data_offset, 0)
+    } else if lower.ends_with(".mdx") {
+        let (ss, udo) = mdx_sector_format(path);
+        (path.to_path_buf(), ss, udo, MDX_DATA_OFFSET)
     } else {
         let udo = detect_raw_sector_offset(path).unwrap_or(0);
-        (path.to_path_buf(), if udo > 0 { RAW_SECTOR_SIZE } else { 2048u64 }, udo)
+        (path.to_path_buf(), if udo > 0 { RAW_SECTOR_SIZE } else { 2048u64 }, udo, 0)
     };
 
     let file_len = fs::metadata(&file_path)
         .map_err(|e| format!("Cannot stat image: {e}"))?.len();
-    let total_sectors = file_len / sector_size;
+    let total_sectors = file_len.saturating_sub(data_offset) / sector_size;
 
     if total_sectors == 0 { return Err("Image file is empty".to_string()); }
     if lba >= total_sectors {
@@ -908,7 +1086,7 @@ fn read_sector(image_path: String, lba: u64) -> Result<SectorData, String> {
     }
 
     let mut f = File::open(&file_path).map_err(|e| format!("Cannot open: {e}"))?;
-    f.seek(SeekFrom::Start(lba * sector_size)).map_err(|e| format!("Seek error: {e}"))?;
+    f.seek(SeekFrom::Start(data_offset + lba * sector_size)).map_err(|e| format!("Seek error: {e}"))?;
     let mut bytes = vec![0u8; sector_size as usize];
     f.read_exact(&mut bytes).map_err(|e| format!("Read error: {e}"))?;
 
@@ -1340,6 +1518,26 @@ fn list_disc_contents(image_path: String, dir_path: String) -> Result<Vec<DiscEn
         } else {
             collect_entries(&open_iso_fs(&track)?, &dir_path)
         }
+    } else if lower.ends_with(".mdx") {
+        let path_obj = Path::new(path);
+        let track = parse_mdx_as_data_track(path_obj);
+        if track.user_data_offset > 0 {
+            // 2352-byte raw sectors: reuse existing filesystem openers.
+            if cdi_filesystem::is_cdi_disc(&track.bin_path, track.track_offset, track.user_data_offset, track.lba_offset, track.descramble) {
+                open_cdi_fs(&track)?.list_directory(&dir_path)
+            } else if pce_filesystem::is_pce_disc(&track.bin_path, track.track_offset, track.user_data_offset) {
+                open_pce_fs(&track)?.list_directory(&dir_path)
+            } else if hfs_filesystem::is_hfs_disc(&track.bin_path, track.track_offset, track.user_data_offset) {
+                open_hfs_fs(&track)?.list_directory(&dir_path)
+            } else if udf_filesystem::is_udf_disc(&track.bin_path, track.track_offset, track.user_data_offset) {
+                open_udf_fs(&track)?.list_directory(&dir_path)
+            } else {
+                collect_entries(&open_iso_fs(&track)?, &dir_path)
+            }
+        } else {
+            // 2048-byte logical sectors: use MdxReader.
+            collect_entries(&open_iso_fs_mdx(path_obj)?, &dir_path)
+        }
     } else {
         let path_obj = Path::new(path);
         let user_data_offset = detect_raw_sector_offset(path_obj).unwrap_or(0);
@@ -1395,6 +1593,24 @@ fn save_file(image_path: String, file_path: String, dest_path: String) -> Result
             extract_file_from_fs(&open_iso_fs_for_cue(Path::new(path))?, &file_path, &dest_path)
         } else {
             extract_file_from_fs(&open_iso_fs(&track)?, &file_path, &dest_path)
+        }
+    } else if lower.ends_with(".mdx") {
+        let path_obj = Path::new(path);
+        let track = parse_mdx_as_data_track(path_obj);
+        if track.user_data_offset > 0 {
+            if cdi_filesystem::is_cdi_disc(&track.bin_path, track.track_offset, track.user_data_offset, track.lba_offset, track.descramble) {
+                open_cdi_fs(&track)?.extract_file(&file_path, &dest_path)
+            } else if pce_filesystem::is_pce_disc(&track.bin_path, track.track_offset, track.user_data_offset) {
+                open_pce_fs(&track)?.extract_file(&file_path, &dest_path)
+            } else if hfs_filesystem::is_hfs_disc(&track.bin_path, track.track_offset, track.user_data_offset) {
+                open_hfs_fs(&track)?.extract_file(&file_path, &dest_path)
+            } else if udf_filesystem::is_udf_disc(&track.bin_path, track.track_offset, track.user_data_offset) {
+                open_udf_fs(&track)?.extract_file(&file_path, &dest_path)
+            } else {
+                extract_file_from_fs(&open_iso_fs(&track)?, &file_path, &dest_path)
+            }
+        } else {
+            extract_file_from_fs(&open_iso_fs_mdx(path_obj)?, &file_path, &dest_path)
         }
     } else {
         let path_obj = Path::new(path);
@@ -1455,6 +1671,24 @@ fn save_directory(image_path: String, dir_path: String, dest_path: String) -> Re
         } else {
             extract_dir_from_fs(&open_iso_fs(&track)?, &dir_path, &dest_path)
         }
+    } else if lower.ends_with(".mdx") {
+        let path_obj = Path::new(path);
+        let track = parse_mdx_as_data_track(path_obj);
+        if track.user_data_offset > 0 {
+            if cdi_filesystem::is_cdi_disc(&track.bin_path, track.track_offset, track.user_data_offset, track.lba_offset, track.descramble) {
+                open_cdi_fs(&track)?.extract_directory(&dir_path, &dest_path)
+            } else if pce_filesystem::is_pce_disc(&track.bin_path, track.track_offset, track.user_data_offset) {
+                open_pce_fs(&track)?.extract_directory(&dir_path, &dest_path)
+            } else if hfs_filesystem::is_hfs_disc(&track.bin_path, track.track_offset, track.user_data_offset) {
+                open_hfs_fs(&track)?.extract_directory(&dir_path, &dest_path)
+            } else if udf_filesystem::is_udf_disc(&track.bin_path, track.track_offset, track.user_data_offset) {
+                open_udf_fs(&track)?.extract_directory(&dir_path, &dest_path)
+            } else {
+                extract_dir_from_fs(&open_iso_fs(&track)?, &dir_path, &dest_path)
+            }
+        } else {
+            extract_dir_from_fs(&open_iso_fs_mdx(path_obj)?, &dir_path, &dest_path)
+        }
     } else {
         let path_obj = Path::new(path);
         let user_data_offset = detect_raw_sector_offset(path_obj).unwrap_or(0);
@@ -1496,7 +1730,7 @@ pub fn run() {
             list_disc_contents, save_file, save_directory,
             get_cue_tracks, save_audio_track, list_optical_drives,
             get_mds_tracks, mount_disc_image, unmount_disc_image,
-            get_disc_filesystems, read_sector
+            get_disc_filesystems, read_sector, get_platform
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -92,7 +92,7 @@ jobs:
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          CARGO_TARGET_DIR: src-tauri/target
+          CARGO_TARGET_DIR: ${{ github.workspace }}/src-tauri/target
         with:
           args: --target ${{ matrix.target }}
 

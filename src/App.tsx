@@ -84,7 +84,7 @@ function formatDuration(sectors: number): string {
 function isMountable(path: string, platform: string): boolean {
   const lower = path.toLowerCase();
   if (lower.endsWith(".iso") || lower.endsWith(".img") || lower.endsWith(".dmg") || lower.endsWith(".cdr")) return true;
-  if (platform === "linux" && (lower.endsWith(".cue") || lower.endsWith(".mds") || lower.endsWith(".mdx"))) return true;
+  if (platform === "linux" && (lower.endsWith(".cue") || lower.endsWith(".mds") || lower.endsWith(".mdx") || lower.endsWith(".nrg") || lower.endsWith(".ccd"))) return true;
   return false;
 }
 
@@ -369,7 +369,7 @@ function App() {
 
   async function openImage() {
     const selected = await open({
-      filters: [{ name: "Disc Images", extensions: ["iso", "img", "cue", "mds", "mdx"] }],
+      filters: [{ name: "Disc Images", extensions: ["iso", "img", "cue", "mds", "mdx", "nrg", "ccd"] }],
     });
     if (!selected) return;
     await openImageAtPath(selected as string);
@@ -380,7 +380,7 @@ function App() {
     getCurrentWebview().onDragDropEvent((event) => {
       if (event.payload.type === "drop") {
         setIsDragOver(false);
-        const supported = ["iso", "img", "cue", "mds", "mdx"];
+        const supported = ["iso", "img", "cue", "mds", "mdx", "nrg", "ccd"];
         const path = event.payload.paths.find((p) =>
           supported.some((ext) => p.toLowerCase().endsWith(`.${ext}`))
         );
@@ -995,7 +995,7 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.`}</pre>
         <span className="statusbar-left">{statusText}</span>
         <a className="statusbar-brand" href="https://sites.google.com/view/whateverindustries/home" target="_blank" rel="noreferrer">whatev.indus</a>
         <span className="statusbar-right">
-          <span className="statusbar-version">v0.1.10</span>
+          <span className="statusbar-version">v0.1.11</span>
         </span>
       </div>
     </div>

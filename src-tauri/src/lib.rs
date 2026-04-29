@@ -190,6 +190,18 @@ fn detect_raw_sector_offset(path: &Path) -> Option<u64> {
     Some(if buf[15] == 2 { 24 } else { 16 })
 }
 
+// Probe bytes at `offset` in the file for the CD sync pattern.
+// Returns (sector_size, user_data_offset): (2352, 16|24) for raw sectors,
+// (2048, 0) for logical 2048-byte sectors or unrecognised data.
+fn detect_sector_format_at(path: &Path, offset: u64) -> (u64, u64) {
+    let Ok(mut f) = File::open(path) else { return (2048, 0) };
+    if f.seek(SeekFrom::Start(offset)).is_err() { return (2048, 0) }
+    let mut buf = [0u8; 16];
+    if f.read_exact(&mut buf).is_err() { return (2048, 0) }
+    const SYNC: [u8; 12] = [0x00,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0x00];
+    if buf[..12] == SYNC { (2352, if buf[15] == 2 { 24 } else { 16 }) } else { (2048, 0) }
+}
+
 fn detect_filesystems_raw(path: &Path) -> Vec<String> {
     let user_data_offset = detect_raw_sector_offset(path).unwrap_or(0);
     if pce_filesystem::is_pce_disc(path, 0, user_data_offset) {
@@ -231,11 +243,11 @@ fn detect_filesystems_raw(path: &Path) -> Vec<String> {
 fn get_disc_filesystems(image_path: String) -> Result<Vec<String>, String> {
     let path = Path::new(&image_path);
     let lower = image_path.to_lowercase();
-    if lower.ends_with(".cue") {
-        let track = parse_cue_for_data_track(path)?;
-        Ok(detect_filesystems_in_bin(&track.bin_path, track.track_offset, track.user_data_offset, track.lba_offset, track.descramble))
-    } else if lower.ends_with(".mds") {
-        let track = parse_mds_for_data_track(path)?;
+    if lower.ends_with(".cue") || lower.ends_with(".mds") || lower.ends_with(".nrg") || lower.ends_with(".ccd") {
+        let track = if lower.ends_with(".cue") { parse_cue_for_data_track(path)? }
+            else if lower.ends_with(".mds") { parse_mds_for_data_track(path)? }
+            else if lower.ends_with(".nrg") { parse_nrg_for_data_track(path)? }
+            else { parse_ccd_for_data_track(path)? };
         Ok(detect_filesystems_in_bin(&track.bin_path, track.track_offset, track.user_data_offset, track.lba_offset, track.descramble))
     } else if lower.ends_with(".mdx") {
         Ok(detect_filesystems_mdx(path))
@@ -438,18 +450,8 @@ fn is_mdx_file(path: &Path) -> bool {
         && buf[16] == 0x02
 }
 
-// Returns (sector_size, user_data_offset) for the data section starting at MDX_DATA_OFFSET.
 fn mdx_sector_format(path: &Path) -> (u64, u64) {
-    let Ok(mut f) = File::open(path) else { return (2048, 0) };
-    if f.seek(SeekFrom::Start(MDX_DATA_OFFSET)).is_err() { return (2048, 0) }
-    let mut buf = [0u8; 16];
-    if f.read_exact(&mut buf).is_err() { return (2048, 0) }
-    const SYNC: [u8; 12] = [0x00,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0x00];
-    if buf[..12] == SYNC {
-        (2352, if buf[15] == 2 { 24 } else { 16 })
-    } else {
-        (2048, 0)
-    }
+    detect_sector_format_at(path, MDX_DATA_OFFSET)
 }
 
 fn parse_mdx_as_data_track(path: &Path) -> DataTrack {
@@ -498,6 +500,151 @@ fn detect_filesystems_mdx(path: &Path) -> Vec<String> {
         }
     }
     result
+}
+
+// ── NRG support ───────────────────────────────────────────────────────────────
+
+fn parse_nrg_for_data_track(path: &Path) -> Result<DataTrack, String> {
+    let data = fs::read(path).map_err(|e| format!("Cannot read NRG: {e}"))?;
+    let len = data.len();
+    if len < 12 { return Err("File too small for NRG".to_string()); }
+
+    // v1 (NERO): 8-byte footer  [u32 BE chunk_offset][NERO]
+    // v2 (NER5): 12-byte footer [u64 LE chunk_offset][NER5]
+    let (v2, chunk_offset) = if &data[len - 4..] == b"NER5" && len >= 12 {
+        let off = u64::from_le_bytes(data[len - 12..len - 4].try_into().unwrap_or([0; 8])) as usize;
+        (true, off)
+    } else if &data[len - 4..] == b"NERO" && len >= 8 {
+        let off = u32::from_be_bytes(data[len - 8..len - 4].try_into().unwrap_or([0; 4])) as usize;
+        (false, off)
+    } else {
+        return Err("Not a Nero (.nrg) image".to_string());
+    };
+
+    if chunk_offset >= len { return Err("Invalid NRG chunk offset".to_string()); }
+
+    let mut pos = chunk_offset;
+    while pos + 8 <= len {
+        let tag = &data[pos..pos + 4];
+        let chunk_len = if v2 {
+            u32::from_le_bytes(data[pos + 4..pos + 8].try_into().unwrap_or([0; 4])) as usize
+        } else {
+            u32::from_be_bytes(data[pos + 4..pos + 8].try_into().unwrap_or([0; 4])) as usize
+        };
+
+        if tag == b"END!" || chunk_len == 0 { break; }
+        let c = &data[(pos + 8).min(len)..((pos + 8 + chunk_len).min(len))];
+
+        // DAOI (v1) / DAOX (v2): disc-at-once info.
+        // Preamble: 22-byte UPC/catalog + 2-byte header = 24 bytes.
+        // Per-track entry: 12 ISRC + 2 sector_size + 1 mode + 1 pad +
+        //   4-byte (DAOI) or 8-byte (DAOX) index0 + same index1 + same end.
+        // mode 0x02 = AUDIO in all known Nero versions.
+        if (tag == b"DAOI" || tag == b"DAOX") && c.len() >= 24 {
+            let entry_size: usize = if tag == b"DAOX" { 40 } else { 28 };
+            let mut tp = 24usize;
+            while tp + entry_size <= c.len() {
+                let mode = c[tp + 14];
+                if mode != 0x02 {
+                    let track_off: u64 = if tag == b"DAOX" {
+                        u64::from_be_bytes(c[tp + 24..tp + 32].try_into().unwrap_or([0; 8]))
+                    } else {
+                        u32::from_be_bytes(c[tp + 20..tp + 24].try_into().unwrap_or([0; 4])) as u64
+                    };
+                    if track_off < len as u64 {
+                        let (_, udo) = detect_sector_format_at(path, track_off);
+                        let lba_off = if udo > 0 { sector_lba_at(path, track_off) } else { 0 };
+                        return Ok(DataTrack {
+                            bin_path: path.to_path_buf(),
+                            track_offset: track_off,
+                            user_data_offset: udo,
+                            lba_offset: lba_off,
+                            descramble: false,
+                            sector_count: 0,
+                        });
+                    }
+                }
+                tp += entry_size;
+            }
+        }
+
+        pos += 8 + chunk_len;
+    }
+    Err("No data track found in NRG".to_string())
+}
+
+// ── CCD/IMG support ───────────────────────────────────────────────────────────
+
+fn parse_ccd_for_data_track(ccd_path: &Path) -> Result<DataTrack, String> {
+    fn parse_int_ccd(s: &str) -> i64 {
+        let s = s.trim();
+        if let Some(h) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+            i64::from_str_radix(h, 16).unwrap_or(0)
+        } else {
+            s.parse().unwrap_or(0)
+        }
+    }
+
+    let text = fs::read_to_string(ccd_path).map_err(|e| format!("Cannot read CCD: {e}"))?;
+    let img_path = ccd_path.with_extension("img");
+    if !img_path.exists() {
+        return Err(format!("IMG file not found: {}", img_path.display()));
+    }
+
+    struct Entry { control: u32, plba: i64 }
+    let mut entries: Vec<Entry> = Vec::new();
+    let mut in_entry = false;
+    let mut point = -1i32;
+    let mut control = 0u32;
+    let mut plba = 0i64;
+    let mut has = (false, false, false); // point, control, plba
+
+    macro_rules! flush {
+        () => {
+            if in_entry && has.0 && has.1 && has.2 && point >= 1 && point <= 99 {
+                entries.push(Entry { control, plba });
+            }
+        };
+    }
+
+    for line in text.lines() {
+        let t = line.trim();
+        if t.starts_with('[') {
+            flush!();
+            in_entry = t.to_ascii_lowercase().starts_with("[entry");
+            point = -1; control = 0; plba = 0; has = (false, false, false);
+            continue;
+        }
+        if !in_entry { continue; }
+        if let Some(eq) = t.find('=') {
+            let val = &t[eq + 1..];
+            match t[..eq].trim().to_ascii_lowercase().as_str() {
+                "point"   => { point   = parse_int_ccd(val) as i32; has.0 = true; }
+                "control" => { control = parse_int_ccd(val) as u32; has.1 = true; }
+                "plba"    => { plba    = val.trim().parse().unwrap_or(0); has.2 = true; }
+                _ => {}
+            }
+        }
+    }
+    flush!();
+
+    for e in &entries {
+        if (e.control & 0x04) != 0 && e.plba >= 0 {
+            let track_offset = e.plba as u64 * RAW_SECTOR_SIZE;
+            let (_, udo) = detect_sector_format_at(&img_path, track_offset);
+            let udo = if udo == 0 { 16 } else { udo }; // CCD .img is always raw 2352
+            let lba_offset = sector_lba_at(&img_path, track_offset);
+            return Ok(DataTrack {
+                bin_path: img_path,
+                track_offset,
+                user_data_offset: udo,
+                lba_offset,
+                descramble: false,
+                sector_count: 0,
+            });
+        }
+    }
+    Err("No data track found in CCD".to_string())
 }
 
 // ── MDS/MDF support ───────────────────────────────────────────────────────────
@@ -701,7 +848,7 @@ fn mount_disc_image(
     #[cfg(target_os = "linux")]
     {
         let lower = image_path.to_lowercase();
-        let use_cdemu = lower.ends_with(".cue") || lower.ends_with(".mds") || lower.ends_with(".mdx");
+        let use_cdemu = lower.ends_with(".cue") || lower.ends_with(".mds") || lower.ends_with(".mdx") || lower.ends_with(".nrg") || lower.ends_with(".ccd");
 
         if use_cdemu {
             let before = sr_devices();
@@ -1068,6 +1215,13 @@ fn read_sector(image_path: String, lba: u64) -> Result<SectorData, String> {
     } else if lower.ends_with(".mds") {
         let track = parse_mds_for_data_track(path)?;
         (track.bin_path, RAW_SECTOR_SIZE, track.user_data_offset, 0)
+    } else if lower.ends_with(".nrg") {
+        let track = parse_nrg_for_data_track(path)?;
+        let ss = if track.user_data_offset > 0 { RAW_SECTOR_SIZE } else { 2048 };
+        (track.bin_path, ss, track.user_data_offset, track.track_offset)
+    } else if lower.ends_with(".ccd") {
+        let track = parse_ccd_for_data_track(path)?;
+        (track.bin_path, RAW_SECTOR_SIZE, track.user_data_offset, track.track_offset)
     } else if lower.ends_with(".mdx") {
         let (ss, udo) = mdx_sector_format(path);
         (path.to_path_buf(), ss, udo, MDX_DATA_OFFSET)
@@ -1499,12 +1653,11 @@ fn list_disc_contents(image_path: String, dir_path: String) -> Result<Vec<DiscEn
 
     let lower = path.to_lowercase();
 
-    if lower.ends_with(".cue") || lower.ends_with(".mds") {
-        let track = if lower.ends_with(".cue") {
-            parse_cue_for_data_track(Path::new(path))?
-        } else {
-            parse_mds_for_data_track(Path::new(path))?
-        };
+    if lower.ends_with(".cue") || lower.ends_with(".mds") || lower.ends_with(".nrg") || lower.ends_with(".ccd") {
+        let track = if lower.ends_with(".cue") { parse_cue_for_data_track(Path::new(path))? }
+            else if lower.ends_with(".mds") { parse_mds_for_data_track(Path::new(path))? }
+            else if lower.ends_with(".nrg") { parse_nrg_for_data_track(Path::new(path))? }
+            else { parse_ccd_for_data_track(Path::new(path))? };
         if cdi_filesystem::is_cdi_disc(&track.bin_path, track.track_offset, track.user_data_offset, track.lba_offset, track.descramble) {
             open_cdi_fs(&track)?.list_directory(&dir_path)
         } else if pce_filesystem::is_pce_disc(&track.bin_path, track.track_offset, track.user_data_offset) {
@@ -1575,12 +1728,11 @@ fn save_file(image_path: String, file_path: String, dest_path: String) -> Result
 
     let lower = path.to_lowercase();
 
-    if lower.ends_with(".cue") || lower.ends_with(".mds") {
-        let track = if lower.ends_with(".cue") {
-            parse_cue_for_data_track(Path::new(path))?
-        } else {
-            parse_mds_for_data_track(Path::new(path))?
-        };
+    if lower.ends_with(".cue") || lower.ends_with(".mds") || lower.ends_with(".nrg") || lower.ends_with(".ccd") {
+        let track = if lower.ends_with(".cue") { parse_cue_for_data_track(Path::new(path))? }
+            else if lower.ends_with(".mds") { parse_mds_for_data_track(Path::new(path))? }
+            else if lower.ends_with(".nrg") { parse_nrg_for_data_track(Path::new(path))? }
+            else { parse_ccd_for_data_track(Path::new(path))? };
         if cdi_filesystem::is_cdi_disc(&track.bin_path, track.track_offset, track.user_data_offset, track.lba_offset, track.descramble) {
             open_cdi_fs(&track)?.extract_file(&file_path, &dest_path)
         } else if pce_filesystem::is_pce_disc(&track.bin_path, track.track_offset, track.user_data_offset) {
@@ -1652,12 +1804,11 @@ fn save_directory(image_path: String, dir_path: String, dest_path: String) -> Re
 
     let lower = path.to_lowercase();
 
-    if lower.ends_with(".cue") || lower.ends_with(".mds") {
-        let track = if lower.ends_with(".cue") {
-            parse_cue_for_data_track(Path::new(path))?
-        } else {
-            parse_mds_for_data_track(Path::new(path))?
-        };
+    if lower.ends_with(".cue") || lower.ends_with(".mds") || lower.ends_with(".nrg") || lower.ends_with(".ccd") {
+        let track = if lower.ends_with(".cue") { parse_cue_for_data_track(Path::new(path))? }
+            else if lower.ends_with(".mds") { parse_mds_for_data_track(Path::new(path))? }
+            else if lower.ends_with(".nrg") { parse_nrg_for_data_track(Path::new(path))? }
+            else { parse_ccd_for_data_track(Path::new(path))? };
         if cdi_filesystem::is_cdi_disc(&track.bin_path, track.track_offset, track.user_data_offset, track.lba_offset, track.descramble) {
             open_cdi_fs(&track)?.extract_directory(&dir_path, &dest_path)
         } else if pce_filesystem::is_pce_disc(&track.bin_path, track.track_offset, track.user_data_offset) {

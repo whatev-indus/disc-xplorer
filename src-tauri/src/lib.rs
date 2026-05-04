@@ -1968,25 +1968,93 @@ pub struct DriveInfo {
     pub device_path: String,
     pub has_disc: bool,
     pub volume_name: Option<String>,
+    pub mount_point: Option<String>,
 }
 
-fn check_disc_in_drive(device_path: &str) -> (bool, Option<String>) {
+// ── macOS ─────────────────────────────────────────────────────────────────────
+
+#[cfg(target_os = "macos")]
+fn check_disc_in_drive(device_path: &str) -> (bool, Option<String>, Option<String>) {
     let Ok(out) = Command::new("diskutil").args(["info", device_path]).output() else {
-        return (false, None);
+        return (false, None, None);
     };
     let text = String::from_utf8_lossy(&out.stdout);
+    let mut volume_name: Option<String> = None;
+    let mut mount_point: Option<String> = None;
     for line in text.lines() {
         let t = line.trim();
         if let Some(rest) = t.strip_prefix("Volume Name:") {
-            let name = rest.trim().to_string();
-            if !name.is_empty() && name != "Not applicable" && name != "(null)" {
-                return (true, Some(name));
+            let n = rest.trim().to_string();
+            if !n.is_empty() && n != "Not applicable" && n != "(null)" {
+                volume_name = Some(n);
+            }
+        }
+        if let Some(rest) = t.strip_prefix("Mount Point:") {
+            let mp = rest.trim().to_string();
+            if !mp.is_empty() && mp != "Not applicable" {
+                mount_point = Some(mp);
             }
         }
     }
-    (false, None)
+    if volume_name.is_some() {
+        (true, volume_name, mount_point)
+    } else {
+        (false, None, None)
+    }
 }
 
+// Fallback: scan `diskutil list` for whole-disk nodes that look like optical
+// media (no partition-table type on entry 0), then confirm via `diskutil info`.
+// Returns a map of "Device / Media Name" → BSD node name (e.g. "disk11").
+#[cfg(target_os = "macos")]
+fn scan_optical_nodes() -> std::collections::HashMap<String, String> {
+    let mut map = std::collections::HashMap::new();
+    let Ok(out) = Command::new("diskutil").args(["list"]).output() else { return map };
+    let text = String::from_utf8_lossy(&out.stdout);
+
+    let mut cur_node: Option<String> = None;
+    let mut skip_header = false;
+
+    for line in text.lines() {
+        if line.starts_with("/dev/disk") {
+            cur_node = line.split_whitespace().next()
+                .map(|s| s.trim_start_matches("/dev/").to_string());
+            skip_header = true;
+            continue;
+        }
+        if skip_header {
+            skip_header = false;
+            continue;
+        }
+        let Some(node) = cur_node.take() else { continue };
+        let trimmed = line.trim_start();
+        if !trimmed.starts_with("0:") { continue; }
+
+        let rest = trimmed[2..].trim_start();
+        let first_word = rest.split_whitespace().next().unwrap_or("");
+        let has_partition_type = first_word.contains('_')
+            || matches!(first_word, "Apple" | "EFI" | "FAT" | "Microsoft" | "Linux" | "FreeBSD");
+        if has_partition_type { continue; }
+
+        let Ok(info) = Command::new("diskutil").args(["info", &format!("/dev/{node}")]).output() else { continue };
+        let info_text = String::from_utf8_lossy(&info.stdout);
+        let mut is_optical = false;
+        let mut media_name = String::new();
+        for l in info_text.lines() {
+            let t = l.trim();
+            if t.starts_with("Optical Drive Type:") { is_optical = true; }
+            if let Some(r) = t.strip_prefix("Device / Media Name:") {
+                media_name = r.trim().to_string();
+            }
+        }
+        if is_optical && !media_name.is_empty() {
+            map.insert(media_name, node);
+        }
+    }
+    map
+}
+
+#[cfg(target_os = "macos")]
 #[tauri::command]
 fn list_optical_drives() -> Result<Vec<DriveInfo>, String> {
     let out = Command::new("system_profiler")
@@ -1995,11 +2063,17 @@ fn list_optical_drives() -> Result<Vec<DriveInfo>, String> {
         .map_err(|e| format!("Cannot query optical drives: {e}"))?;
 
     let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap_or_default();
-
     let arr = json.get("SPDiscBurningDataType")
         .and_then(|v| v.as_array())
         .cloned()
         .unwrap_or_default();
+
+    let needs_fallback = arr.iter().any(|d| {
+        ["spdisc_burner-devicenode", "spdisc_burning_device", "bsd_name"]
+            .iter()
+            .all(|k| d.get(k).is_none())
+    });
+    let fallback = if needs_fallback { scan_optical_nodes() } else { std::collections::HashMap::new() };
 
     let mut result = Vec::new();
     for drive in &arr {
@@ -2007,16 +2081,238 @@ fn list_optical_drives() -> Result<Vec<DriveInfo>, String> {
 
         let node = ["spdisc_burner-devicenode", "spdisc_burning_device", "bsd_name"]
             .iter()
-            .find_map(|k| drive.get(k)?.as_str());
+            .find_map(|k| drive.get(k)?.as_str().map(|s| s.to_string()))
+            .or_else(|| fallback.get(name).cloned());
 
         let Some(node) = node else { continue; };
-        let device_path = format!("/dev/{node}");
-        let (has_disc, volume_name) = check_disc_in_drive(&device_path);
+        let device_path = if node.starts_with("/dev/") { node } else { format!("/dev/{node}") };
+        let (has_disc, volume_name, mount_point) = check_disc_in_drive(&device_path);
+        let access_path = mount_point.clone().unwrap_or_else(|| device_path.clone());
 
-        result.push(DriveInfo { name: name.to_string(), device_path, has_disc, volume_name });
+        result.push(DriveInfo {
+            name: name.to_string(),
+            device_path: access_path,
+            has_disc,
+            volume_name,
+            mount_point,
+        });
     }
 
     Ok(result)
+}
+
+// ── Windows ───────────────────────────────────────────────────────────────────
+
+// Query optical drives via PowerShell Get-CimInstance Win32_CDROMDrive.
+// Each drive exposes: Name, Drive (letter e.g. "D:"), VolumeName, MediaLoaded.
+#[cfg(target_os = "windows")]
+#[tauri::command]
+fn list_optical_drives() -> Result<Vec<DriveInfo>, String> {
+    // Force UTF-8 output so non-ASCII volume names survive the pipe.
+    let script = r#"
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8;
+$drives = Get-CimInstance Win32_CDROMDrive | Select-Object Name, Drive, VolumeName, MediaLoaded;
+if ($drives -eq $null) { '[]' } else { $drives | ConvertTo-Json -Compress }
+"#;
+    let out = Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", script])
+        .output()
+        .map_err(|e| format!("PowerShell failed: {e}"))?;
+
+    let text = String::from_utf8_lossy(&out.stdout);
+    let text = text.trim();
+    if text.is_empty() || text == "[]" { return Ok(vec![]); }
+
+    // PowerShell returns an object (not array) when there's only one drive.
+    let json: serde_json::Value = serde_json::from_str(text)
+        .unwrap_or(serde_json::Value::Array(vec![]));
+    let arr: Vec<serde_json::Value> = match json {
+        serde_json::Value::Array(a) => a,
+        obj @ serde_json::Value::Object(_) => vec![obj],
+        _ => vec![],
+    };
+
+    let mut result = Vec::new();
+    for drive in arr {
+        let name = drive.get("Name").and_then(|v| v.as_str()).unwrap_or("Optical Drive").to_string();
+        let raw_letter = drive.get("Drive").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+        if raw_letter.is_empty() { continue; }
+        // Normalise to "D:" regardless of whether Windows included the colon.
+        let letter = if raw_letter.ends_with(':') {
+            raw_letter.clone()
+        } else {
+            format!("{raw_letter}:")
+        };
+
+        let media_loaded = drive.get("MediaLoaded").and_then(|v| v.as_bool()).unwrap_or(false);
+        let volume_name = drive.get("VolumeName")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string());
+
+        // "D:\" is a valid directory path that list_disc_contents handles via is_dir().
+        let mount_path = format!("{}\\", letter);
+        let (device_path, mount_point) = if media_loaded {
+            (mount_path.clone(), Some(mount_path))
+        } else {
+            (letter.clone(), None)
+        };
+
+        result.push(DriveInfo {
+            name,
+            device_path,
+            has_disc: media_loaded,
+            volume_name,
+            mount_point,
+        });
+    }
+    Ok(result)
+}
+
+// ── Linux ─────────────────────────────────────────────────────────────────────
+
+// Query optical drives via lsblk JSON output filtered to rom type.
+// Uses the raw /dev/srN device path for sector-level access; mount point is
+// kept for informational use. SIZE field is used for reliable disc detection.
+#[cfg(target_os = "linux")]
+#[tauri::command]
+fn list_optical_drives() -> Result<Vec<DriveInfo>, String> {
+    // -d: list devices without children (avoids partition sub-entries).
+    // SIZE is non-zero when media is present; 0B/empty when drive is empty.
+    let out = match Command::new("lsblk")
+        .args(["-J", "-d", "-o", "NAME,TYPE,LABEL,MOUNTPOINT,MODEL,SIZE"])
+        .output()
+    {
+        Ok(o) => o,
+        Err(_) => return Ok(vec![]),  // lsblk not available on this system
+    };
+
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap_or_default();
+    let devices = json.get("blockdevices")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    let mut result = Vec::new();
+    for dev in devices {
+        let dev_type = dev.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        if dev_type != "rom" { continue; }
+
+        let dev_name = dev.get("name").and_then(|v| v.as_str()).unwrap_or("");
+        if dev_name.is_empty() { continue; }
+
+        let model = dev.get("model").and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .unwrap_or(dev_name)
+            .trim()
+            .to_string();
+
+        let label = dev.get("label").and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string());
+
+        // lsblk ≥2.37 emits "mountpoints" (array); older versions emit "mountpoint" (scalar).
+        let mount = dev.get("mountpoints")
+            .and_then(|v| v.as_array())
+            .and_then(|arr| arr.iter().find_map(|m| m.as_str().filter(|s| !s.is_empty())))
+            .map(|s| s.to_string())
+            .or_else(|| {
+                dev.get("mountpoint").and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.to_string())
+            });
+
+        // SIZE is "0B" or empty when no media; a real capacity like "700M" when loaded.
+        let size_str = dev.get("size").and_then(|v| v.as_str()).unwrap_or("").trim();
+        let has_disc = (!size_str.is_empty() && size_str != "0" && size_str != "0B")
+            || label.is_some() || mount.is_some();
+
+        let device_node = format!("/dev/{dev_name}");
+
+        result.push(DriveInfo {
+            name: model,
+            device_path: device_node,  // always raw device for sector reads and eject
+            has_disc,
+            volume_name: label,
+            mount_point: mount,
+        });
+    }
+    Ok(result)
+}
+
+// ── Disc ejection ─────────────────────────────────────────────────────────────
+
+#[tauri::command]
+fn eject_disc(path: String) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        let out = Command::new("diskutil")
+            .args(["eject", &path])
+            .output()
+            .map_err(|e| format!("diskutil eject failed: {e}"))?;
+        if !out.status.success() {
+            return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
+        }
+        return Ok(());
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        // path is like "D:\" — trim to "D:" for the Shell.Application eject verb
+        let drive = path.trim_end_matches(['\\', '/']);
+        let script = format!(
+            r#"(New-Object -ComObject Shell.Application).NameSpace(17).ParseName('{drive}').InvokeVerb('Eject')"#
+        );
+        Command::new("powershell")
+            .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+            .output()
+            .map_err(|e| format!("PowerShell eject failed: {e}"))?;
+        return Ok(());
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        // Try `eject` first (util-linux), fall back to `udisksctl`
+        match Command::new("eject").arg(&path).output() {
+            Ok(out) if out.status.success() => return Ok(()),
+            Ok(out) => {
+                let eject_err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+                // Try udisksctl as fallback
+                match Command::new("udisksctl")
+                    .args(["eject", "-b", &path])
+                    .output()
+                {
+                    Ok(u) if u.status.success() => return Ok(()),
+                    Ok(u) => {
+                        let ud_err = String::from_utf8_lossy(&u.stderr).trim().to_string();
+                        return Err(format!("eject: {eject_err}; udisksctl: {ud_err}"));
+                    }
+                    Err(_) => return Err(eject_err),
+                }
+            }
+            Err(_) => {
+                // `eject` not installed — try udisksctl
+                match Command::new("udisksctl")
+                    .args(["eject", "-b", &path])
+                    .output()
+                {
+                    Ok(u) if u.status.success() => return Ok(()),
+                    Ok(u) => {
+                        return Err(String::from_utf8_lossy(&u.stderr).trim().to_string());
+                    }
+                    Err(_) => {
+                        return Err(
+                            "Neither 'eject' nor 'udisksctl' is available on this system"
+                                .to_string(),
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[allow(unreachable_code)]
+    Err("Eject not supported on this platform".to_string())
 }
 
 // ── Disc entry ────────────────────────────────────────────────────────────────
@@ -2644,7 +2940,7 @@ pub fn run() {
             list_disc_contents, save_file, save_directory,
             get_cue_tracks, get_gdi_tracks, save_audio_track, list_optical_drives,
             get_mds_tracks, mount_disc_image, unmount_disc_image,
-            get_disc_filesystems, read_sector, get_platform
+            get_disc_filesystems, read_sector, get_platform, eject_disc
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

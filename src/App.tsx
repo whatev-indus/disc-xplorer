@@ -29,6 +29,7 @@ interface DriveInfo {
   device_path: string;
   has_disc: boolean;
   volume_name: string | null;
+  mount_point: string | null;
 }
 
 type NodeType = "root" | "session" | "data_track" | "audio_track" | "filesystem" | "dir";
@@ -167,6 +168,7 @@ function App() {
   const [error, setError] = useState<string | null>(null);
   const [statusText, setStatusText] = useState("No disc loaded");
   const [mountedDevice, setMountedDevice] = useState<string | null>(null);
+  const [physicalDiscActive, setPhysicalDiscActive] = useState(false);
   const [drives, setDrives] = useState<DriveInfo[]>([]);
   const [showDriveMenu, setShowDriveMenu] = useState(false);
   const [loadingDrives, setLoadingDrives] = useState(false);
@@ -290,6 +292,7 @@ function App() {
     setError(null);
     setEmptyDriveName(null);
     setMountedDevice(null);
+    setPhysicalDiscActive(false);
 
     const lowerPath = path.toLowerCase();
     const isCue = lowerPath.endsWith(".cue");
@@ -460,6 +463,31 @@ function App() {
     // Keep the disc image open in the app after unmounting.
   }
 
+  function unmountPhysicalDisc() {
+    setPhysicalDiscActive(false);
+    setImagePath(null);
+    setImageName("");
+    setEntries([]);
+    setAudioEntries([]);
+    setTree([]);
+    setCueTracks([]);
+    setActiveFilesystem("");
+    setSidebarPath("");
+    setError(null);
+    setStatusText("No disc loaded");
+    setViewMode("filesystem");
+  }
+
+  async function ejectDisc() {
+    if (!imagePath) return;
+    try {
+      await invoke("eject_disc", { path: imagePath });
+    } catch (e) {
+      setError(String(e));
+    }
+    unmountPhysicalDisc();
+  }
+
   async function openDisc() {
     setLoadingDrives(true);
     setShowDriveMenu(true);
@@ -488,11 +516,13 @@ function App() {
       setAudioEntries([]);
       setTree([]);
       setStatusText("No disc loaded");
+      setPhysicalDiscActive(false);
       return;
     }
 
     const name = drive.volume_name || drive.name;
     setSourceImagePath(null);
+    setPhysicalDiscActive(true);
     setImagePath(drive.device_path);
     setImageName(name);
     setEmptyDriveName(null);
@@ -786,7 +816,13 @@ function App() {
           }
           <div className="separator" />
           <div className="drive-menu-wrap" ref={driveMenuRef}>
-            <button className="btn-open btn-open-secondary" onClick={openDisc}>Open Disc from Drive ▾</button>
+            {physicalDiscActive
+              ? <>
+                  <button className="btn-open btn-open-secondary btn-unmount" onClick={unmountPhysicalDisc}>Unmount Disc</button>
+                  <button className="btn-open btn-open-secondary btn-unmount btn-eject" onClick={ejectDisc} title="Eject disc">⏏</button>
+                </>
+              : <button className="btn-open btn-open-secondary" onClick={openDisc}>Open Disc from Drive ▾</button>
+            }
             {showDriveMenu && (
               <div className="drive-menu">
                 {loadingDrives ? (
@@ -1093,7 +1129,7 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.`}</pre>
         <span className="statusbar-left">{statusText}</span>
         <a className="statusbar-brand" href="https://sites.google.com/view/whateverindustries/home" target="_blank" rel="noreferrer">whatev.indus</a>
         <span className="statusbar-right">
-          <span className="statusbar-version">v0.1.12</span>
+          <span className="statusbar-version">v0.1.13</span>
         </span>
       </div>
     </div>

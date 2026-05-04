@@ -534,16 +534,30 @@ impl HfsFs {
 // ── Detection ─────────────────────────────────────────────────────────────────
 
 /// Returns true when the disc image at the given track parameters contains an
-/// Apple Macintosh HFS filesystem (detected via the Apple DDR 'ER' signature).
+/// Apple Macintosh HFS filesystem (detected via DDR → APM → MDB chain).
 pub fn is_hfs_disc(
     bin_path: &std::path::Path,
     track_offset: u64,
     user_data_offset: u64,
 ) -> bool {
     let Ok(mut f) = File::open(bin_path) else { return false };
-    let raw = track_offset + user_data_offset; // sector 0, user-data start
-    if f.seek(SeekFrom::Start(raw)).is_err() { return false; }
-    let mut buf = [0u8; 2];
-    if f.read_exact(&mut buf).is_err() { return false; }
-    buf == [0x45, 0x52] // 'ER'
+    let mut buf = [0u8; 512];
+    // 1. Apple DDR at user-data byte 0
+    if read_ud(&mut f, track_offset, user_data_offset, 0, &mut buf).is_err() { return false; }
+    if &buf[0..2] != b"ER" { return false; }
+    let dev_blk_sz = { let d = u16_be(&buf, 2) as u64; if d == 0 { DEV_BLOCK } else { d } };
+    // 2. Scan partition map for Apple_HFS
+    let mut part_ud: Option<u64> = None;
+    for pm_blk in 1u64..=16 {
+        if read_ud(&mut f, track_offset, user_data_offset, pm_blk * dev_blk_sz, &mut buf).is_err() { break; }
+        if &buf[0..2] != b"PM" { break; }
+        let p_start = u32_be(&buf, 8) as u64;
+        let p_type = std::str::from_utf8(&buf[48..80]).unwrap_or("").trim_end_matches('\0');
+        if p_type == "Apple_HFS" { part_ud = Some(p_start * dev_blk_sz); break; }
+    }
+    let Some(part_ud) = part_ud else { return false };
+    // 3. Verify HFS MDB signature at partition start + 1024
+    if read_ud(&mut f, track_offset, user_data_offset, part_ud + 1024, &mut buf).is_err() { return false; }
+    let sig = u16_be(&buf, 0);
+    sig == 0xD2D7 || sig == 0x4244
 }

@@ -84,7 +84,13 @@ function formatDuration(sectors: number): string {
 function isMountable(path: string, platform: string): boolean {
   const lower = path.toLowerCase();
   if (lower.endsWith(".iso") || lower.endsWith(".img") || lower.endsWith(".dmg") || lower.endsWith(".cdr")) return true;
-  if (platform === "linux" && (lower.endsWith(".cue") || lower.endsWith(".mds") || lower.endsWith(".mdx") || lower.endsWith(".nrg") || lower.endsWith(".ccd"))) return true;
+  if (platform === "linux" && (
+    lower.endsWith(".cue") || lower.endsWith(".mds") || lower.endsWith(".mdx") ||
+    lower.endsWith(".nrg") || lower.endsWith(".ccd") ||
+    lower.endsWith(".toc") || lower.endsWith(".b6t") || lower.endsWith(".bwt") ||
+    lower.endsWith(".c2d") || lower.endsWith(".pdi") || lower.endsWith(".gi") ||
+    lower.endsWith(".daa")
+  )) return true;
   return false;
 }
 
@@ -156,6 +162,7 @@ function App() {
   const [emptyDriveName, setEmptyDriveName] = useState<string | null>(null);
   const [tree, setTree] = useState<TreeNode[]>([]);
   const [cueTracks, setCueTracks] = useState<TrackInfo[]>([]);
+  const [activeFilesystem, setActiveFilesystem] = useState<string>("");
   const [sidebarPath, setSidebarPath] = useState<string>("");
   const [error, setError] = useState<string | null>(null);
   const [statusText, setStatusText] = useState("No disc loaded");
@@ -233,11 +240,17 @@ function App() {
 
   const navIdRef = useRef(0);
 
-  const loadDirectory = useCallback(async (imgPath: string, dirPath: string, fsLabel = "") => {
+  const loadDirectory = useCallback(async (imgPath: string, dirPath: string, fsLabel = "", filesystem?: string) => {
     const myId = ++navIdRef.current;
     setError(null);
+    const effectiveFs = filesystem !== undefined ? filesystem : activeFilesystem;
+    if (filesystem !== undefined) setActiveFilesystem(filesystem);
     try {
-      const result = await invoke<DiscEntry[]>("list_disc_contents", { imagePath: imgPath, dirPath });
+      const result = await invoke<DiscEntry[]>("list_disc_contents", {
+        imagePath: imgPath,
+        dirPath,
+        filesystem: effectiveFs || null,
+      });
       if (navIdRef.current !== myId) return;
       const sorted = result.sort((a, b) => {
         if (a.is_dir !== b.is_dir) return a.is_dir ? -1 : 1;
@@ -254,7 +267,7 @@ function App() {
       if (navIdRef.current !== myId) return;
       setError(String(e));
     }
-  }, []);
+  }, [activeFilesystem]);
 
   function buildAudioEntries(tracks: TrackInfo[]): AudioEntry[] {
     return tracks.map((t) => ({
@@ -270,6 +283,7 @@ function App() {
 
   async function openImageAtPath(path: string) {
     const name = path.split(/[/\\]/).pop() ?? path;
+    setActiveFilesystem("");
     setImagePath(path);
     setSourceImagePath(path);
     setImageName(name);
@@ -280,12 +294,15 @@ function App() {
     const lowerPath = path.toLowerCase();
     const isCue = lowerPath.endsWith(".cue");
     const isMds = lowerPath.endsWith(".mds");
+    const isGdi = lowerPath.endsWith(".gdi");
 
-    if (isCue || isMds) {
+    if (isCue || isMds || isGdi) {
       const [tracks, filesystems] = await Promise.all([
-        isMds
-          ? invoke<TrackInfo[]>("get_mds_tracks", { mdsPath: path })
-          : invoke<TrackInfo[]>("get_cue_tracks", { cuePath: path }),
+        isGdi
+          ? invoke<TrackInfo[]>("get_gdi_tracks", { gdiPath: path })
+          : isMds
+            ? invoke<TrackInfo[]>("get_mds_tracks", { mdsPath: path })
+            : invoke<TrackInfo[]>("get_cue_tracks", { cuePath: path }),
         invoke<string[]>("get_disc_filesystems", { imagePath: path }).catch(() => ["ISO 9660"]),
       ]);
       setCueTracks(tracks);
@@ -356,20 +373,35 @@ function App() {
     } else {
       setCueTracks([]);
       setSidebarPath("/");
-      const rootNode: TreeNode = { name, path: "/", nodeType: "root", children: null, expanded: false };
+
+      const filesystems = await invoke<string[]>("get_disc_filesystems", { imagePath: path }).catch(() => ["ISO 9660"]);
+      const makeFsNode = (fs: string): TreeNode => ({
+        name: fs,
+        path: `__fs_${fs.toLowerCase().replace(/ /g, "_")}`,
+        nodeType: "filesystem" as NodeType,
+        children: null,
+        expanded: false,
+      });
+
+      const fsChildren = filesystems.map(makeFsNode);
+      const rootNode: TreeNode = { name, path: "__root", nodeType: "root", children: fsChildren, expanded: true };
       setTree([rootNode]);
-      await loadDirectory(path, "/");
-      const result = await invoke<DiscEntry[]>("list_disc_contents", { imagePath: path, dirPath: "/" });
-      const subDirs = result
-        .filter((e) => e.is_dir)
-        .map((e): TreeNode => ({ name: e.name, path: `/${e.name}`, nodeType: "dir", children: null, expanded: false }));
-      setTree([{ ...rootNode, expanded: true, children: subDirs }]);
+      const firstFs = filesystems[0] ?? "ISO 9660";
+      const firstFsPath = `__fs_${firstFs.toLowerCase().replace(/ /g, "_")}`;
+      setSidebarPath(firstFsPath);
+      await loadDirectory(path, "/", firstFs, firstFs);
+      try {
+        const result = await invoke<DiscEntry[]>("list_disc_contents", { imagePath: path, dirPath: "/", filesystem: firstFs });
+        const subDirs = result.filter((e) => e.is_dir)
+          .map((e): TreeNode => ({ name: e.name, path: `/${e.name}`, nodeType: "dir", children: null, expanded: false }));
+        setTree([{ ...rootNode, children: fsChildren.map((c) => c.path === firstFsPath ? { ...c, expanded: true, children: subDirs } : c) }]);
+      } catch { /* tree update failed */ }
     }
   }
 
   async function openImage() {
     const selected = await open({
-      filters: [{ name: "Disc Images", extensions: ["iso", "img", "cue", "mds", "mdx", "nrg", "ccd"] }],
+      filters: [{ name: "Disc Images", extensions: ["iso", "img", "chd", "cue", "mds", "mdx", "nrg", "ccd", "cdi", "gdi", "toc", "b6t", "bwt", "c2d", "pdi", "gi", "daa"] }],
     });
     if (!selected) return;
     await openImageAtPath(selected as string);
@@ -380,7 +412,7 @@ function App() {
     getCurrentWebview().onDragDropEvent((event) => {
       if (event.payload.type === "drop") {
         setIsDragOver(false);
-        const supported = ["iso", "img", "cue", "mds", "mdx", "nrg", "ccd"];
+        const supported = ["iso", "img", "chd", "cue", "mds", "mdx", "nrg", "ccd", "cdi", "gdi", "toc", "b6t", "bwt", "c2d", "pdi", "gi", "daa"];
         const path = event.payload.paths.find((p) =>
           supported.some((ext) => p.toLowerCase().endsWith(`.${ext}`))
         );
@@ -515,6 +547,18 @@ function App() {
       return;
     }
 
+    if (nodePath.startsWith("__fs_") && cueTracks.length === 0) {
+      function toggleFs(nodes: TreeNode[]): TreeNode[] {
+        return nodes.map((n) => {
+          if (n.path === nodePath) return { ...n, expanded: !n.expanded };
+          if (n.children) return { ...n, children: toggleFs(n.children) };
+          return n;
+        });
+      }
+      setTree(toggleFs(tree));
+      return;
+    }
+
     if (nodePath.startsWith("__")) return;
 
     async function expandNode(nodes: TreeNode[]): Promise<TreeNode[]> {
@@ -612,7 +656,31 @@ function App() {
     if (path.startsWith("__fs_")) {
       setSidebarPath(path);
       const fsName = findNodeByPath(tree, path)?.name ?? "";
-      loadDirectory(imagePath, "/", fsName);
+      loadDirectory(imagePath, "/", fsName, fsName);
+      // For non-CUE discs: expand clicked filesystem node with its subdirs,
+      // collapsing all sibling filesystem nodes.
+      if (cueTracks.length === 0) {
+        invoke<DiscEntry[]>("list_disc_contents", { imagePath, dirPath: "/", filesystem: fsName })
+          .then((result) => {
+            const subDirs = result.filter((e) => e.is_dir)
+              .map((e): TreeNode => ({ name: e.name, path: `/${e.name}`, nodeType: "dir", children: null, expanded: false }));
+            setTree((prev) => {
+              function swapFs(nodes: TreeNode[]): TreeNode[] {
+                return nodes.map((n) => {
+                  if (n.nodeType === "filesystem") {
+                    return n.path === path
+                      ? { ...n, expanded: true, children: subDirs }
+                      : { ...n, expanded: false, children: null };
+                  }
+                  if (n.children) return { ...n, children: swapFs(n.children) };
+                  return n;
+                });
+              }
+              return swapFs(prev);
+            });
+          })
+          .catch(() => {});
+      }
       return;
     }
 
@@ -627,7 +695,7 @@ function App() {
       const base = defaultDownloadPath || await open({ directory: true, title: `Choose destination for "${entry.name}"` }) as string | null;
       if (!base) return;
       try {
-        await invoke("save_directory", { imagePath, dirPath: entryPath, destPath: `${base}/${entry.name}` });
+        await invoke("save_directory", { imagePath, dirPath: entryPath, destPath: `${base}/${entry.name}`, filesystem: activeFilesystem || null });
       } catch (e) { setError(String(e)); }
     } else {
       const destPath = defaultDownloadPath
@@ -635,7 +703,7 @@ function App() {
         : await save({ defaultPath: entry.name });
       if (!destPath) return;
       try {
-        await invoke("save_file", { imagePath, filePath: entryPath, destPath });
+        await invoke("save_file", { imagePath, filePath: entryPath, destPath, filesystem: activeFilesystem || null });
       } catch (e) { setError(String(e)); }
     }
   }
@@ -838,6 +906,36 @@ version 2 or later. This application is licensed under GPL v3, which
 is compatible with and satisfies the requirements of the LGPL.
 
 Source: https://lame.sourceforge.io`}</pre>
+              <p className="license-package" style={{ marginTop: "16px" }}>chd-rs — CHD (Compressed Hunks of Data) decompression</p>
+              <pre className="license-text">{`Copyright (c) 2022 Ronny Chan
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions
+are met:
+
+1. Redistributions of source code must retain the above copyright
+   notice, this list of conditions and the following disclaimer.
+
+2. Redistributions in binary form must reproduce the above copyright
+   notice, this list of conditions and the following disclaimer in
+   the documentation and/or other materials provided with the
+   distribution.
+
+3. Neither the name of the copyright holder nor the names of its
+   contributors may be used to endorse or promote products derived
+   from this software without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+"AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.`}</pre>
               <p className="license-package" style={{ marginTop: "16px" }}>libflac-sys — Rust bindings for libFLAC</p>
               <pre className="license-text">{`Copyright (c) 2020 Matthias Geier. All rights reserved.
 
@@ -995,7 +1093,7 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.`}</pre>
         <span className="statusbar-left">{statusText}</span>
         <a className="statusbar-brand" href="https://sites.google.com/view/whateverindustries/home" target="_blank" rel="noreferrer">whatev.indus</a>
         <span className="statusbar-right">
-          <span className="statusbar-version">v0.1.11</span>
+          <span className="statusbar-version">v0.1.12</span>
         </span>
       </div>
     </div>

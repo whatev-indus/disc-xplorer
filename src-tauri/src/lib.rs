@@ -3,16 +3,21 @@ use mp3lame_encoder::{Builder as Mp3Builder, DualPcm, FlushNoGap};
 use iso9660::{ISO9660, ISO9660Reader, ISODirectory, DirectoryEntry};
 use serde::Serialize;
 use std::fs::{self, File};
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::io::{self, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Mutex;
 use tauri::Manager;
+use chd::Chd;
+use chd::read::ChdReader;
 
 mod cdi_filesystem;
+mod gcm_filesystem;
 mod hfs_filesystem;
 mod pce_filesystem;
+mod threedo_filesystem;
 mod udf_filesystem;
+mod xdvdfs_filesystem;
 
 fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), String> {
     fs::create_dir_all(dst).map_err(|e| format!("Cannot create dir {:?}: {e}", dst))?;
@@ -63,6 +68,7 @@ struct TrackFile {
     file: File,
     track_offset: u64,
     user_data_offset: u64,
+    stride: u64,       // bytes per sector (2048, 2336, or 2352)
     lba_offset: u64,   // for single-BIN legacy mode
     start_lba: u64,    // absolute disc LBA of first sector (for multi-BIN dispatch)
     sector_count: u64, // 0 = unknown / unlimited
@@ -75,10 +81,10 @@ pub struct MultiTrackBinReader {
 }
 
 impl MultiTrackBinReader {
-    fn single(file: File, track_offset: u64, user_data_offset: u64, lba_offset: u64) -> Self {
+    fn single(file: File, track_offset: u64, user_data_offset: u64, stride: u64, lba_offset: u64) -> Self {
         MultiTrackBinReader {
             tracks: vec![TrackFile {
-                file, track_offset, user_data_offset, lba_offset,
+                file, track_offset, user_data_offset, stride, lba_offset,
                 start_lba: lba_offset, sector_count: 0,
             }],
             root_idx: 0,
@@ -93,7 +99,7 @@ impl ISO9660Reader for MultiTrackBinReader {
             // Single-BIN: use lba_offset for multisession compat (same as old BinCueReader).
             let t = &mut self.tracks[self.root_idx];
             let adjusted = if lba >= t.lba_offset { lba - t.lba_offset } else { lba };
-            let pos = t.track_offset + adjusted * RAW_SECTOR_SIZE + t.user_data_offset;
+            let pos = t.track_offset + adjusted * t.stride + t.user_data_offset;
             t.file.seek(SeekFrom::Start(pos))?;
             return t.file.read(buf);
         }
@@ -109,7 +115,7 @@ impl ISO9660Reader for MultiTrackBinReader {
                 .unwrap_or((self.root_idx, lba))
         };
         let t = &mut self.tracks[idx];
-        let pos = t.track_offset + adjusted * RAW_SECTOR_SIZE + t.user_data_offset;
+        let pos = t.track_offset + adjusted * t.stride + t.user_data_offset;
         t.file.seek(SeekFrom::Start(pos))?;
         t.file.read(buf)
     }
@@ -119,6 +125,7 @@ struct DataTrack {
     bin_path: PathBuf,
     track_offset: u64,
     user_data_offset: u64,
+    stride: u64,
     lba_offset: u64,
     descramble: bool,
     sector_count: u64,
@@ -146,35 +153,70 @@ fn detect_filesystems_in_bin(bin_path: &Path, track_offset: u64, user_data_offse
     if pce_filesystem::is_pce_disc(bin_path, track_offset, user_data_offset) {
         return vec!["PC Engine CD-ROM".to_string()];
     }
-    if hfs_filesystem::is_hfs_disc(bin_path, track_offset, user_data_offset) {
-        return vec!["HFS".to_string()];
+    if threedo_filesystem::is_threedo_disc(bin_path, track_offset, user_data_offset) {
+        return vec!["3DO OperaFS".to_string()];
     }
+    if user_data_offset == 0 {
+        if let Some(kind) = gcm_filesystem::detect_gcm_disc(bin_path) {
+            return vec![gcm_kind_label(kind)];
+        }
+    }
+
+    let mut result: Vec<String> = Vec::new();
+
+    // XDVDFS is added first; fall through to also detect ISO 9660 so that
+    // full Xbox DVD dumps show both the game partition and the DVD-Video zone.
+    if user_data_offset == 0 && xdvdfs_filesystem::is_xdvdfs_disc(bin_path, track_offset) {
+        result.push("XDVDFS".to_string());
+    }
+
+    let has_hfs = hfs_filesystem::is_hfs_disc(bin_path, track_offset, user_data_offset);
+    if has_hfs {
+        result.push("HFS".to_string());
+    }
+
     if udf_filesystem::is_udf_disc(bin_path, track_offset, user_data_offset) {
         let version = File::open(bin_path).ok()
             .and_then(|f| udf_filesystem::UdfFs::new(f, track_offset, user_data_offset).ok())
             .map(|u| u.udf_version.clone())
             .unwrap_or_else(|| "UDF".to_string());
-        return vec![version];
+        result.push(version);
+        return result;
     }
 
-    let mut result = vec!["ISO 9660".to_string()];
-    let Ok(mut f) = File::open(bin_path) else { return result };
-    for lba in 17u64..32 {
-        let adjusted = if lba >= lba_offset { lba - lba_offset } else { lba };
-        let pos = track_offset + adjusted * RAW_SECTOR_SIZE + user_data_offset;
-        if f.seek(SeekFrom::Start(pos)).is_err() { break; }
+    // Probe for ISO 9660 by verifying the PVD signature at LBA 16.
+    // This runs even when HFS was found, to detect Mac/PC hybrid discs.
+    let stride = if user_data_offset > 0 { RAW_SECTOR_SIZE } else { 2048 };
+    if let Ok(mut f) = File::open(bin_path) {
+        let adj16 = if 16u64 >= lba_offset { 16 - lba_offset } else { 16 };
+        let pvd_pos = track_offset + adj16 * stride + user_data_offset;
         let mut buf = [0u8; 2048];
-        if f.read_exact(&mut buf).is_err() { break; }
-        match buf[0] {
-            0xFF => break,
-            0x02 => {
-                let esc = &buf[88..120];
-                if esc.starts_with(b"%/@") || esc.starts_with(b"%/C") || esc.starts_with(b"%/E") {
-                    result.push("Joliet".to_string());
+        if f.seek(SeekFrom::Start(pvd_pos)).is_ok() && f.read_exact(&mut buf).is_ok()
+            && &buf[1..6] == b"CD001"
+        {
+            result.push("ISO 9660".to_string());
+            for lba in 17u64..32 {
+                let adjusted = if lba >= lba_offset { lba - lba_offset } else { lba };
+                let pos = track_offset + adjusted * stride + user_data_offset;
+                if f.seek(SeekFrom::Start(pos)).is_err() { break; }
+                let mut buf2 = [0u8; 2048];
+                if f.read_exact(&mut buf2).is_err() { break; }
+                match buf2[0] {
+                    0xFF => break,
+                    0x02 => {
+                        let esc = &buf2[88..120];
+                        if esc.starts_with(b"%/@") || esc.starts_with(b"%/C") || esc.starts_with(b"%/E") {
+                            result.push("Joliet".to_string());
+                        }
+                    }
+                    _ => {}
                 }
             }
-            _ => {}
         }
+    }
+
+    if result.is_empty() {
+        result.push("ISO 9660".to_string());
     }
     result
 }
@@ -204,37 +246,72 @@ fn detect_sector_format_at(path: &Path, offset: u64) -> (u64, u64) {
 
 fn detect_filesystems_raw(path: &Path) -> Vec<String> {
     let user_data_offset = detect_raw_sector_offset(path).unwrap_or(0);
+    let sector_size = if user_data_offset > 0 { RAW_SECTOR_SIZE } else { 2048 };
+
     if pce_filesystem::is_pce_disc(path, 0, user_data_offset) {
         return vec!["PC Engine CD-ROM".to_string()];
     }
-    if hfs_filesystem::is_hfs_disc(path, 0, user_data_offset) {
-        return vec!["HFS".to_string()];
+    if threedo_filesystem::is_threedo_disc(path, 0, user_data_offset) {
+        return vec!["3DO OperaFS".to_string()];
     }
+    if user_data_offset == 0 {
+        if let Some(kind) = gcm_filesystem::detect_gcm_disc(path) {
+            return vec![gcm_kind_label(kind)];
+        }
+    }
+
+    let mut result: Vec<String> = Vec::new();
+
+    // XDVDFS is added first; fall through to also detect ISO 9660 so that
+    // full Xbox DVD dumps show both the game partition and the DVD-Video zone.
+    if user_data_offset == 0 && xdvdfs_filesystem::is_xdvdfs_disc(path, 0) {
+        result.push("XDVDFS".to_string());
+    }
+
+    let has_hfs = hfs_filesystem::is_hfs_disc(path, 0, user_data_offset);
+    if has_hfs {
+        result.push("HFS".to_string());
+    }
+
     if udf_filesystem::is_udf_disc(path, 0, user_data_offset) {
         let version = File::open(path).ok()
             .and_then(|f| udf_filesystem::UdfFs::new(f, 0, user_data_offset).ok())
             .map(|u| u.udf_version.clone())
             .unwrap_or_else(|| "UDF".to_string());
-        return vec![version];
+        result.push(version);
+        return result;
     }
-    let mut result = vec!["ISO 9660".to_string()];
-    let Ok(mut f) = File::open(path) else { return result };
-    let sector_size = if user_data_offset > 0 { RAW_SECTOR_SIZE } else { 2048 };
-    for lba in 17u64..32 {
-        let pos = lba * sector_size + user_data_offset;
-        if f.seek(SeekFrom::Start(pos)).is_err() { break; }
+
+    // Probe for ISO 9660 by verifying the PVD signature at LBA 16.
+    // This runs even when HFS was found, to detect Mac/PC hybrid discs.
+    if let Ok(mut f) = File::open(path) {
+        let pvd_pos = 16 * sector_size + user_data_offset;
         let mut buf = [0u8; 2048];
-        if f.read_exact(&mut buf).is_err() { break; }
-        match buf[0] {
-            0xFF => break,
-            0x02 => {
-                let esc = &buf[88..120];
-                if esc.starts_with(b"%/@") || esc.starts_with(b"%/C") || esc.starts_with(b"%/E") {
-                    result.push("Joliet".to_string());
+        if f.seek(SeekFrom::Start(pvd_pos)).is_ok() && f.read_exact(&mut buf).is_ok()
+            && &buf[1..6] == b"CD001"
+        {
+            result.push("ISO 9660".to_string());
+            for lba in 17u64..32 {
+                let pos = lba * sector_size + user_data_offset;
+                if f.seek(SeekFrom::Start(pos)).is_err() { break; }
+                let mut buf2 = [0u8; 2048];
+                if f.read_exact(&mut buf2).is_err() { break; }
+                match buf2[0] {
+                    0xFF => break,
+                    0x02 => {
+                        let esc = &buf2[88..120];
+                        if esc.starts_with(b"%/@") || esc.starts_with(b"%/C") || esc.starts_with(b"%/E") {
+                            result.push("Joliet".to_string());
+                        }
+                    }
+                    _ => {}
                 }
             }
-            _ => {}
         }
+    }
+
+    if result.is_empty() {
+        result.push("ISO 9660".to_string());
     }
     result
 }
@@ -243,12 +320,16 @@ fn detect_filesystems_raw(path: &Path) -> Vec<String> {
 fn get_disc_filesystems(image_path: String) -> Result<Vec<String>, String> {
     let path = Path::new(&image_path);
     let lower = image_path.to_lowercase();
-    if lower.ends_with(".cue") || lower.ends_with(".mds") || lower.ends_with(".nrg") || lower.ends_with(".ccd") {
+    if lower.ends_with(".cue") || lower.ends_with(".mds") || lower.ends_with(".nrg") || lower.ends_with(".ccd") || lower.ends_with(".cdi") || lower.ends_with(".gdi") {
         let track = if lower.ends_with(".cue") { parse_cue_for_data_track(path)? }
             else if lower.ends_with(".mds") { parse_mds_for_data_track(path)? }
             else if lower.ends_with(".nrg") { parse_nrg_for_data_track(path)? }
-            else { parse_ccd_for_data_track(path)? };
+            else if lower.ends_with(".ccd") { parse_ccd_for_data_track(path)? }
+            else if lower.ends_with(".gdi") { parse_gdi_for_data_track(path)? }
+            else { parse_cdi_for_data_track(path)? };
         Ok(detect_filesystems_in_bin(&track.bin_path, track.track_offset, track.user_data_offset, track.lba_offset, track.descramble))
+    } else if lower.ends_with(".chd") {
+        Ok(detect_filesystems_chd(path))
     } else if lower.ends_with(".mdx") {
         Ok(detect_filesystems_mdx(path))
     } else {
@@ -326,8 +407,8 @@ fn parse_cue_for_data_track(cue_path: &Path) -> Result<DataTrack, String> {
             let sector_count = fs::metadata(bin)
                 .map(|m| m.len().saturating_sub(track_offset) / RAW_SECTOR_SIZE)
                 .unwrap_or(0);
-            let dt = DataTrack { bin_path: bin.clone(), track_offset, user_data_offset, lba_offset, descramble: false, sector_count };
-            if first_data.is_none() { first_data = Some(DataTrack { bin_path: dt.bin_path.clone(), track_offset: dt.track_offset, user_data_offset: dt.user_data_offset, lba_offset: dt.lba_offset, descramble: false, sector_count: dt.sector_count }); }
+            let dt = DataTrack { bin_path: bin.clone(), track_offset, user_data_offset, stride: RAW_SECTOR_SIZE, lba_offset, descramble: false, sector_count };
+            if first_data.is_none() { first_data = Some(DataTrack { bin_path: dt.bin_path.clone(), track_offset: dt.track_offset, user_data_offset: dt.user_data_offset, stride: RAW_SECTOR_SIZE, lba_offset: dt.lba_offset, descramble: false, sector_count: dt.sector_count }); }
             last_data = Some(dt);
         }
     }
@@ -351,6 +432,7 @@ fn parse_cue_for_data_track(cue_path: &Path) -> Result<DataTrack, String> {
                 bin_path: bin.clone(),
                 track_offset: pregap_byte_offset,
                 user_data_offset: 24,
+                stride: RAW_SECTOR_SIZE,
                 lba_offset: 0,
                 descramble: true,
                 sector_count: 0,
@@ -411,7 +493,7 @@ fn parse_cue_all_data_tracks(cue_path: &Path) -> Result<Vec<DataTrack>, String> 
             let sector_count = fs::metadata(bin)
                 .map(|m| m.len().saturating_sub(track_offset) / RAW_SECTOR_SIZE)
                 .unwrap_or(0);
-            all_data.push(DataTrack { bin_path: bin.clone(), track_offset, user_data_offset, lba_offset, descramble: false, sector_count });
+            all_data.push(DataTrack { bin_path: bin.clone(), track_offset, user_data_offset, stride: RAW_SECTOR_SIZE, lba_offset, descramble: false, sector_count });
         }
     }
 
@@ -457,7 +539,7 @@ fn mdx_sector_format(path: &Path) -> (u64, u64) {
 fn parse_mdx_as_data_track(path: &Path) -> DataTrack {
     let (sector_size, user_data_offset) = mdx_sector_format(path);
     let lba_offset = if sector_size == 2352 { sector_lba_at(path, MDX_DATA_OFFSET) } else { 0 };
-    DataTrack { bin_path: path.to_path_buf(), track_offset: MDX_DATA_OFFSET, user_data_offset, lba_offset, descramble: false, sector_count: 0 }
+    DataTrack { bin_path: path.to_path_buf(), track_offset: MDX_DATA_OFFSET, user_data_offset, stride: RAW_SECTOR_SIZE, lba_offset, descramble: false, sector_count: 0 }
 }
 
 // ISO9660Reader for 2048-byte logical MDX sectors (the common case).
@@ -558,6 +640,7 @@ fn parse_nrg_for_data_track(path: &Path) -> Result<DataTrack, String> {
                             bin_path: path.to_path_buf(),
                             track_offset: track_off,
                             user_data_offset: udo,
+                            stride: RAW_SECTOR_SIZE,
                             lba_offset: lba_off,
                             descramble: false,
                             sector_count: 0,
@@ -638,6 +721,7 @@ fn parse_ccd_for_data_track(ccd_path: &Path) -> Result<DataTrack, String> {
                 bin_path: img_path,
                 track_offset,
                 user_data_offset: udo,
+                stride: RAW_SECTOR_SIZE,
                 lba_offset,
                 descramble: false,
                 sector_count: 0,
@@ -645,6 +729,273 @@ fn parse_ccd_for_data_track(ccd_path: &Path) -> Result<DataTrack, String> {
         }
     }
     Err("No data track found in CCD".to_string())
+}
+
+// ── CDI (DiscJuggler) support ─────────────────────────────────────────────────
+
+// Scan for the ISO9660 PVD (CD001 signature) near a computed track start and
+// return Some(adjusted_track_offset) such that LBA 16 maps exactly to the PVD,
+// or None if no PVD was found within MAX_SCAN sectors.
+// On standard CDs the PVD is at LBA 16; on Dreamcast GD-ROM discs a 150-sector
+// IP.BIN bootstrap precedes the ISO9660 area (PVD at LBA 166).
+fn cdi_align_to_pvd(path: &Path, base_offset: u64, stride: u64, udo: u64) -> Option<u64> {
+    const PVD_LBA: u64 = 16;
+    const CD001: &[u8] = b"\x01CD001\x01";
+    const MAX_SCAN: u64 = 512;
+
+    let mut f = File::open(path).ok()?;
+    let mut buf = [0u8; 8];
+
+    for delta in 0..MAX_SCAN {
+        let pos = base_offset + (PVD_LBA + delta) * stride + udo;
+        if f.seek(SeekFrom::Start(pos)).is_err() { break; }
+        if f.read_exact(&mut buf).is_err() { break; }
+        if buf.starts_with(CD001) {
+            return Some(base_offset + delta * stride);
+        }
+    }
+    None
+}
+
+fn parse_cdi_for_data_track(path: &Path) -> Result<DataTrack, String> {
+    const CDI_V2:  u32 = 0x80000004;
+    // const CDI_V3:  u32 = 0x80000005;
+    const CDI_V35: u32 = 0x80000006;
+
+    let mut f = File::open(path).map_err(|e| format!("Cannot open CDI: {e}"))?;
+    let file_size = f.seek(SeekFrom::End(0)).map_err(|e| format!("CDI seek: {e}"))?;
+    if file_size < 8 { return Err("CDI file too short".to_string()); }
+
+    // Footer: [version u32 LE][header_offset u32 LE] at the last 8 bytes.
+    f.seek(SeekFrom::Start(file_size - 8)).map_err(|e| format!("CDI seek: {e}"))?;
+    let mut b4 = [0u8; 4];
+    f.read_exact(&mut b4).map_err(|e| format!("CDI read: {e}"))?;
+    let version = u32::from_le_bytes(b4);
+    f.read_exact(&mut b4).map_err(|e| format!("CDI read: {e}"))?;
+    let header_offset = u32::from_le_bytes(b4);
+
+    // V2=0x80000004, V3=0x80000005, V3.5=0x80000006
+    if version < 0x80000004 || version > 0x80000006 {
+        return Err(format!("Not a CDI image (version 0x{version:08X})"));
+    }
+    if header_offset == 0 { return Err("Bad CDI: zero header offset".to_string()); }
+
+    // V3.5: descriptor occupies the last header_offset bytes.
+    // V2/V3: header_offset is an absolute byte position from the start.
+    let desc_start: u64 = if version == CDI_V35 {
+        file_size.saturating_sub(header_offset as u64)
+    } else {
+        header_offset as u64
+    };
+
+    f.seek(SeekFrom::Start(desc_start)).map_err(|e| format!("CDI seek: {e}"))?;
+
+    let mut b1 = [0u8; 1];
+    let mut b2 = [0u8; 2];
+
+    macro_rules! r1 { () => {{ f.read_exact(&mut b1).map_err(|e| format!("CDI read: {e}"))?; b1[0] }} }
+    macro_rules! r2 { () => {{ f.read_exact(&mut b2).map_err(|e| format!("CDI read: {e}"))?; u16::from_le_bytes(b2) }} }
+    macro_rules! r4 { () => {{ f.read_exact(&mut b4).map_err(|e| format!("CDI read: {e}"))?; u32::from_le_bytes(b4) }} }
+    macro_rules! sk { ($n:expr) => {{ f.seek(SeekFrom::Current($n as i64)).map_err(|e| format!("CDI seek: {e}"))?; }} }
+
+    // Based on cdirip source (CDI_get_sessions / CDI_get_tracks / CDI_read_track).
+    let num_sessions = r2!() as u32;
+    let mut cur_offset: u64 = 0;
+    // Two buckets: last track whose ISO9660 PVD was confirmed, and first track
+    // found without a PVD (fallback). We prefer the confirmed one.
+    let mut best_with_pvd:    Option<DataTrack> = None;
+    let mut first_without_pvd: Option<DataTrack> = None;
+
+    'sessions: for _ in 0..num_sessions {
+        let num_tracks = r2!() as u32;  // CDI_get_tracks
+
+        for _ in 0..num_tracks {
+            // -- CDI_read_track layout (verbatim from cdirip/cdi.c) --
+
+            // 4-byte marker; if non-zero, 8 extra bytes follow (DJ 3.00.780+)
+            let marker = r4!();
+            if marker != 0 { sk!(8); }
+
+            // Two 10-byte track start marks (validated in cdirip, we skip both)
+            sk!(20);
+
+            // 4-byte skip, then 1-byte filename length, then filename bytes
+            sk!(4);
+            let fn_len = r1!() as i64;
+            sk!(fn_len);
+
+            // 11 + 4 + 4 = 19 bytes undeciphered
+            sk!(19);
+
+            // 4-byte DJ4 marker; if 0x80000000, 8 extra bytes follow
+            let dj4 = r4!();
+            if dj4 == 0x80000000 { sk!(8); }
+
+            sk!(2);
+            let pregap       = r4!() as u64;  // pregap in sectors
+            let track_length = r4!() as u64;  // data sectors only (excludes pregap)
+            sk!(6);
+            let track_mode   = r4!();          // 0=audio, 1=Mode1, 2=Mode2
+            sk!(12);
+            let start_lba    = r4!() as u64;  // absolute disc LBA of first data sector
+            let total_len    = r4!() as u64;  // pregap + data (used to advance cur_offset)
+            sk!(16);
+            let sector_size_value = r4!();     // 0→2048, 1→2336, 2→2352
+
+            // 29-byte trailer; non-V2 adds 5 skip + 4 read (+ 78 conditional)
+            sk!(29);
+            if version != CDI_V2 {
+                sk!(5);
+                let extra = r4!();
+                if extra == 0xffffffff { sk!(78); }
+            }
+
+            let stride: u64 = match sector_size_value {
+                0 => 2048,
+                1 => 2336,
+                _ => 2352,
+            };
+
+            if track_mode != 0 {
+                let base_offset = cur_offset + pregap * stride;
+                let user_data_offset = match stride {
+                    2048 => 0,
+                    2336 => 8,
+                    _ => detect_sector_format_at(path, base_offset).1,
+                };
+                // Probe for the actual ISO 9660 PVD. On standard CDs the PVD is at
+                // LBA 16 from base_offset. On Dreamcast GD-ROM discs a 150-sector
+                // IP.BIN bootstrap precedes the ISO9660 area, so the PVD is at LBA
+                // 166. Adjust track_offset so that LBA 16 always hits the PVD.
+                let pvd_offset = cdi_align_to_pvd(path, base_offset, stride, user_data_offset);
+                let track_offset = pvd_offset.unwrap_or(base_offset);
+                let dt = DataTrack {
+                    bin_path: path.to_path_buf(),
+                    track_offset,
+                    user_data_offset,
+                    stride,
+                    lba_offset: start_lba,
+                    descramble: false,
+                    sector_count: track_length,
+                };
+                if pvd_offset.is_some() {
+                    best_with_pvd = Some(dt);
+                    break 'sessions;  // stop: later sessions may have corrupt descriptors
+                } else if first_without_pvd.is_none() {
+                    first_without_pvd = Some(dt);  // keep only as a fallback
+                }
+            }
+
+            cur_offset += stride * total_len;
+        }
+
+        // CDI_skip_next_session: 4+8 bytes; non-V2 adds 1 more
+        sk!(12);
+        if version != CDI_V2 { sk!(1); }
+    }
+
+    best_with_pvd
+        .or(first_without_pvd)
+        .ok_or_else(|| "No data track found in CDI image".to_string())
+}
+
+// ── GDI support ───────────────────────────────────────────────────────────────
+// Format: text index file; each track in its own .bin/.raw file.
+// Line 1: num_tracks. Remaining lines: <num> <start_lba> <type> <sector_size> <file> <flags>
+// type 0 = audio, 4 = data. sector_size typically 2352 (raw) or 2048 (cooked).
+
+fn parse_gdi_for_data_track(gdi_path: &Path) -> Result<DataTrack, String> {
+    let text = fs::read_to_string(gdi_path).map_err(|e| format!("Cannot read GDI: {e}"))?;
+    let dir = gdi_path.parent().unwrap_or(Path::new("."));
+
+    let mut lines = text.lines().filter(|l| !l.trim().is_empty());
+    lines.next().ok_or("GDI: missing track count")?; // skip count line
+
+    // Keep best data track with a confirmed PVD (prefer highest start_lba, i.e. GD-ROM area).
+    let mut best_with_pvd: Option<(u64, DataTrack)> = None;
+    let mut best_without_pvd: Option<(u64, DataTrack)> = None;
+
+    for line in lines {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() < 5 { continue; }
+        let start_lba: u64 = match parts[1].parse() { Ok(v) => v, Err(_) => continue };
+        let track_type: u32 = match parts[2].parse() { Ok(v) => v, Err(_) => continue };
+        let sector_size: u64 = match parts[3].parse() { Ok(v) => v, Err(_) => continue };
+        let filename = parts[4].trim_matches('"');
+
+        if track_type == 0 { continue; } // audio
+
+        let bin_path = dir.join(filename);
+        if !bin_path.exists() { continue; }
+
+        let stride = sector_size;
+        let user_data_offset = if stride == 2048 { 0 } else { detect_sector_format_at(&bin_path, 0).1 };
+        let sector_count = fs::metadata(&bin_path).map(|m| m.len() / stride).unwrap_or(0);
+
+        // base_offset=0: each GDI track file starts at byte 0.
+        let pvd_offset = cdi_align_to_pvd(&bin_path, 0, stride, user_data_offset);
+        let track_offset = pvd_offset.unwrap_or(0);
+
+        let dt = DataTrack { bin_path, track_offset, user_data_offset, stride, lba_offset: start_lba, descramble: false, sector_count };
+        if pvd_offset.is_some() {
+            if best_with_pvd.as_ref().map_or(true, |(best, _)| start_lba > *best) {
+                best_with_pvd = Some((start_lba, dt));
+            }
+        } else if best_without_pvd.as_ref().map_or(true, |(best, _)| start_lba > *best) {
+            best_without_pvd = Some((start_lba, dt));
+        }
+    }
+
+    best_with_pvd.map(|(_, dt)| dt)
+        .or_else(|| best_without_pvd.map(|(_, dt)| dt))
+        .ok_or_else(|| "No data track found in GDI image".to_string())
+}
+
+#[tauri::command]
+fn get_gdi_tracks(gdi_path: String) -> Result<Vec<TrackInfo>, String> {
+    let path = Path::new(&gdi_path);
+    let text = fs::read_to_string(path).map_err(|e| format!("Cannot read GDI: {e}"))?;
+    let dir = path.parent().unwrap_or(Path::new("."));
+
+    let mut lines = text.lines().filter(|l| !l.trim().is_empty());
+    lines.next().ok_or("GDI: missing track count")?; // skip count line
+
+    let mut tracks: Vec<TrackInfo> = Vec::new();
+    for line in lines {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() < 5 { continue; }
+        let number: u32    = match parts[0].parse() { Ok(v) => v, Err(_) => continue };
+        let disc_lba: u64  = match parts[1].parse() { Ok(v) => v, Err(_) => continue };
+        let track_type: u32 = match parts[2].parse() { Ok(v) => v, Err(_) => continue };
+        let sector_size: u64 = match parts[3].parse() { Ok(v) => v, Err(_) => continue };
+        let filename = parts[4].trim_matches('"');
+
+        let bin_path = dir.join(filename);
+        let num_sectors = fs::metadata(&bin_path).map(|m| m.len() / sector_size).unwrap_or(0);
+        let is_data = track_type != 0;
+        let mode = if !is_data {
+            "AUDIO".to_string()
+        } else if sector_size == 2048 {
+            "MODE1/2048".to_string()
+        } else {
+            let udo = detect_sector_format_at(&bin_path, 0).1;
+            if udo == 24 { "MODE2/2352".to_string() } else { "MODE1/2352".to_string() }
+        };
+        // GD-ROM discs: tracks with disc LBA < 45000 are the CD-DA area (session 1),
+        // tracks at LBA >= 45000 are the GD-ROM high-density area (session 2).
+        let session = if disc_lba < 45000 { 1u32 } else { 2 };
+        // start_lba=0: each GDI track is its own file starting at byte 0.
+        // open_audio_src uses start_lba * RAW_SECTOR_SIZE as the seek offset within bin_path.
+        tracks.push(TrackInfo {
+            number, is_data, mode,
+            start_lba: 0,
+            num_sectors, session,
+            bin_path: bin_path.to_string_lossy().into_owned(),
+        });
+    }
+
+    if tracks.is_empty() { return Err("No tracks found in GDI".to_string()); }
+    Ok(tracks)
 }
 
 // ── MDS/MDF support ───────────────────────────────────────────────────────────
@@ -666,6 +1017,27 @@ fn parse_mds_for_data_track(mds_path: &Path) -> Result<DataTrack, String> {
         return Err("Not a valid MDS file".to_string());
     }
 
+    let mdf_path = mds_path.with_extension("mdf");
+    if !mdf_path.exists() {
+        return Err(format!("MDF file not found: {}", mdf_path.display()));
+    }
+
+    // DVD medium types (0x10=DVD-ROM, 0x12=DVD-R, 0x14=DVD-RW, 0x18=DVD+R…):
+    // The MDF is a flat 2048-byte-per-sector image; CD session/track parsing doesn't apply.
+    let medium_type = data[0x12];
+    if medium_type >= 0x10 {
+        let sector_count = fs::metadata(&mdf_path).map(|m| m.len() / 2048).unwrap_or(0);
+        return Ok(DataTrack {
+            bin_path: mdf_path,
+            track_offset: 0,
+            user_data_offset: 0,
+            stride: 2048,
+            lba_offset: 0,
+            descramble: false,
+            sector_count,
+        });
+    }
+
     let session_offset = read_u32_le(&data, 0x4C) as usize;
     if session_offset + 0x18 > data.len() {
         return Err("Invalid MDS session offset".to_string());
@@ -673,11 +1045,6 @@ fn parse_mds_for_data_track(mds_path: &Path) -> Result<DataTrack, String> {
 
     let num_blocks = data[session_offset + 0x0A] as usize;
     let track_blocks_offset = read_u32_le(&data, session_offset + 0x14) as usize;
-
-    let mdf_path = mds_path.with_extension("mdf");
-    if !mdf_path.exists() {
-        return Err(format!("MDF file not found: {}", mdf_path.display()));
-    }
 
     for i in 0..num_blocks {
         let tb = track_blocks_offset + i * MDS_TRACK_BLOCK_SIZE;
@@ -697,7 +1064,7 @@ fn parse_mds_for_data_track(mds_path: &Path) -> Result<DataTrack, String> {
 
         let track_offset = read_u64_le(&data, tb + 0x20);
         let lba_offset = sector_lba_at(&mdf_path, track_offset);
-        return Ok(DataTrack { bin_path: mdf_path, track_offset, user_data_offset, lba_offset, descramble: false, sector_count: 0 });
+        return Ok(DataTrack { bin_path: mdf_path, track_offset, user_data_offset, stride: RAW_SECTOR_SIZE, lba_offset, descramble: false, sector_count: 0 });
     }
 
     Err("No data track found in MDS".to_string())
@@ -711,6 +1078,20 @@ fn get_mds_track_list(mds_path: &Path) -> Result<Vec<TrackInfo>, String> {
         return Err("Not a valid MDS file".to_string());
     }
 
+    let mdf_path = mds_path.with_extension("mdf");
+    let mdf_str = mdf_path.to_string_lossy().into_owned();
+
+    // DVD medium types: single data track, flat 2048-byte sectors.
+    let medium_type = data[0x12];
+    if medium_type >= 0x10 {
+        let num_sectors = fs::metadata(&mdf_path).map(|m| m.len() / 2048).unwrap_or(0);
+        return Ok(vec![TrackInfo {
+            number: 1, is_data: true, mode: "MODE1/2048".to_string(),
+            start_lba: 0, num_sectors, session: 1,
+            bin_path: mdf_str,
+        }]);
+    }
+
     // Number of sessions is at 0x14 (2 bytes LE); sessions array starts at 0x4C (4 bytes LE).
     let num_sessions = {
         let n = u16::from_le_bytes([data[0x14], data[0x15]]) as usize;
@@ -718,11 +1099,9 @@ fn get_mds_track_list(mds_path: &Path) -> Result<Vec<TrackInfo>, String> {
     };
     let first_session_offset = read_u32_le(&data, 0x4C) as usize;
 
-    let mdf_path = mds_path.with_extension("mdf");
     let total_sectors = fs::metadata(&mdf_path)
         .map(|m| m.len() / RAW_SECTOR_SIZE)
         .unwrap_or(0);
-    let mdf_str = mdf_path.to_string_lossy().into_owned();
 
     let mut tracks: Vec<TrackInfo> = Vec::new();
 
@@ -780,6 +1159,155 @@ fn get_mds_track_list(mds_path: &Path) -> Result<Vec<TrackInfo>, String> {
 #[tauri::command]
 fn get_mds_tracks(mds_path: String) -> Result<Vec<TrackInfo>, String> {
     get_mds_track_list(Path::new(&mds_path))
+}
+
+// ── CHD (Compressed Hunks of Data) support ─────────────────────────────────
+
+struct ChdSectorReader {
+    reader: ChdReader<BufReader<File>>,
+    stride: u64,
+    user_data_offset: u64,
+    track_byte_start: u64,
+}
+
+impl ISO9660Reader for ChdSectorReader {
+    fn read_at(&mut self, buf: &mut [u8], lba: u64) -> io::Result<usize> {
+        let pos = self.track_byte_start + lba * self.stride + self.user_data_offset;
+        self.reader.seek(SeekFrom::Start(pos))?;
+        self.reader.read(buf)
+    }
+}
+
+fn chd_stride(hunk_size: u64, unit_b: u64) -> u64 {
+    if unit_b == 2448 || (unit_b == 0 && hunk_size % 2448 == 0 && hunk_size >= 2448) {
+        2448
+    } else if unit_b == 2352 || (unit_b == 0 && hunk_size % 2352 == 0 && hunk_size >= 2352) {
+        2352
+    } else {
+        2048
+    }
+}
+
+fn open_chd(path: &Path) -> Result<ChdSectorReader, String> {
+    let file = File::open(path).map_err(|e| format!("Cannot open CHD: {e}"))?;
+    let chd = Chd::open(BufReader::new(file), None)
+        .map_err(|e| format!("Cannot parse CHD: {e}"))?;
+
+    let stride = chd_stride(
+        chd.header().hunk_size() as u64,
+        chd.header().unit_bytes() as u64,
+    );
+    let mut reader = ChdReader::new(chd);
+
+    if stride == 2048 {
+        return Ok(ChdSectorReader { reader, stride: 2048, user_data_offset: 0, track_byte_start: 0 });
+    }
+
+    // CD CHD: probe the PVD to find the data track start position and sector mode.
+    // Common pregap values: 0 (no stored pregap), 4 (MAME default), 150 (2-sec pregap).
+    let mut track_byte_start = 0u64;
+    let mut user_data_offset = 16u64;
+    'probe: for pregap in [0u64, 4, 150] {
+        for udo in [16u64, 24] {
+            let pvd_pos = (pregap + 16) * stride + udo;
+            let mut buf = [0u8; 6];
+            if reader.seek(SeekFrom::Start(pvd_pos)).is_ok()
+                && reader.read_exact(&mut buf).is_ok()
+                && buf[0] == 1 && &buf[1..6] == b"CD001"
+            {
+                track_byte_start = pregap * stride;
+                user_data_offset = udo;
+                break 'probe;
+            }
+        }
+    }
+
+    Ok(ChdSectorReader { reader, stride, user_data_offset, track_byte_start })
+}
+
+fn detect_filesystems_chd(path: &Path) -> Vec<String> {
+    let mut r = match open_chd(path) {
+        Ok(r) => r,
+        Err(_) => return vec!["ISO 9660".to_string()],
+    };
+
+    // Probe for 3DO OperaFS (LBA 0 magic, raw CD sectors) before trying ISO 9660.
+    if r.stride != 2048 {
+        for pregap in [0u64, 4, 150] {
+            for udo in [16u64, 24] {
+                if threedo_filesystem::is_threedo_reader(&mut r.reader, pregap * r.stride, udo, r.stride) {
+                    return vec!["3DO OperaFS".to_string()];
+                }
+            }
+        }
+    }
+
+    // Probe for XDVDFS (Xbox DVD, 2048-byte sectors).
+    if r.stride == 2048 && xdvdfs_filesystem::is_xdvdfs_reader(&mut r.reader, 0) {
+        return vec!["XDVDFS".to_string()];
+    }
+    // Probe for GameCube/Wii GCM (2048-byte sectors).
+    if r.stride == 2048 {
+        if let Some(kind) = gcm_filesystem::detect_gcm_reader(&mut r.reader) {
+            return vec![gcm_kind_label(kind)];
+        }
+    }
+
+    let mut result: Vec<String> = Vec::new();
+    {
+        // For raw-sector CHDs (stride != 2048), open_chd may have defaulted track_byte_start=0
+        // and user_data_offset=16 when no ISO PVD was found, which can produce false positives
+        // against non-ISO discs (e.g. 3DO). Re-probe with all pregap+udo combinations.
+        let s = r.stride;
+        let combos: Vec<(u64, u64)> = if s != 2048 {
+            [0u64, 4, 150].iter()
+                .flat_map(|&pg| [16u64, 24].iter().map(move |&udo| (pg * s, udo)))
+                .collect()
+        } else {
+            vec![(r.track_byte_start, r.user_data_offset)]
+        };
+        'iso: for (tbs, udo) in combos {
+            let pvd_pos = tbs + 16 * s + udo;
+            let mut buf = [0u8; 2048];
+            if r.reader.seek(SeekFrom::Start(pvd_pos)).is_ok()
+                && r.reader.read_exact(&mut buf).is_ok()
+                && buf[0] == 1 && &buf[1..6] == b"CD001"
+            {
+                result.push("ISO 9660".to_string());
+                for lba in 17u64..32 {
+                    let pos = tbs + lba * s + udo;
+                    if r.reader.seek(SeekFrom::Start(pos)).is_err() { break; }
+                    let mut buf2 = [0u8; 2048];
+                    if r.reader.read_exact(&mut buf2).is_err() { break; }
+                    match buf2[0] {
+                        0xFF => break,
+                        0x02 => {
+                            let esc = &buf2[88..120];
+                            if esc.starts_with(b"%/@") || esc.starts_with(b"%/C") || esc.starts_with(b"%/E") {
+                                result.push("Joliet".to_string());
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                break 'iso;
+            }
+        }
+    }
+
+    if result.is_empty() {
+        if r.stride != 2048 {
+            result.push("3DO OperaFS".to_string());
+        } else {
+            result.push("ISO 9660".to_string());
+        }
+    }
+    result
+}
+
+fn open_chd_iso(path: &Path) -> Result<ISO9660<ChdSectorReader>, String> {
+    let r = open_chd(path)?;
+    ISO9660::new(r).map_err(|e| format!("Invalid CHD: {e}"))
 }
 
 // ── Mount disc image ──────────────────────────────────────────────────────────
@@ -848,19 +1376,31 @@ fn mount_disc_image(
     #[cfg(target_os = "linux")]
     {
         let lower = image_path.to_lowercase();
-        let use_cdemu = lower.ends_with(".cue") || lower.ends_with(".mds") || lower.ends_with(".mdx") || lower.ends_with(".nrg") || lower.ends_with(".ccd");
+        let use_cdemu = lower.ends_with(".cue") || lower.ends_with(".mds") || lower.ends_with(".mdx")
+            || lower.ends_with(".nrg") || lower.ends_with(".ccd")
+            || lower.ends_with(".toc") || lower.ends_with(".b6t") || lower.ends_with(".bwt")
+            || lower.ends_with(".c2d") || lower.ends_with(".pdi") || lower.ends_with(".gi")
+            || lower.ends_with(".daa");
 
         if use_cdemu {
             let before = sr_devices();
 
             let load_out = Command::new("cdemu")
-                .args(["load", "0", &image_path])
+                .args(["load", "any", &image_path])
                 .output()
                 .map_err(|e| format!("cdemu load failed: {e}"))?;
 
             if !load_out.status.success() {
                 return Err(String::from_utf8_lossy(&load_out.stderr).trim().to_string());
             }
+
+            // Parse assigned slot from output: "...loaded image '...' to device N."
+            let slot = String::from_utf8_lossy(&load_out.stdout)
+                .split_whitespace()
+                .last()
+                .map(|w| w.trim_end_matches('.').to_string())
+                .filter(|w| w.chars().all(|c| c.is_ascii_digit()))
+                .unwrap_or_else(|| "0".to_string());
 
             // Give the kernel time to expose the virtual device.
             std::thread::sleep(std::time::Duration::from_millis(1500));
@@ -889,11 +1429,11 @@ fn mount_disc_image(
             };
 
             if mount_point.is_empty() {
-                let _ = Command::new("cdemu").args(["unload", "0"]).output();
+                let _ = Command::new("cdemu").args(["unload", &slot]).output();
                 return Err("CDemu: could not determine mount point".to_string());
             }
 
-            let device_key = format!("cdemu:0:{new_dev}");
+            let device_key = format!("cdemu:{slot}:{new_dev}");
             state.0.lock().unwrap().push(device_key.clone());
             return Ok(MountResult { mount_point, device: device_key });
         }
@@ -1222,6 +1762,32 @@ fn read_sector(image_path: String, lba: u64) -> Result<SectorData, String> {
     } else if lower.ends_with(".ccd") {
         let track = parse_ccd_for_data_track(path)?;
         (track.bin_path, RAW_SECTOR_SIZE, track.user_data_offset, track.track_offset)
+    } else if lower.ends_with(".cdi") {
+        let track = parse_cdi_for_data_track(path)?;
+        (track.bin_path, track.stride, track.user_data_offset, track.track_offset)
+    } else if lower.ends_with(".gdi") {
+        let track = parse_gdi_for_data_track(path)?;
+        (track.bin_path, track.stride, track.user_data_offset, track.track_offset)
+    } else if lower.ends_with(".chd") {
+        let file = File::open(path).map_err(|e| format!("Cannot open CHD: {e}"))?;
+        let chd = Chd::open(BufReader::new(file), None)
+            .map_err(|e| format!("Cannot parse CHD: {e}"))?;
+        let stride = chd_stride(chd.header().hunk_size() as u64, chd.header().unit_bytes() as u64);
+        let logical_bytes = chd.header().logical_bytes();
+        let total_sectors = if stride > 0 { logical_bytes / stride } else { 0 };
+        if total_sectors == 0 { return Err("CHD is empty".to_string()); }
+        if lba >= total_sectors {
+            return Err(format!("Sector {lba} out of range (0–{})", total_sectors - 1));
+        }
+        let mut reader = ChdReader::new(chd);
+        reader.seek(SeekFrom::Start(lba * stride)).map_err(|e| format!("Seek error: {e}"))?;
+        let mut bytes = vec![0u8; stride as usize];
+        reader.read_exact(&mut bytes).map_err(|e| format!("Read error: {e}"))?;
+        const SYNC: [u8; 12] = [0x00,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0x00];
+        let udo = if stride > 2048 && bytes.len() >= 16 && bytes[0..12] == SYNC {
+            if bytes[15] == 2 { 24u32 } else { 16u32 }
+        } else { 0u32 };
+        return Ok(SectorData { bytes, sector_size: stride as u32, user_data_offset: udo, total_sectors, lba });
     } else if lower.ends_with(".mdx") {
         let (ss, udo) = mdx_sector_format(path);
         (path.to_path_buf(), ss, udo, MDX_DATA_OFFSET)
@@ -1376,7 +1942,14 @@ fn save_audio_as_mp3(track: &TrackInfo, dest_path: &str) -> Result<(), String> {
 
 #[tauri::command]
 fn save_audio_track(cue_path: String, track_number: u32, dest_path: String, format: String) -> Result<(), String> {
-    let tracks = get_cue_tracks(cue_path)?;
+    let lower = cue_path.to_lowercase();
+    let tracks = if lower.ends_with(".gdi") {
+        get_gdi_tracks(cue_path)?
+    } else if lower.ends_with(".mds") {
+        get_mds_track_list(Path::new(&cue_path))?
+    } else {
+        get_cue_tracks(cue_path)?
+    };
     let track = tracks.iter()
         .find(|t| t.number == track_number && !t.is_data)
         .ok_or_else(|| format!("Audio track {track_number} not found"))?;
@@ -1579,9 +2152,72 @@ fn open_pce_fs(track: &DataTrack) -> Result<pce_filesystem::PceFs, String> {
     pce_filesystem::PceFs::new(bin, track.track_offset, track.user_data_offset)
 }
 
+fn open_threedo_fs(track: &DataTrack) -> Result<threedo_filesystem::ThreeDOFs<File>, String> {
+    let bin = File::open(&track.bin_path).map_err(|e| format!("Cannot open: {e}"))?;
+    let stride = threedo_filesystem::default_stride(track.user_data_offset);
+    threedo_filesystem::ThreeDOFs::new(bin, track.track_offset, track.user_data_offset, stride)
+}
+
+fn open_threedo_chd(path: &Path) -> Result<threedo_filesystem::ThreeDOFs<ChdReader<BufReader<File>>>, String> {
+    let file = File::open(path).map_err(|e| format!("Cannot open CHD: {e}"))?;
+    let chd = Chd::open(BufReader::new(file), None)
+        .map_err(|e| format!("Cannot parse CHD: {e}"))?;
+    let stride = chd_stride(chd.header().hunk_size() as u64, chd.header().unit_bytes() as u64);
+    let mut reader = ChdReader::new(chd);
+
+    let mut track_byte_start = 0u64;
+    let mut udo = if stride == 2048 { 0u64 } else { 16u64 };
+    if stride != 2048 {
+        'probe: for pregap in [0u64, 4, 150] {
+            for ud in [16u64, 24] {
+                if threedo_filesystem::is_threedo_reader(&mut reader, pregap * stride, ud, stride) {
+                    track_byte_start = pregap * stride;
+                    udo = ud;
+                    break 'probe;
+                }
+            }
+        }
+    }
+
+    threedo_filesystem::ThreeDOFs::new(reader, track_byte_start, udo, stride)
+}
+
+fn gcm_kind_label(kind: gcm_filesystem::DiscKind) -> String {
+    match kind {
+        gcm_filesystem::DiscKind::GameCube => "GameCube GCM".to_string(),
+        gcm_filesystem::DiscKind::Wii => "Wii GCM".to_string(),
+    }
+}
+
+fn open_gcm_fs(track: &DataTrack) -> Result<gcm_filesystem::GcmFs<File>, String> {
+    let bin = File::open(&track.bin_path).map_err(|e| format!("Cannot open: {e}"))?;
+    gcm_filesystem::GcmFs::new(bin, track.track_offset)
+}
+
+fn open_gcm_chd(path: &Path) -> Result<gcm_filesystem::GcmFs<ChdReader<BufReader<File>>>, String> {
+    let file = File::open(path).map_err(|e| format!("Cannot open CHD: {e}"))?;
+    let chd = Chd::open(BufReader::new(file), None)
+        .map_err(|e| format!("Cannot parse CHD: {e}"))?;
+    let reader = ChdReader::new(chd);
+    gcm_filesystem::GcmFs::new(reader, 0)
+}
+
+fn open_xdvdfs_fs(track: &DataTrack) -> Result<xdvdfs_filesystem::XDVDFSFs<File>, String> {
+    let bin = File::open(&track.bin_path).map_err(|e| format!("Cannot open: {e}"))?;
+    xdvdfs_filesystem::XDVDFSFs::new(bin, track.track_offset)
+}
+
+fn open_xdvdfs_chd(path: &Path) -> Result<xdvdfs_filesystem::XDVDFSFs<ChdReader<BufReader<File>>>, String> {
+    let file = File::open(path).map_err(|e| format!("Cannot open CHD: {e}"))?;
+    let chd = Chd::open(BufReader::new(file), None)
+        .map_err(|e| format!("Cannot parse CHD: {e}"))?;
+    let reader = ChdReader::new(chd);
+    xdvdfs_filesystem::XDVDFSFs::new(reader, 0)
+}
+
 fn open_iso_fs(track: &DataTrack) -> Result<ISO9660<MultiTrackBinReader>, String> {
     let bin = File::open(&track.bin_path).map_err(|e| format!("Cannot open: {e}"))?;
-    let reader = MultiTrackBinReader::single(bin, track.track_offset, track.user_data_offset, track.lba_offset);
+    let reader = MultiTrackBinReader::single(bin, track.track_offset, track.user_data_offset, track.stride, track.lba_offset);
     ISO9660::new(reader).map_err(|e| format!("Invalid disc image: {e}"))
 }
 
@@ -1602,6 +2238,7 @@ fn open_iso_fs_for_cue(cue_path: &Path) -> Result<ISO9660<MultiTrackBinReader>, 
                 file,
                 track_offset: dt.track_offset,
                 user_data_offset: dt.user_data_offset,
+                stride: dt.stride,
                 lba_offset: dt.lba_offset,
                 start_lba: dt.lba_offset,
                 sector_count: dt.sector_count,
@@ -1612,13 +2249,28 @@ fn open_iso_fs_for_cue(cue_path: &Path) -> Result<ISO9660<MultiTrackBinReader>, 
     } else {
         let dt = all_tracks.into_iter().last().unwrap();
         let bin = File::open(&dt.bin_path).map_err(|e| format!("Cannot open BIN: {e}"))?;
-        let reader = MultiTrackBinReader::single(bin, dt.track_offset, dt.user_data_offset, dt.lba_offset);
+        let reader = MultiTrackBinReader::single(bin, dt.track_offset, dt.user_data_offset, dt.stride, dt.lba_offset);
         ISO9660::new(reader).map_err(|e| format!("Invalid disc image: {e}"))
     }
 }
 
+// Returns true when filesystem is None (auto-detect) OR explicitly matches target.
+fn fs_matches(fs: &Option<String>, target: &str) -> bool {
+    fs.as_deref().map_or(true, |s| s == target)
+}
+
+fn fs_matches_udf(fs: &Option<String>) -> bool {
+    fs.as_deref().map_or(true, |s| s.starts_with("UDF"))
+}
+
+fn fs_matches_gcm(fs: &Option<String>) -> bool {
+    fs.as_deref().map_or(true, |s| s == "GameCube GCM" || s == "Wii GCM")
+}
+
+
+
 #[tauri::command]
-fn list_disc_contents(image_path: String, dir_path: String) -> Result<Vec<DiscEntry>, String> {
+fn list_disc_contents(image_path: String, dir_path: String, filesystem: Option<String>) -> Result<Vec<DiscEntry>, String> {
     let path = image_path.as_str();
 
     // If image_path is a real directory (e.g. a mounted disc volume), list it directly.
@@ -1653,23 +2305,41 @@ fn list_disc_contents(image_path: String, dir_path: String) -> Result<Vec<DiscEn
 
     let lower = path.to_lowercase();
 
-    if lower.ends_with(".cue") || lower.ends_with(".mds") || lower.ends_with(".nrg") || lower.ends_with(".ccd") {
+    if lower.ends_with(".cue") || lower.ends_with(".mds") || lower.ends_with(".nrg") || lower.ends_with(".ccd") || lower.ends_with(".cdi") || lower.ends_with(".gdi") {
         let track = if lower.ends_with(".cue") { parse_cue_for_data_track(Path::new(path))? }
             else if lower.ends_with(".mds") { parse_mds_for_data_track(Path::new(path))? }
             else if lower.ends_with(".nrg") { parse_nrg_for_data_track(Path::new(path))? }
-            else { parse_ccd_for_data_track(Path::new(path))? };
+            else if lower.ends_with(".ccd") { parse_ccd_for_data_track(Path::new(path))? }
+            else if lower.ends_with(".gdi") { parse_gdi_for_data_track(Path::new(path))? }
+            else { parse_cdi_for_data_track(Path::new(path))? };
         if cdi_filesystem::is_cdi_disc(&track.bin_path, track.track_offset, track.user_data_offset, track.lba_offset, track.descramble) {
             open_cdi_fs(&track)?.list_directory(&dir_path)
         } else if pce_filesystem::is_pce_disc(&track.bin_path, track.track_offset, track.user_data_offset) {
             open_pce_fs(&track)?.list_directory(&dir_path)
-        } else if hfs_filesystem::is_hfs_disc(&track.bin_path, track.track_offset, track.user_data_offset) {
+        } else if threedo_filesystem::is_threedo_disc(&track.bin_path, track.track_offset, track.user_data_offset) {
+            open_threedo_fs(&track)?.list_directory(&dir_path)
+        } else if fs_matches(&filesystem, "XDVDFS") && track.user_data_offset == 0 && xdvdfs_filesystem::is_xdvdfs_disc(&track.bin_path, track.track_offset) {
+            open_xdvdfs_fs(&track)?.list_directory(&dir_path)
+        } else if fs_matches_gcm(&filesystem) && track.user_data_offset == 0 && gcm_filesystem::detect_gcm_disc(&track.bin_path).is_some() {
+            open_gcm_fs(&track)?.list_directory(&dir_path)
+        } else if fs_matches(&filesystem, "HFS") && hfs_filesystem::is_hfs_disc(&track.bin_path, track.track_offset, track.user_data_offset) {
             open_hfs_fs(&track)?.list_directory(&dir_path)
-        } else if udf_filesystem::is_udf_disc(&track.bin_path, track.track_offset, track.user_data_offset) {
+        } else if fs_matches_udf(&filesystem) && udf_filesystem::is_udf_disc(&track.bin_path, track.track_offset, track.user_data_offset) {
             open_udf_fs(&track)?.list_directory(&dir_path)
         } else if lower.ends_with(".cue") {
             collect_entries(&open_iso_fs_for_cue(Path::new(path))?, &dir_path)
         } else {
             collect_entries(&open_iso_fs(&track)?, &dir_path)
+        }
+    } else if lower.ends_with(".chd") {
+        if filesystem.as_deref() == Some("3DO OperaFS") {
+            open_threedo_chd(Path::new(path))?.list_directory(&dir_path)
+        } else if filesystem.as_deref() == Some("XDVDFS") {
+            open_xdvdfs_chd(Path::new(path))?.list_directory(&dir_path)
+        } else if filesystem.as_deref() == Some("GameCube GCM") || filesystem.as_deref() == Some("Wii GCM") {
+            open_gcm_chd(Path::new(path))?.list_directory(&dir_path)
+        } else {
+            collect_entries(&open_chd_iso(Path::new(path))?, &dir_path)
         }
     } else if lower.ends_with(".mdx") {
         let path_obj = Path::new(path);
@@ -1680,6 +2350,8 @@ fn list_disc_contents(image_path: String, dir_path: String) -> Result<Vec<DiscEn
                 open_cdi_fs(&track)?.list_directory(&dir_path)
             } else if pce_filesystem::is_pce_disc(&track.bin_path, track.track_offset, track.user_data_offset) {
                 open_pce_fs(&track)?.list_directory(&dir_path)
+            } else if threedo_filesystem::is_threedo_disc(&track.bin_path, track.track_offset, track.user_data_offset) {
+                open_threedo_fs(&track)?.list_directory(&dir_path)
             } else if hfs_filesystem::is_hfs_disc(&track.bin_path, track.track_offset, track.user_data_offset) {
                 open_hfs_fs(&track)?.list_directory(&dir_path)
             } else if udf_filesystem::is_udf_disc(&track.bin_path, track.track_offset, track.user_data_offset) {
@@ -1698,15 +2370,32 @@ fn list_disc_contents(image_path: String, dir_path: String) -> Result<Vec<DiscEn
             let file = File::open(path).map_err(|e| format!("Cannot open file: {e}"))?;
             return pce_filesystem::PceFs::new(file, 0, user_data_offset)?.list_directory(&dir_path);
         }
-        if udf_filesystem::is_udf_disc(path_obj, 0, user_data_offset) {
+        if threedo_filesystem::is_threedo_disc(path_obj, 0, user_data_offset) {
+            let file = File::open(path).map_err(|e| format!("Cannot open file: {e}"))?;
+            let stride = threedo_filesystem::default_stride(user_data_offset);
+            return threedo_filesystem::ThreeDOFs::new(file, 0, user_data_offset, stride)?.list_directory(&dir_path);
+        }
+        if fs_matches(&filesystem, "XDVDFS") && user_data_offset == 0 && xdvdfs_filesystem::is_xdvdfs_disc(path_obj, 0) {
+            let file = File::open(path).map_err(|e| format!("Cannot open file: {e}"))?;
+            return xdvdfs_filesystem::XDVDFSFs::new(file, 0)?.list_directory(&dir_path);
+        }
+        if fs_matches_gcm(&filesystem) && user_data_offset == 0 && gcm_filesystem::detect_gcm_disc(path_obj).is_some() {
+            let file = File::open(path).map_err(|e| format!("Cannot open file: {e}"))?;
+            return gcm_filesystem::GcmFs::new(file, 0)?.list_directory(&dir_path);
+        }
+        if fs_matches_udf(&filesystem) && udf_filesystem::is_udf_disc(path_obj, 0, user_data_offset) {
             let file = File::open(path).map_err(|e| format!("Cannot open file: {e}"))?;
             if let Ok(mut udf) = udf_filesystem::UdfFs::new(file, 0, user_data_offset) {
                 return udf.list_directory(&dir_path);
             }
         }
+        if fs_matches(&filesystem, "HFS") && hfs_filesystem::is_hfs_disc(path_obj, 0, user_data_offset) {
+            let file = File::open(path).map_err(|e| format!("Cannot open file: {e}"))?;
+            return hfs_filesystem::HfsFs::new(file, 0, user_data_offset)?.list_directory(&dir_path);
+        }
         let file = File::open(path).map_err(|e| format!("Cannot open file: {e}"))?;
         if user_data_offset > 0 {
-            let reader = MultiTrackBinReader::single(file, 0, user_data_offset, 0);
+            let reader = MultiTrackBinReader::single(file, 0, user_data_offset, RAW_SECTOR_SIZE, 0);
             let fs = ISO9660::new(reader).map_err(|e| format!("Invalid disc image: {e}"))?;
             collect_entries(&fs, &dir_path)
         } else {
@@ -1717,7 +2406,7 @@ fn list_disc_contents(image_path: String, dir_path: String) -> Result<Vec<DiscEn
 }
 
 #[tauri::command]
-fn save_file(image_path: String, file_path: String, dest_path: String) -> Result<(), String> {
+fn save_file(image_path: String, file_path: String, dest_path: String, filesystem: Option<String>) -> Result<(), String> {
     let path = image_path.as_str();
 
     if Path::new(path).is_dir() {
@@ -1728,23 +2417,41 @@ fn save_file(image_path: String, file_path: String, dest_path: String) -> Result
 
     let lower = path.to_lowercase();
 
-    if lower.ends_with(".cue") || lower.ends_with(".mds") || lower.ends_with(".nrg") || lower.ends_with(".ccd") {
+    if lower.ends_with(".cue") || lower.ends_with(".mds") || lower.ends_with(".nrg") || lower.ends_with(".ccd") || lower.ends_with(".cdi") || lower.ends_with(".gdi") {
         let track = if lower.ends_with(".cue") { parse_cue_for_data_track(Path::new(path))? }
             else if lower.ends_with(".mds") { parse_mds_for_data_track(Path::new(path))? }
             else if lower.ends_with(".nrg") { parse_nrg_for_data_track(Path::new(path))? }
-            else { parse_ccd_for_data_track(Path::new(path))? };
+            else if lower.ends_with(".ccd") { parse_ccd_for_data_track(Path::new(path))? }
+            else if lower.ends_with(".gdi") { parse_gdi_for_data_track(Path::new(path))? }
+            else { parse_cdi_for_data_track(Path::new(path))? };
         if cdi_filesystem::is_cdi_disc(&track.bin_path, track.track_offset, track.user_data_offset, track.lba_offset, track.descramble) {
             open_cdi_fs(&track)?.extract_file(&file_path, &dest_path)
         } else if pce_filesystem::is_pce_disc(&track.bin_path, track.track_offset, track.user_data_offset) {
             open_pce_fs(&track)?.extract_file(&file_path, &dest_path)
-        } else if hfs_filesystem::is_hfs_disc(&track.bin_path, track.track_offset, track.user_data_offset) {
+        } else if threedo_filesystem::is_threedo_disc(&track.bin_path, track.track_offset, track.user_data_offset) {
+            open_threedo_fs(&track)?.extract_file(&file_path, &dest_path)
+        } else if fs_matches(&filesystem, "XDVDFS") && track.user_data_offset == 0 && xdvdfs_filesystem::is_xdvdfs_disc(&track.bin_path, track.track_offset) {
+            open_xdvdfs_fs(&track)?.extract_file(&file_path, &dest_path)
+        } else if fs_matches_gcm(&filesystem) && track.user_data_offset == 0 && gcm_filesystem::detect_gcm_disc(&track.bin_path).is_some() {
+            open_gcm_fs(&track)?.extract_file(&file_path, &dest_path)
+        } else if fs_matches(&filesystem, "HFS") && hfs_filesystem::is_hfs_disc(&track.bin_path, track.track_offset, track.user_data_offset) {
             open_hfs_fs(&track)?.extract_file(&file_path, &dest_path)
-        } else if udf_filesystem::is_udf_disc(&track.bin_path, track.track_offset, track.user_data_offset) {
+        } else if fs_matches_udf(&filesystem) && udf_filesystem::is_udf_disc(&track.bin_path, track.track_offset, track.user_data_offset) {
             open_udf_fs(&track)?.extract_file(&file_path, &dest_path)
         } else if lower.ends_with(".cue") {
             extract_file_from_fs(&open_iso_fs_for_cue(Path::new(path))?, &file_path, &dest_path)
         } else {
             extract_file_from_fs(&open_iso_fs(&track)?, &file_path, &dest_path)
+        }
+    } else if lower.ends_with(".chd") {
+        if filesystem.as_deref() == Some("3DO OperaFS") {
+            open_threedo_chd(Path::new(path))?.extract_file(&file_path, &dest_path)
+        } else if filesystem.as_deref() == Some("XDVDFS") {
+            open_xdvdfs_chd(Path::new(path))?.extract_file(&file_path, &dest_path)
+        } else if filesystem.as_deref() == Some("GameCube GCM") || filesystem.as_deref() == Some("Wii GCM") {
+            open_gcm_chd(Path::new(path))?.extract_file(&file_path, &dest_path)
+        } else {
+            extract_file_from_fs(&open_chd_iso(Path::new(path))?, &file_path, &dest_path)
         }
     } else if lower.ends_with(".mdx") {
         let path_obj = Path::new(path);
@@ -1754,6 +2461,8 @@ fn save_file(image_path: String, file_path: String, dest_path: String) -> Result
                 open_cdi_fs(&track)?.extract_file(&file_path, &dest_path)
             } else if pce_filesystem::is_pce_disc(&track.bin_path, track.track_offset, track.user_data_offset) {
                 open_pce_fs(&track)?.extract_file(&file_path, &dest_path)
+            } else if threedo_filesystem::is_threedo_disc(&track.bin_path, track.track_offset, track.user_data_offset) {
+                open_threedo_fs(&track)?.extract_file(&file_path, &dest_path)
             } else if hfs_filesystem::is_hfs_disc(&track.bin_path, track.track_offset, track.user_data_offset) {
                 open_hfs_fs(&track)?.extract_file(&file_path, &dest_path)
             } else if udf_filesystem::is_udf_disc(&track.bin_path, track.track_offset, track.user_data_offset) {
@@ -1771,15 +2480,32 @@ fn save_file(image_path: String, file_path: String, dest_path: String) -> Result
             let file = File::open(path).map_err(|e| format!("Cannot open file: {e}"))?;
             return pce_filesystem::PceFs::new(file, 0, user_data_offset)?.extract_file(&file_path, &dest_path);
         }
-        if udf_filesystem::is_udf_disc(path_obj, 0, user_data_offset) {
+        if threedo_filesystem::is_threedo_disc(path_obj, 0, user_data_offset) {
+            let file = File::open(path).map_err(|e| format!("Cannot open file: {e}"))?;
+            let stride = threedo_filesystem::default_stride(user_data_offset);
+            return threedo_filesystem::ThreeDOFs::new(file, 0, user_data_offset, stride)?.extract_file(&file_path, &dest_path);
+        }
+        if fs_matches(&filesystem, "XDVDFS") && user_data_offset == 0 && xdvdfs_filesystem::is_xdvdfs_disc(path_obj, 0) {
+            let file = File::open(path).map_err(|e| format!("Cannot open file: {e}"))?;
+            return xdvdfs_filesystem::XDVDFSFs::new(file, 0)?.extract_file(&file_path, &dest_path);
+        }
+        if fs_matches_gcm(&filesystem) && user_data_offset == 0 && gcm_filesystem::detect_gcm_disc(path_obj).is_some() {
+            let file = File::open(path).map_err(|e| format!("Cannot open file: {e}"))?;
+            return gcm_filesystem::GcmFs::new(file, 0)?.extract_file(&file_path, &dest_path);
+        }
+        if fs_matches_udf(&filesystem) && udf_filesystem::is_udf_disc(path_obj, 0, user_data_offset) {
             let file = File::open(path).map_err(|e| format!("Cannot open file: {e}"))?;
             if let Ok(mut udf) = udf_filesystem::UdfFs::new(file, 0, user_data_offset) {
                 return udf.extract_file(&file_path, &dest_path);
             }
         }
+        if fs_matches(&filesystem, "HFS") && hfs_filesystem::is_hfs_disc(path_obj, 0, user_data_offset) {
+            let file = File::open(path).map_err(|e| format!("Cannot open file: {e}"))?;
+            return hfs_filesystem::HfsFs::new(file, 0, user_data_offset)?.extract_file(&file_path, &dest_path);
+        }
         if user_data_offset > 0 {
             let file = File::open(path).map_err(|e| format!("Cannot open file: {e}"))?;
-            let reader = MultiTrackBinReader::single(file, 0, user_data_offset, 0);
+            let reader = MultiTrackBinReader::single(file, 0, user_data_offset, RAW_SECTOR_SIZE, 0);
             let fs = ISO9660::new(reader).map_err(|e| format!("Invalid disc image: {e}"))?;
             extract_file_from_fs(&fs, &file_path, &dest_path)
         } else {
@@ -1789,7 +2515,7 @@ fn save_file(image_path: String, file_path: String, dest_path: String) -> Result
 }
 
 #[tauri::command]
-fn save_directory(image_path: String, dir_path: String, dest_path: String) -> Result<(), String> {
+fn save_directory(image_path: String, dir_path: String, dest_path: String, filesystem: Option<String>) -> Result<(), String> {
     let path = image_path.as_str();
 
     if Path::new(path).is_dir() {
@@ -1804,23 +2530,41 @@ fn save_directory(image_path: String, dir_path: String, dest_path: String) -> Re
 
     let lower = path.to_lowercase();
 
-    if lower.ends_with(".cue") || lower.ends_with(".mds") || lower.ends_with(".nrg") || lower.ends_with(".ccd") {
+    if lower.ends_with(".cue") || lower.ends_with(".mds") || lower.ends_with(".nrg") || lower.ends_with(".ccd") || lower.ends_with(".cdi") || lower.ends_with(".gdi") {
         let track = if lower.ends_with(".cue") { parse_cue_for_data_track(Path::new(path))? }
             else if lower.ends_with(".mds") { parse_mds_for_data_track(Path::new(path))? }
             else if lower.ends_with(".nrg") { parse_nrg_for_data_track(Path::new(path))? }
-            else { parse_ccd_for_data_track(Path::new(path))? };
+            else if lower.ends_with(".ccd") { parse_ccd_for_data_track(Path::new(path))? }
+            else if lower.ends_with(".gdi") { parse_gdi_for_data_track(Path::new(path))? }
+            else { parse_cdi_for_data_track(Path::new(path))? };
         if cdi_filesystem::is_cdi_disc(&track.bin_path, track.track_offset, track.user_data_offset, track.lba_offset, track.descramble) {
             open_cdi_fs(&track)?.extract_directory(&dir_path, &dest_path)
         } else if pce_filesystem::is_pce_disc(&track.bin_path, track.track_offset, track.user_data_offset) {
             open_pce_fs(&track)?.extract_directory(&dir_path, &dest_path)
-        } else if hfs_filesystem::is_hfs_disc(&track.bin_path, track.track_offset, track.user_data_offset) {
+        } else if threedo_filesystem::is_threedo_disc(&track.bin_path, track.track_offset, track.user_data_offset) {
+            open_threedo_fs(&track)?.extract_directory(&dir_path, &dest_path)
+        } else if fs_matches(&filesystem, "XDVDFS") && track.user_data_offset == 0 && xdvdfs_filesystem::is_xdvdfs_disc(&track.bin_path, track.track_offset) {
+            open_xdvdfs_fs(&track)?.extract_directory(&dir_path, &dest_path)
+        } else if fs_matches_gcm(&filesystem) && track.user_data_offset == 0 && gcm_filesystem::detect_gcm_disc(&track.bin_path).is_some() {
+            open_gcm_fs(&track)?.extract_directory(&dir_path, &dest_path)
+        } else if fs_matches(&filesystem, "HFS") && hfs_filesystem::is_hfs_disc(&track.bin_path, track.track_offset, track.user_data_offset) {
             open_hfs_fs(&track)?.extract_directory(&dir_path, &dest_path)
-        } else if udf_filesystem::is_udf_disc(&track.bin_path, track.track_offset, track.user_data_offset) {
+        } else if fs_matches_udf(&filesystem) && udf_filesystem::is_udf_disc(&track.bin_path, track.track_offset, track.user_data_offset) {
             open_udf_fs(&track)?.extract_directory(&dir_path, &dest_path)
         } else if lower.ends_with(".cue") {
             extract_dir_from_fs(&open_iso_fs_for_cue(Path::new(path))?, &dir_path, &dest_path)
         } else {
             extract_dir_from_fs(&open_iso_fs(&track)?, &dir_path, &dest_path)
+        }
+    } else if lower.ends_with(".chd") {
+        if filesystem.as_deref() == Some("3DO OperaFS") {
+            open_threedo_chd(Path::new(path))?.extract_directory(&dir_path, &dest_path)
+        } else if filesystem.as_deref() == Some("XDVDFS") {
+            open_xdvdfs_chd(Path::new(path))?.extract_directory(&dir_path, &dest_path)
+        } else if filesystem.as_deref() == Some("GameCube GCM") || filesystem.as_deref() == Some("Wii GCM") {
+            open_gcm_chd(Path::new(path))?.extract_directory(&dir_path, &dest_path)
+        } else {
+            extract_dir_from_fs(&open_chd_iso(Path::new(path))?, &dir_path, &dest_path)
         }
     } else if lower.ends_with(".mdx") {
         let path_obj = Path::new(path);
@@ -1830,6 +2574,8 @@ fn save_directory(image_path: String, dir_path: String, dest_path: String) -> Re
                 open_cdi_fs(&track)?.extract_directory(&dir_path, &dest_path)
             } else if pce_filesystem::is_pce_disc(&track.bin_path, track.track_offset, track.user_data_offset) {
                 open_pce_fs(&track)?.extract_directory(&dir_path, &dest_path)
+            } else if threedo_filesystem::is_threedo_disc(&track.bin_path, track.track_offset, track.user_data_offset) {
+                open_threedo_fs(&track)?.extract_directory(&dir_path, &dest_path)
             } else if hfs_filesystem::is_hfs_disc(&track.bin_path, track.track_offset, track.user_data_offset) {
                 open_hfs_fs(&track)?.extract_directory(&dir_path, &dest_path)
             } else if udf_filesystem::is_udf_disc(&track.bin_path, track.track_offset, track.user_data_offset) {
@@ -1847,15 +2593,32 @@ fn save_directory(image_path: String, dir_path: String, dest_path: String) -> Re
             let file = File::open(path).map_err(|e| format!("Cannot open file: {e}"))?;
             return pce_filesystem::PceFs::new(file, 0, user_data_offset)?.extract_directory(&dir_path, &dest_path);
         }
-        if udf_filesystem::is_udf_disc(path_obj, 0, user_data_offset) {
+        if threedo_filesystem::is_threedo_disc(path_obj, 0, user_data_offset) {
+            let file = File::open(path).map_err(|e| format!("Cannot open file: {e}"))?;
+            let stride = threedo_filesystem::default_stride(user_data_offset);
+            return threedo_filesystem::ThreeDOFs::new(file, 0, user_data_offset, stride)?.extract_directory(&dir_path, &dest_path);
+        }
+        if fs_matches(&filesystem, "XDVDFS") && user_data_offset == 0 && xdvdfs_filesystem::is_xdvdfs_disc(path_obj, 0) {
+            let file = File::open(path).map_err(|e| format!("Cannot open file: {e}"))?;
+            return xdvdfs_filesystem::XDVDFSFs::new(file, 0)?.extract_directory(&dir_path, &dest_path);
+        }
+        if fs_matches_gcm(&filesystem) && user_data_offset == 0 && gcm_filesystem::detect_gcm_disc(path_obj).is_some() {
+            let file = File::open(path).map_err(|e| format!("Cannot open file: {e}"))?;
+            return gcm_filesystem::GcmFs::new(file, 0)?.extract_directory(&dir_path, &dest_path);
+        }
+        if fs_matches_udf(&filesystem) && udf_filesystem::is_udf_disc(path_obj, 0, user_data_offset) {
             let file = File::open(path).map_err(|e| format!("Cannot open file: {e}"))?;
             if let Ok(mut udf) = udf_filesystem::UdfFs::new(file, 0, user_data_offset) {
                 return udf.extract_directory(&dir_path, &dest_path);
             }
         }
+        if fs_matches(&filesystem, "HFS") && hfs_filesystem::is_hfs_disc(path_obj, 0, user_data_offset) {
+            let file = File::open(path).map_err(|e| format!("Cannot open file: {e}"))?;
+            return hfs_filesystem::HfsFs::new(file, 0, user_data_offset)?.extract_directory(&dir_path, &dest_path);
+        }
         if user_data_offset > 0 {
             let file = File::open(path).map_err(|e| format!("Cannot open file: {e}"))?;
-            let reader = MultiTrackBinReader::single(file, 0, user_data_offset, 0);
+            let reader = MultiTrackBinReader::single(file, 0, user_data_offset, RAW_SECTOR_SIZE, 0);
             let fs = ISO9660::new(reader).map_err(|e| format!("Invalid disc image: {e}"))?;
             extract_dir_from_fs(&fs, &dir_path, &dest_path)
         } else {
@@ -1879,7 +2642,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             list_disc_contents, save_file, save_directory,
-            get_cue_tracks, save_audio_track, list_optical_drives,
+            get_cue_tracks, get_gdi_tracks, save_audio_track, list_optical_drives,
             get_mds_tracks, mount_disc_image, unmount_disc_image,
             get_disc_filesystems, read_sector, get_platform
         ])

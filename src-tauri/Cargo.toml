@@ -1,6 +1,6 @@
 [package]
 name = "tauri-app"
-version = "0.1.11"
+version = "0.1.12"
 description = "A Tauri App"
 authors = ["you"]
 edition = "2021"
@@ -27,4 +27,5 @@ iso9660 = { path = "crates/iso9660" }
 encoding_rs = "0.8"
 flac-bound = { version = "0.3", features = ["libflac-nobuild"], default-features = false }
 mp3lame-encoder = "0.2.4"
+chd = { version = "0.3", features = ["cd_full"] }
 

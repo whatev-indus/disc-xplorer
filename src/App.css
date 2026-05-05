@@ -159,6 +159,12 @@ body {
 }
 .btn-unmount:hover { background: #4a2a2a; }
 
+.btn-eject {
+  padding: 4px 8px;
+  font-size: 14px;
+  line-height: 1;
+}
+
 .btn-dump {
   padding: 4px 12px;
   background: transparent;
@@ -303,6 +309,15 @@ body {
   color: var(--text-bright);
   margin-bottom: 6px;
 }
+
+.cdemu-modal { width: 420px; max-height: unset; }
+.cdemu-modal .modal-body { font-size: 13px; color: var(--text); line-height: 1.6; }
+.cdemu-modal .modal-body p { margin: 0 0 10px; }
+.cdemu-modal .modal-body p:last-child { margin-bottom: 0; }
+.modal-footer { display: flex; gap: 8px; justify-content: flex-end; padding: 10px 14px; border-top: 1px solid var(--border); flex-shrink: 0; }
+.cdemu-status { font-size: 12px; color: var(--text-muted); }
+.cdemu-ok { color: #6dbf6d; }
+.cdemu-err { color: #e06c75; }
 
 .license-text {
   font-family: var(--font-mono);

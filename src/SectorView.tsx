@@ -194,9 +194,9 @@ export function SectorView({ imagePath, onClose }: { imagePath: string; onClose:
                   <span className="sv-badge sv-badge-cd">CD</span>
                   <span>Mode {disc.mode}</span>
                   <span className="sv-sep">·</span>
-                  <span>Disc LBA <strong>{disc.discLba}</strong></span>
+                  <span>LBA <strong>{data.lba.toLocaleString()}</strong></span>
                   <span className="sv-sep">·</span>
-                  <span>MSF {disc.msf}</span>
+                  <span title={`Disc-absolute LBA ${disc.discLba}`}>MSF {disc.msf}</span>
                   <span className="sv-sep">·</span>
                   <span>{data.sector_size}B raw</span>
                   {layout && layout.dataEnd > layout.dataStart && (

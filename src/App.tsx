@@ -182,6 +182,10 @@ function App() {
   const [isDragOver, setIsDragOver] = useState(false);
   const [showSectorView, setShowSectorView] = useState(false);
   const [platform, setPlatform] = useState<string>("");
+  const [showCdemuPrompt, setShowCdemuPrompt] = useState(false);
+  const [cdemuInstalling, setCdemuInstalling] = useState(false);
+  const [cdemuInstallMsg, setCdemuInstallMsg] = useState<string | null>(null);
+  const [cdemuInstallOk, setCdemuInstallOk] = useState(false);
 
   const dragRef = useRef<{ col: keyof ColWidths; startX: number; startWidth: number } | null>(null);
   const driveMenuRef = useRef<HTMLDivElement>(null);
@@ -191,6 +195,13 @@ function App() {
   useEffect(() => {
     invoke<string>("get_platform").then(setPlatform);
   }, []);
+
+  useEffect(() => {
+    if (platform !== "linux") return;
+    invoke<boolean>("check_cdemu_installed").then(installed => {
+      if (!installed) setShowCdemuPrompt(true);
+    });
+  }, [platform]);
 
   useEffect(() => {
     function handleOutsideClick(e: MouseEvent) {
@@ -214,6 +225,21 @@ function App() {
     if (showSettings) document.addEventListener("mousedown", handleOutsideClick);
     return () => document.removeEventListener("mousedown", handleOutsideClick);
   }, [showSettings]);
+
+  async function installCdemu() {
+    setCdemuInstalling(true);
+    setCdemuInstallMsg(null);
+    try {
+      const msg = await invoke<string>("install_cdemu");
+      setCdemuInstallMsg(msg);
+      setCdemuInstallOk(true);
+    } catch (e) {
+      setCdemuInstallMsg(String(e));
+      setCdemuInstallOk(false);
+    } finally {
+      setCdemuInstalling(false);
+    }
+  }
 
   async function pickDownloadLocation() {
     const dir = await open({ directory: true, title: "Set Default Download Location" });
@@ -1007,6 +1033,34 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.`}</pre>
         </div>
       )}
 
+      {showCdemuPrompt && (
+        <div className="modal-overlay">
+          <div className="modal cdemu-modal" onClick={e => e.stopPropagation()}>
+            <div className="modal-header">
+              <span className="modal-title">CDemu Not Installed</span>
+            </div>
+            <div className="modal-body">
+              <p>CDemu is required to mount certain disc image formats on Linux (.cue, .mds, .nrg, and others).</p>
+              <p>Would you like to install it now?</p>
+              {cdemuInstalling && <p className="cdemu-status">Installing… (a system password prompt may appear)</p>}
+              {cdemuInstallMsg && (
+                <p className={cdemuInstallOk ? "cdemu-status cdemu-ok" : "cdemu-status cdemu-err"}>{cdemuInstallMsg}</p>
+              )}
+            </div>
+            <div className="modal-footer">
+              {!cdemuInstallOk && (
+                <button className="btn-open" onClick={installCdemu} disabled={cdemuInstalling}>
+                  {cdemuInstalling ? "Installing…" : "Install"}
+                </button>
+              )}
+              <button className="btn-open btn-open-secondary" onClick={() => setShowCdemuPrompt(false)}>
+                {cdemuInstallOk ? "Done" : "Not Now"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {showSectorView && sourceImagePath && (
         <SectorView imagePath={sourceImagePath} onClose={() => setShowSectorView(false)} />
       )}
@@ -1129,7 +1183,7 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.`}</pre>
         <span className="statusbar-left">{statusText}</span>
         <a className="statusbar-brand" href="https://sites.google.com/view/whateverindustries/home" target="_blank" rel="noreferrer">whatev.indus</a>
         <span className="statusbar-right">
-          <span className="statusbar-version">v0.1.13</span>
+          <span className="statusbar-version">v0.1.14</span>
         </span>
       </div>
     </div>

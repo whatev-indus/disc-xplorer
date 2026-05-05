@@ -1038,7 +1038,7 @@ fn parse_mds_for_data_track(mds_path: &Path) -> Result<DataTrack, String> {
         });
     }
 
-    let session_offset = read_u32_le(&data, 0x4C) as usize;
+    let session_offset = read_u32_le(&data, 0x50) as usize;
     if session_offset + 0x18 > data.len() {
         return Err("Invalid MDS session offset".to_string());
     }
@@ -1054,17 +1054,30 @@ fn parse_mds_for_data_track(mds_path: &Path) -> Result<DataTrack, String> {
         let point = data[tb + 4];
 
         if point == 0 || point > 99 { continue; }
-        if mode_byte == 0x00 { continue; } // AUDIO
+        if mode_byte == 0x00 || mode_byte == 0xA9 { continue; } // AUDIO
 
-        let user_data_offset = if mode_byte == 0x02 || mode_byte == 0x03 || mode_byte == 0x04 {
-            24u64 // MODE2
+        // Sector size stored at +0x10; includes +0x60 subchannel bytes when present.
+        let sector_size = u16::from_le_bytes([data[tb + 0x10], data[tb + 0x11]]) as u64;
+        let stride = if sector_size >= 0x800 { sector_size } else { RAW_SECTOR_SIZE };
+
+        // Base size without subchannel bytes (always last 0x60 bytes when subchan!=0).
+        let subchan_size = if data[tb + 1] != 0 { 0x60u64 } else { 0u64 };
+        let base_size = stride.saturating_sub(subchan_size);
+
+        // When base_size == 0x800 the MDF stores user data only (no raw header).
+        // When base_size >= 0x930 a full raw sector is stored; skip sync+header.
+        let user_data_offset = if base_size > 0x800 {
+            match mode_byte {
+                0xAC | 0xAD | 0x03 | 0x04 => 24u64, // MODE2 Form1/2: extra sub-header
+                _ => 16u64,                           // MODE1 / MODE2 raw
+            }
         } else {
-            16u64 // MODE1
+            0u64
         };
 
-        let track_offset = read_u64_le(&data, tb + 0x20);
+        let track_offset = read_u64_le(&data, tb + 0x28);
         let lba_offset = sector_lba_at(&mdf_path, track_offset);
-        return Ok(DataTrack { bin_path: mdf_path, track_offset, user_data_offset, stride: RAW_SECTOR_SIZE, lba_offset, descramble: false, sector_count: 0 });
+        return Ok(DataTrack { bin_path: mdf_path, track_offset, user_data_offset, stride, lba_offset, descramble: false, sector_count: 0 });
     }
 
     Err("No data track found in MDS".to_string())
@@ -1092,16 +1105,12 @@ fn get_mds_track_list(mds_path: &Path) -> Result<Vec<TrackInfo>, String> {
         }]);
     }
 
-    // Number of sessions is at 0x14 (2 bytes LE); sessions array starts at 0x4C (4 bytes LE).
+    // Number of sessions is at 0x14 (2 bytes LE); sessions array starts at 0x50 (4 bytes LE).
     let num_sessions = {
         let n = u16::from_le_bytes([data[0x14], data[0x15]]) as usize;
         if n == 0 { 1 } else { n }
     };
-    let first_session_offset = read_u32_le(&data, 0x4C) as usize;
-
-    let total_sectors = fs::metadata(&mdf_path)
-        .map(|m| m.len() / RAW_SECTOR_SIZE)
-        .unwrap_or(0);
+    let first_session_offset = read_u32_le(&data, 0x50) as usize;
 
     let mut tracks: Vec<TrackInfo> = Vec::new();
 
@@ -1109,7 +1118,8 @@ fn get_mds_track_list(mds_path: &Path) -> Result<Vec<TrackInfo>, String> {
         let sess_off = first_session_offset + s * MDS_SESSION_BLOCK_SIZE;
         if sess_off + MDS_SESSION_BLOCK_SIZE > data.len() { break; }
 
-        let session_number = u16::from_le_bytes([data[sess_off + 6], data[sess_off + 7]]) as u32;
+        // Session number field is at sess_off+8 (2 bytes LE).
+        let session_number = u16::from_le_bytes([data[sess_off + 8], data[sess_off + 9]]) as u32;
         let session_num = if session_number > 0 { session_number } else { (s + 1) as u32 };
 
         let num_blocks = data[sess_off + 0x0A] as usize;
@@ -1123,21 +1133,27 @@ fn get_mds_track_list(mds_path: &Path) -> Result<Vec<TrackInfo>, String> {
             let point = data[tb + 4];
             if point == 0 || point > 99 { continue; }
 
-            let is_data = mode_byte != 0x00;
+            let is_data = mode_byte != 0x00 && mode_byte != 0xA9;
+
+            // Sector size at +0x10; includes 0x60 subchannel bytes when subchan != 0.
+            let sector_size = u16::from_le_bytes([data[tb + 0x10], data[tb + 0x11]]) as u64;
+            let subchan_size = if data[tb + 1] != 0 { 0x60u64 } else { 0u64 };
+            let base_size = sector_size.saturating_sub(subchan_size);
             let mode = match mode_byte {
-                0x00 => "AUDIO".to_string(),
-                0x02 | 0x03 | 0x04 => "MODE2/2352".to_string(),
-                _ => "MODE1/2352".to_string(),
+                0x00 | 0xA9 => "AUDIO".to_string(),
+                0xAB | 0x02 | 0x03 | 0x04 => "MODE2/2352".to_string(),
+                0xAA | _ => if base_size <= 0x800 { "MODE1/2048".to_string() } else { "MODE1/2352".to_string() },
             };
 
-            let msf_m = data[tb + 8] as u64;
-            let msf_s = data[tb + 9] as u64;
-            let msf_f = data[tb + 10] as u64;
-            let start_lba = (msf_m * 60 + msf_s) * 75 + msf_f;
+            // PLBA: disc-absolute start LBA for this track (field at +0x24, u32 LE).
+            let start_lba = read_u32_le(&data, tb + 0x24) as u64;
 
-            let num_sectors = {
-                let n = read_u32_le(&data, tb + 0x28) as u64;
-                if n > 0 { n } else { total_sectors.saturating_sub(start_lba) }
+            // Extra/index block: pregap_sectors(u32) + track_length(u32) at absolute file offset.
+            let extra_offset = read_u32_le(&data, tb + 0x0C) as usize;
+            let num_sectors = if extra_offset + 8 <= data.len() {
+                read_u32_le(&data, extra_offset + 4) as u64 // track length (excludes pregap)
+            } else {
+                0
             };
 
             tracks.push(TrackInfo {
@@ -1388,7 +1404,11 @@ fn mount_disc_image(
             let load_out = Command::new("cdemu")
                 .args(["load", "any", &image_path])
                 .output()
-                .map_err(|e| format!("cdemu load failed: {e}"))?;
+                .map_err(|e| if e.kind() == std::io::ErrorKind::NotFound {
+                    "CDemu is not installed. Install the 'cdemu' package to mount this image type.".to_string()
+                } else {
+                    format!("cdemu load failed: {e}")
+                })?;
 
             if !load_out.status.success() {
                 return Err(String::from_utf8_lossy(&load_out.stderr).trim().to_string());
@@ -1604,6 +1624,66 @@ fn get_platform() -> &'static str {
     else { "windows" }
 }
 
+// ── CDemu installation helpers (Linux) ───────────────────────────────────────
+
+#[tauri::command]
+fn check_cdemu_installed() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        Command::new("which").arg("cdemu")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+    #[cfg(not(target_os = "linux"))]
+    false
+}
+
+#[cfg(target_os = "linux")]
+fn cdemu_install_args() -> Option<(String, Vec<String>)> {
+    let managers: &[(&str, &[&str])] = &[
+        ("pacman",  &["-S", "--noconfirm", "cdemu-client"]),
+        ("apt-get", &["install", "-y", "cdemu-client"]),
+        ("dnf",     &["install", "-y", "cdemu-client"]),
+        ("zypper",  &["install", "-y", "cdemu-client"]),
+        ("eopkg",   &["install", "cdemu-client"]),
+    ];
+    for (bin, args) in managers {
+        if Command::new("which").arg(bin).output().map(|o| o.status.success()).unwrap_or(false) {
+            return Some((bin.to_string(), args.iter().map(|s| s.to_string()).collect()));
+        }
+    }
+    None
+}
+
+#[tauri::command]
+fn install_cdemu() -> Result<String, String> {
+    #[cfg(target_os = "linux")]
+    {
+        let (pm, args) = cdemu_install_args()
+            .ok_or_else(|| "Could not detect a supported package manager. Install cdemu-client manually.".to_string())?;
+
+        let out = Command::new("pkexec")
+            .arg(&pm)
+            .args(&args)
+            .output()
+            .map_err(|e| if e.kind() == std::io::ErrorKind::NotFound {
+                "pkexec not found. Install cdemu-client manually using your package manager.".to_string()
+            } else {
+                format!("Installation failed: {e}")
+            })?;
+
+        if out.status.success() {
+            Ok("cdemu-client installed successfully.".to_string())
+        } else {
+            let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+            Err(if stderr.is_empty() { "Installation cancelled or failed.".to_string() } else { stderr })
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    Err("Not supported on this platform.".to_string())
+}
+
 // ── CUE track listing ─────────────────────────────────────────────────────────
 
 #[derive(Serialize)]
@@ -1751,10 +1831,10 @@ fn read_sector(image_path: String, lba: u64) -> Result<SectorData, String> {
 
     let (file_path, sector_size, user_data_offset, data_offset): (PathBuf, u64, u64, u64) = if lower.ends_with(".cue") {
         let track = parse_cue_for_data_track(path)?;
-        (track.bin_path, RAW_SECTOR_SIZE, track.user_data_offset, 0)
+        (track.bin_path, RAW_SECTOR_SIZE, track.user_data_offset, track.track_offset)
     } else if lower.ends_with(".mds") {
         let track = parse_mds_for_data_track(path)?;
-        (track.bin_path, RAW_SECTOR_SIZE, track.user_data_offset, 0)
+        (track.bin_path, RAW_SECTOR_SIZE, track.user_data_offset, track.track_offset)
     } else if lower.ends_with(".nrg") {
         let track = parse_nrg_for_data_track(path)?;
         let ss = if track.user_data_offset > 0 { RAW_SECTOR_SIZE } else { 2048 };
@@ -2940,7 +3020,8 @@ pub fn run() {
             list_disc_contents, save_file, save_directory,
             get_cue_tracks, get_gdi_tracks, save_audio_track, list_optical_drives,
             get_mds_tracks, mount_disc_image, unmount_disc_image,
-            get_disc_filesystems, read_sector, get_platform, eject_disc
+            get_disc_filesystems, read_sector, get_platform, eject_disc,
+            check_cdemu_installed, install_cdemu
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

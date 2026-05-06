@@ -14,6 +14,8 @@ v5+). Currently these are not replayed during emulation. Via drive emulation, th
 subchannel and DPM streams should be fed through so that protected disc images behave
 correctly when authenticated by the guest software.
 
+## In settings add "Detach Sector View window." option
+
 ## SabreTools.Serialization — additional disc image format support
 
 Investigate https://github.com/SabreTools/SabreTools.Serialization for formats not yet

@@ -13,6 +13,7 @@ interface SectorData {
 interface Layout {
   hasCd: boolean;
   mode: number;
+  form: number; // 0 = n/a or unknown, 1 = Form 1, 2 = Form 2 (Mode 2 only)
   syncEnd: number;
   headerEnd: number;
   subhdrEnd: number;
@@ -21,11 +22,24 @@ interface Layout {
   eccStart: number;
 }
 
+// Returns the ISOBuster-style mode label with user byte count, e.g. "Mode 2 / Form 1 (2048)".
+function modeLabel(layout: Layout): string {
+  const userBytes = layout.dataEnd - layout.dataStart;
+  if (!layout.hasCd) return `Audio (${userBytes})`;
+  if (layout.mode === 1) return `Mode 1 (${userBytes})`;
+  if (layout.mode === 2) {
+    if (layout.form === 1) return `Mode 2 / Form 1 (${userBytes})`;
+    if (layout.form === 2) return `Mode 2 / Form 2 (${userBytes})`;
+    return `Mode 2 (${userBytes})`;
+  }
+  return `Mode ${layout.mode} (${userBytes})`;
+}
+
 const CD_SYNC = [0x00,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0x00];
 
 function getLayout(bytes: number[], sectorSize: number): Layout {
   const noLayout: Layout = {
-    hasCd: false, mode: 0,
+    hasCd: false, mode: 0, form: 0,
     syncEnd: 0, headerEnd: 0, subhdrEnd: 0,
     dataStart: 0, dataEnd: sectorSize, eccStart: sectorSize,
   };
@@ -34,15 +48,20 @@ function getLayout(bytes: number[], sectorSize: number): Layout {
 
   const mode = bytes[15];
   if (mode === 1) {
-    return { hasCd: true, mode, syncEnd: 12, headerEnd: 16, subhdrEnd: 16, dataStart: 16, dataEnd: 2064, eccStart: 2064 };
+    // Mode 1: sync(12) + header(4) + data(2048) + EDC(4) + zero(8) + ECC(276) = 2352
+    return { hasCd: true, mode, form: 0, syncEnd: 12, headerEnd: 16, subhdrEnd: 16, dataStart: 16, dataEnd: 2064, eccStart: 2064 };
   }
   if (mode === 2) {
+    // Mode 2: sync(12) + header(4) + sub-header(8) + data + ECC/EDC
+    // Form 2 flag: sub-header byte 2 (absolute byte 18), bit 5.
     const isForm2 = bytes.length >= 19 && (bytes[18] & 0x20) !== 0;
+    const form = isForm2 ? 2 : 1;
+    // Form 1: data(2048) + EDC(4) + ECC(276) ending at 2352; Form 2: data(2324) + EDC/spare(4) at 2348
     const dataEnd = isForm2 ? 2348 : 2072;
-    return { hasCd: true, mode, syncEnd: 12, headerEnd: 16, subhdrEnd: 24, dataStart: 24, dataEnd, eccStart: dataEnd };
+    return { hasCd: true, mode, form, syncEnd: 12, headerEnd: 16, subhdrEnd: 24, dataStart: 24, dataEnd, eccStart: dataEnd };
   }
-  // Unknown mode but has sync
-  return { hasCd: true, mode, syncEnd: 12, headerEnd: 16, subhdrEnd: 16, dataStart: 16, dataEnd: 2352, eccStart: 2352 };
+  // Unknown mode but has CD sync
+  return { hasCd: true, mode, form: 0, syncEnd: 12, headerEnd: 16, subhdrEnd: 16, dataStart: 16, dataEnd: 2352, eccStart: 2352 };
 }
 
 function bcd(b: number): number { return (b >> 4) * 10 + (b & 0x0F); }
@@ -76,8 +95,9 @@ function HexRow({ offset, bytes, layout }: { offset: number; bytes: number[]; la
   for (let j = 0; j < 16; j++) {
     if (j === 8) content.push('  '); else if (j > 0) content.push(' ');
     const cls = byteClass(offset + j, layout);
+    const alt = j % 2 === 1 ? 'hb-alt' : '';
     const hex = bytes[j].toString(16).padStart(2, '0').toUpperCase();
-    content.push(<span key={`h${j}`} className={`hb ${cls}`}>{hex}</span>);
+    content.push(<span key={`h${j}`} className={`hb ${alt} ${cls}`}>{hex}</span>);
   }
 
   content.push('  |');
@@ -85,8 +105,9 @@ function HexRow({ offset, bytes, layout }: { offset: number; bytes: number[]; la
   for (let j = 0; j < 16; j++) {
     const b = bytes[j];
     const cls = byteClass(offset + j, layout);
+    const alt = j % 2 === 1 ? 'hb-alt' : '';
     const ch = b >= 0x20 && b < 0x7F ? String.fromCharCode(b) : '.';
-    content.push(<span key={`a${j}`} className={`ha ${cls}`}>{ch}</span>);
+    content.push(<span key={`a${j}`} className={`ha ${alt} ${cls}`}>{ch}</span>);
   }
 
   content.push('|');
@@ -99,7 +120,9 @@ function HexDump({ data, rawMode }: { data: SectorData; rawMode: boolean }) {
   const slice = (!rawMode && layout.hasCd)
     ? data.bytes.slice(layout.dataStart, layout.dataEnd)
     : data.bytes;
-  const baseOffset = (!rawMode && layout.hasCd) ? layout.dataStart : 0;
+  // Raw mode: offsets are absolute within the sector (0000 = sync start).
+  // User mode: offsets start at 0000 relative to user data start.
+  const baseOffset = 0;
   const rows: React.JSX.Element[] = [];
   for (let i = 0; i < slice.length; i += 16) {
     rows.push(
@@ -234,7 +257,9 @@ export function SectorView({ imagePath, onClose }: { imagePath: string; onClose:
             <button
               className={`sv-mode-toggle ${!rawMode ? 'sv-mode-toggle--active' : ''}`}
               onClick={() => setRawMode(m => !m)}
-              title={rawMode ? 'Show user data only (2048B)' : 'Show full raw sector (2352B)'}
+              title={rawMode
+                ? `Show user data only (${layout.dataEnd - layout.dataStart}B)`
+                : `Show full raw sector (${data!.sector_size}B)`}
             >
               {rawMode ? `${data!.sector_size}B raw` : `${layout.dataEnd - layout.dataStart}B user`}
             </button>
@@ -247,7 +272,7 @@ export function SectorView({ imagePath, onClose }: { imagePath: string; onClose:
               {disc ? (
                 <>
                   <span className="sv-badge sv-badge-cd">CD</span>
-                  <span>Mode {disc.mode}</span>
+                  <span>{layout ? modeLabel(layout) : `Mode ${disc.mode}`}</span>
                   <span className="sv-sep">·</span>
                   {discMode
                     ? <span title={`Track-relative LBA ${data.lba}`}>Disc LBA <strong>{disc.discLba.toLocaleString()}</strong></span>
@@ -255,11 +280,6 @@ export function SectorView({ imagePath, onClose }: { imagePath: string; onClose:
                   }
                   <span className="sv-sep">·</span>
                   <span>MSF {disc.msf}</span>
-                  <span className="sv-sep">·</span>
-                  <span>{data.sector_size}B raw</span>
-                  {layout && layout.dataEnd > layout.dataStart && (
-                    <><span className="sv-sep">·</span><span>{layout.dataEnd - layout.dataStart}B user</span></>
-                  )}
                 </>
               ) : (
                 <>

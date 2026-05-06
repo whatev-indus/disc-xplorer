@@ -1242,7 +1242,7 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.`}</pre>
         <span className="statusbar-left">{statusText}</span>
         <a className="statusbar-brand" href="https://sites.google.com/view/whateverindustries/home" target="_blank" rel="noreferrer">whatev.indus</a>
         <span className="statusbar-right">
-          <span className="statusbar-version">v0.2.0</span>
+          <span className="statusbar-version">v0.2.1</span>
         </span>
       </div>
     </div>

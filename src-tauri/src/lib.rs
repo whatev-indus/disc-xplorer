@@ -2420,7 +2420,8 @@ fn read_sector(image_path: String, lba: u64) -> Result<SectorData, String> {
     let lower = image_path.to_lowercase();
 
     let (file_path, sector_size, user_data_offset, data_offset): (PathBuf, u64, u64, u64) = if lower.ends_with(".cue") {
-        let track = parse_cue_for_data_track(path)?;
+        let tracks = parse_cue_all_data_tracks(path)?;
+        let track = tracks.into_iter().next().ok_or("No data track in CUE")?;
         (track.bin_path, RAW_SECTOR_SIZE, track.user_data_offset, track.track_offset)
     } else if lower.ends_with(".mds") {
         let track = parse_mds_for_data_track(path)?;

@@ -94,11 +94,22 @@ function HexRow({ offset, bytes, layout }: { offset: number; bytes: number[]; la
   return <div className="hex-row">{content}</div>;
 }
 
-function HexDump({ data }: { data: SectorData }) {
+function HexDump({ data, rawMode }: { data: SectorData; rawMode: boolean }) {
   const layout = getLayout(data.bytes, data.sector_size);
+  const slice = (!rawMode && layout.hasCd)
+    ? data.bytes.slice(layout.dataStart, layout.dataEnd)
+    : data.bytes;
+  const baseOffset = (!rawMode && layout.hasCd) ? layout.dataStart : 0;
   const rows: React.JSX.Element[] = [];
-  for (let i = 0; i < data.bytes.length; i += 16) {
-    rows.push(<HexRow key={i} offset={i} bytes={data.bytes.slice(i, i + 16)} layout={layout} />);
+  for (let i = 0; i < slice.length; i += 16) {
+    rows.push(
+      <HexRow
+        key={baseOffset + i}
+        offset={baseOffset + i}
+        bytes={slice.slice(i, i + 16)}
+        layout={rawMode ? layout : { ...layout, hasCd: false }}
+      />
+    );
   }
   return <div className="sv-hex-dump">{rows}</div>;
 }
@@ -111,6 +122,7 @@ export function SectorView({ imagePath, onClose }: { imagePath: string; onClose:
   // and track-relative LBA. Null until we've seen a sector with a valid CD sync header.
   const [discOffset, setDiscOffset] = useState<number | null>(null);
   const [discMode, setDiscMode] = useState(false);
+  const [rawMode, setRawMode] = useState(true);
   const inputRef = useRef<HTMLInputElement>(null);
 
   const toDisplay = (trackLba: number) =>
@@ -218,6 +230,15 @@ export function SectorView({ imagePath, onClose }: { imagePath: string; onClose:
             <button className="sv-btn" onClick={() => go(lba + 1)}     disabled={isLastSector}  title="Next (→)">▶</button>
             <button className="sv-btn" onClick={() => go(total - 1)}   disabled={isLastSector}  title="Last (End)">⏭</button>
           </div>
+          {layout?.hasCd && (
+            <button
+              className={`sv-mode-toggle ${!rawMode ? 'sv-mode-toggle--active' : ''}`}
+              onClick={() => setRawMode(m => !m)}
+              title={rawMode ? 'Show user data only (2048B)' : 'Show full raw sector (2352B)'}
+            >
+              {rawMode ? `${data!.sector_size}B raw` : `${layout.dataEnd - layout.dataStart}B user`}
+            </button>
+          )}
         </div>
 
         {data && (
@@ -258,7 +279,7 @@ export function SectorView({ imagePath, onClose }: { imagePath: string; onClose:
         {error && <div className="sv-error">{error}</div>}
 
         <div className="sv-hex-area">
-          {data && <HexDump data={data} />}
+          {data && <HexDump data={data} rawMode={rawMode} />}
         </div>
 
       </div>

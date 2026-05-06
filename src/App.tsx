@@ -523,8 +523,8 @@ function App() {
 
   function isCdemuEmulatable(path: string): boolean {
     const lower = path.toLowerCase();
-    return [".cue", ".mds", ".mdx", ".nrg", ".ccd", ".cdi",
-            ".toc", ".b6t", ".bwt", ".c2d", ".pdi", ".gi", ".daa"]
+    return [".iso", ".img", ".cue", ".mds", ".mdx", ".nrg", ".ccd", ".cdi",
+            ".gdi", ".toc", ".b6t", ".bwt", ".c2d", ".pdi", ".gi", ".daa"]
       .some(ext => lower.endsWith(ext));
   }
 
@@ -632,6 +632,21 @@ function App() {
     } catch {
       // Tree build failed; directory already loaded above
     }
+  }
+
+  async function dumpContents() {
+    if (!imagePath) return;
+    const destPath = await open({ directory: true, title: "Choose destination for disc contents" });
+    if (!destPath) return;
+    const volName = (tree[0]?.name ?? imageName).replace(/\.[^/.]+$/, "") || "disc";
+    try {
+      await invoke("save_directory", {
+        imagePath,
+        dirPath: "/",
+        destPath: `${destPath}/${volName}`,
+        filesystem: activeFilesystem || null,
+      });
+    } catch (e) { setError(String(e)); }
   }
 
   async function dumpDisc() {
@@ -952,6 +967,14 @@ function App() {
               <div className="separator" />
               <button className="btn-dump" onClick={dumpDisc} title="Extract all disc contents to a folder">
                 Dump Disc
+              </button>
+            </>
+          )}
+          {imagePath && viewMode === "filesystem" && (
+            <>
+              <div className="separator" />
+              <button className="btn-dump" onClick={dumpContents} title="Extract all disc contents to a folder">
+                Extract All Contents
               </button>
             </>
           )}

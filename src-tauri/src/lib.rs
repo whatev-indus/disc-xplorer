@@ -1911,7 +1911,7 @@ fn mount_disc_image(
             || lower.ends_with(".daa");
 
         if use_cdemu {
-            let before = sr_devices();
+            ensure_cdemu_daemon()?;
 
             let load_out = syscmd("cdemu")
                 .args(["load", "any", &image_path])
@@ -1934,13 +1934,8 @@ fn mount_disc_image(
                 .filter(|w| w.chars().all(|c| c.is_ascii_digit()))
                 .unwrap_or_else(|| "0".to_string());
 
-            // Give the kernel time to expose the virtual device.
-            std::thread::sleep(std::time::Duration::from_millis(1500));
-
-            let after = sr_devices();
-            let new_dev = after.into_iter()
-                .find(|d| !before.contains(d))
-                .ok_or_else(|| "CDemu: virtual drive did not appear as /dev/srN".to_string())?;
+            let new_dev = cdemu_device_for_slot(&slot)
+                .ok_or_else(|| format!("CDemu: could not find device for slot {slot}"))?;
 
             // Mount via udisksctl; fall back to lsblk if auto-mounted by desktop.
             let mount_out = syscmd("udisksctl")
@@ -2030,6 +2025,19 @@ fn sr_devices() -> Vec<String> {
             }).collect()
         })
         .unwrap_or_default()
+}
+
+// Parses `cdemu device-mapping` to find the /dev/srN path for a given slot.
+fn cdemu_device_for_slot(slot: &str) -> Option<String> {
+    let out = syscmd("cdemu").args(["device-mapping"]).output().ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    for line in text.lines() {
+        let mut cols = line.split_whitespace();
+        if cols.next()? == slot {
+            return cols.next().map(|s| s.to_string());
+        }
+    }
+    None
 }
 
 #[tauri::command]
@@ -2152,6 +2160,71 @@ fn check_cdemu_installed() -> bool {
 }
 
 #[cfg(target_os = "linux")]
+fn ensure_vhba_permissions() -> Result<(), String> {
+    if !std::path::Path::new("/dev/vhba_ctl").exists() {
+        return Err("The vhba kernel module is not loaded. Install the vhba-module package.".to_string());
+    }
+
+    if std::fs::OpenOptions::new().read(true).open("/dev/vhba_ctl").is_ok() {
+        return Ok(());
+    }
+
+    // Grant world read/write on the device for this session.
+    let chmod = syscmd("pkexec")
+        .args(["chmod", "a+rw", "/dev/vhba_ctl"])
+        .output()
+        .map_err(|e| format!("pkexec not found: {e}"))?;
+
+    if !chmod.status.success() {
+        return Err("Administrator access is required to configure CDEmu device permissions.".to_string());
+    }
+
+    // Add the user to the cdemu group so future logins won't need this prompt.
+    if let Ok(user) = std::env::var("USER") {
+        let _ = syscmd("pkexec")
+            .args(["usermod", "-aG", "cdemu", &user])
+            .output();
+    }
+
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn ensure_cdemu_daemon() -> Result<(), String> {
+    ensure_vhba_permissions()?;
+
+    let is_active = syscmd("systemctl")
+        .args(["--user", "is-active", "cdemu-daemon"])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default();
+
+    if is_active == "active" {
+        return Ok(());
+    }
+
+    // Clear a previous failure so systemd will let us start it again.
+    if is_active == "failed" {
+        let _ = syscmd("systemctl")
+            .args(["--user", "reset-failed", "cdemu-daemon"])
+            .output();
+    }
+
+    let started = syscmd("systemctl")
+        .args(["--user", "start", "cdemu-daemon"])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+
+    if started {
+        std::thread::sleep(std::time::Duration::from_millis(1000));
+        return Ok(());
+    }
+
+    Err("CDEmu daemon could not be started. Please check that cdemu-daemon is installed.".to_string())
+}
+
+#[cfg(target_os = "linux")]
 fn cdemu_install_args() -> Option<(String, Vec<String>)> {
     let managers: &[(&str, &[&str])] = &[
         ("pacman",  &["-S", "--noconfirm", "cdemu-client"]),
@@ -2254,16 +2327,29 @@ fn emulate_drive(
 
     #[cfg(target_os = "linux")]
     {
-        let before = sr_devices();
+        ensure_cdemu_daemon()?;
 
-        let load_out = syscmd("cdemu")
+        let try_load = || syscmd("cdemu")
             .args(["load", "any", &image_path])
             .output()
             .map_err(|e| if e.kind() == std::io::ErrorKind::NotFound {
                 "CDemu is not installed. Install the 'cdemu' package to emulate drives.".to_string()
             } else {
                 format!("cdemu load failed: {e}")
-            })?;
+            });
+
+        let load_out = {
+            let first = try_load()?;
+            if !first.status.success()
+                && String::from_utf8_lossy(&first.stderr).contains("No empty device found")
+            {
+                // All slots occupied — add one and retry.
+                let _ = syscmd("cdemu").args(["add-device"]).output();
+                try_load()?
+            } else {
+                first
+            }
+        };
 
         if !load_out.status.success() {
             return Err(String::from_utf8_lossy(&load_out.stderr).trim().to_string());
@@ -2276,12 +2362,8 @@ fn emulate_drive(
             .filter(|w| w.chars().all(|c| c.is_ascii_digit()))
             .unwrap_or_else(|| "0".to_string());
 
-        std::thread::sleep(std::time::Duration::from_millis(1500));
-
-        let after = sr_devices();
-        let device = after.into_iter()
-            .find(|d| !before.contains(d))
-            .ok_or_else(|| "CDemu: virtual drive did not appear as /dev/srN".to_string())?;
+        let device = cdemu_device_for_slot(&slot)
+            .ok_or_else(|| format!("CDemu: could not find device for slot {slot}"))?;
 
         let drive = EmulatedDrive { slot, device, image_path };
         state.0.lock().unwrap().push(drive.clone());

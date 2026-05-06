@@ -3679,9 +3679,23 @@ fn save_directory(image_path: String, dir_path: String, dest_path: String, files
     }
 }
 
+#[tauri::command]
+async fn check_for_update(app: tauri::AppHandle) -> Result<Option<String>, String> {
+    use tauri_plugin_updater::UpdaterExt;
+    match app.updater() {
+        Ok(updater) => match updater.check().await {
+            Ok(Some(update)) => Ok(Some(update.version)),
+            Ok(None) => Ok(None),
+            Err(e) => Err(format!("{e}")),
+        },
+        Err(e) => Err(format!("{e}")),
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .manage(MountedImages(Mutex::new(Vec::new())))
@@ -3696,6 +3710,7 @@ pub fn run() {
                 {
                     let edrives = window.app_handle().state::<EmulatedDrives>();
                     for drive in edrives.0.lock().unwrap().iter() {
+                        let _ = syscmd("cdemu").args(["unload", &drive.slot]).output();
                     }
                 }
             }
@@ -3709,7 +3724,8 @@ pub fn run() {
             get_dpm_data, get_dpm_for_sector,
             get_cdi_tracks,
             emulate_drive, eject_emulated_drive, list_emulated_drives,
-            open_sector_view_window, claim_sector_view_params
+            open_sector_view_window, claim_sector_view_params,
+            check_for_update
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

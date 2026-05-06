@@ -857,6 +857,16 @@ th.col-save { text-align: center; }
   opacity: 0.75;
 }
 
+.statusbar-update {
+  color: #7ddfff;
+  text-decoration: none;
+  margin-right: 8px;
+  font-weight: 600;
+}
+.statusbar-update:hover {
+  text-decoration: underline;
+}
+
 /* Emulated drives bar */
 .emulated-drives-bar {
   display: flex;

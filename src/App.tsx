@@ -199,6 +199,7 @@ function App() {
   const [emulatedDrives, setEmulatedDrives] = useState<EmulatedDrive[]>([]);
   const [emulating, setEmulating] = useState(false);
   const [svParams, setSvParams] = useState<{ imagePath: string; lba: number } | null>(null);
+  const [updateVersion, setUpdateVersion] = useState<string | null>(null);
 
   useEffect(() => {
     if (!IS_SECTOR_VIEW_WINDOW) return;
@@ -214,6 +215,13 @@ function App() {
 
   useEffect(() => {
     invoke<string>("get_platform").then(setPlatform);
+  }, []);
+
+  useEffect(() => {
+    if (IS_SECTOR_VIEW_WINDOW) return;
+    invoke<string | null>("check_for_update")
+      .then(v => { if (v) setUpdateVersion(v); })
+      .catch(() => {});
   }, []);
 
   useEffect(() => {
@@ -1265,6 +1273,11 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.`}</pre>
         <span className="statusbar-left">{statusText}</span>
         <a className="statusbar-brand" href="https://sites.google.com/view/whateverindustries/home" target="_blank" rel="noreferrer">whatev.indus</a>
         <span className="statusbar-right">
+          {updateVersion && (
+            <a className="statusbar-update" href="https://github.com/whatev-indus/disc-xplorer/releases" target="_blank" rel="noreferrer">
+              v{updateVersion} available
+            </a>
+          )}
           <span className="statusbar-version">v0.2.2</span>
         </span>
       </div>

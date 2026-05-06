@@ -1,6 +1,6 @@
 [package]
 name = "tauri-app"
-version = "0.1.14"
+version = "0.2.0"
 description = "A Tauri App"
 authors = ["you"]
 edition = "2021"
@@ -28,4 +28,5 @@ encoding_rs = "0.8"
 flac-bound = { version = "0.3", features = ["libflac-nobuild"], default-features = false }
 mp3lame-encoder = "0.2.4"
 chd = { version = "0.3", features = ["cd_full"] }
+flate2 = "1"
 

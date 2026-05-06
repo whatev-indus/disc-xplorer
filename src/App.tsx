@@ -84,7 +84,8 @@ function formatDuration(sectors: number): string {
 
 function isMountable(path: string, platform: string): boolean {
   const lower = path.toLowerCase();
-  if (lower.endsWith(".iso") || lower.endsWith(".img") || lower.endsWith(".dmg") || lower.endsWith(".cdr")) return true;
+  if (lower.endsWith(".iso") || lower.endsWith(".img")) return true;
+  if (platform === "macos" && (lower.endsWith(".dmg") || lower.endsWith(".cdr"))) return true;
   if (platform === "linux" && (
     lower.endsWith(".cue") || lower.endsWith(".mds") || lower.endsWith(".mdx") ||
     lower.endsWith(".nrg") || lower.endsWith(".ccd") ||
@@ -303,7 +304,7 @@ function App() {
       name: `Track ${String(t.number).padStart(2, "0")}`,
       start_lba: t.start_lba,
       num_sectors: t.num_sectors,
-      size_bytes: t.is_data ? t.num_sectors * 2048 : t.num_sectors * 2352,
+      size_bytes: t.is_data ? (t.num_sectors - t.start_lba) * 2048 : t.num_sectors * 2352,
       format: t.is_data ? t.mode : "CD Audio",
       is_data: t.is_data,
     }));
@@ -324,14 +325,17 @@ function App() {
     const isCue = lowerPath.endsWith(".cue");
     const isMds = lowerPath.endsWith(".mds");
     const isGdi = lowerPath.endsWith(".gdi");
+    const isCdi = lowerPath.endsWith(".cdi");
 
-    if (isCue || isMds || isGdi) {
+    if (isCue || isMds || isGdi || isCdi) {
       const [tracks, filesystems] = await Promise.all([
         isGdi
           ? invoke<TrackInfo[]>("get_gdi_tracks", { gdiPath: path })
           : isMds
             ? invoke<TrackInfo[]>("get_mds_tracks", { mdsPath: path })
-            : invoke<TrackInfo[]>("get_cue_tracks", { cuePath: path }),
+            : isCdi
+              ? invoke<TrackInfo[]>("get_cdi_tracks", { cdiPath: path })
+              : invoke<TrackInfo[]>("get_cue_tracks", { cuePath: path }),
         invoke<string[]>("get_disc_filesystems", { imagePath: path }).catch(() => ["ISO 9660"]),
       ]);
       setCueTracks(tracks);
@@ -430,7 +434,7 @@ function App() {
 
   async function openImage() {
     const selected = await open({
-      filters: [{ name: "Disc Images", extensions: ["iso", "img", "chd", "cue", "mds", "mdx", "nrg", "ccd", "cdi", "gdi", "toc", "b6t", "bwt", "c2d", "pdi", "gi", "daa"] }],
+      filters: [{ name: "Disc Images", extensions: ["iso", "img", "chd", "cue", "mds", "mdx", "nrg", "ccd", "cdi", "gdi", "toc", "b6t", "bwt", "c2d", "pdi", "gi", "daa", "cso", "ciso", "ecm"] }],
     });
     if (!selected) return;
     await openImageAtPath(selected as string);
@@ -441,7 +445,7 @@ function App() {
     getCurrentWebview().onDragDropEvent((event) => {
       if (event.payload.type === "drop") {
         setIsDragOver(false);
-        const supported = ["iso", "img", "chd", "cue", "mds", "mdx", "nrg", "ccd", "cdi", "gdi", "toc", "b6t", "bwt", "c2d", "pdi", "gi", "daa"];
+        const supported = ["iso", "img", "chd", "cue", "mds", "mdx", "nrg", "ccd", "cdi", "gdi", "toc", "b6t", "bwt", "c2d", "pdi", "gi", "daa", "cso", "ciso", "ecm"];
         const path = event.payload.paths.find((p) =>
           supported.some((ext) => p.toLowerCase().endsWith(`.${ext}`))
         );
@@ -1183,7 +1187,7 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.`}</pre>
         <span className="statusbar-left">{statusText}</span>
         <a className="statusbar-brand" href="https://sites.google.com/view/whateverindustries/home" target="_blank" rel="noreferrer">whatev.indus</a>
         <span className="statusbar-right">
-          <span className="statusbar-version">v0.1.14</span>
+          <span className="statusbar-version">v0.2.0</span>
         </span>
       </div>
     </div>

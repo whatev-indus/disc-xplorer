@@ -1,4 +1,9 @@
 use flac_bound::FlacEncoder;
+use flate2::read::DeflateDecoder;
+#[cfg(target_os = "windows")]
+use std::os::windows::process::CommandExt;
+#[cfg(target_os = "windows")]
+const CREATE_NO_WINDOW: u32 = 0x08000000;
 use mp3lame_encoder::{Builder as Mp3Builder, DualPcm, FlushNoGap};
 use iso9660::{ISO9660, ISO9660Reader, ISODirectory, DirectoryEntry};
 use serde::Serialize;
@@ -332,6 +337,10 @@ fn get_disc_filesystems(image_path: String) -> Result<Vec<String>, String> {
         Ok(detect_filesystems_chd(path))
     } else if lower.ends_with(".mdx") {
         Ok(detect_filesystems_mdx(path))
+    } else if lower.ends_with(".cso") || lower.ends_with(".ciso") {
+        Ok(detect_filesystems_cso(path))
+    } else if lower.ends_with(".ecm") {
+        Ok(detect_filesystems_ecm(path))
     } else {
         Ok(detect_filesystems_raw(path))
     }
@@ -1085,6 +1094,498 @@ fn parse_mds_for_data_track(mds_path: &Path) -> Result<DataTrack, String> {
 
 const MDS_SESSION_BLOCK_SIZE: usize = 24;
 
+// ── CDI track listing ─────────────────────────────────────────────────────────
+
+fn get_cdi_track_list(path: &Path) -> Result<Vec<TrackInfo>, String> {
+    const CDI_V2:  u32 = 0x80000004;
+    const CDI_V35: u32 = 0x80000006;
+
+    let mut f = File::open(path).map_err(|e| format!("Cannot open CDI: {e}"))?;
+    let file_size = f.seek(SeekFrom::End(0)).map_err(|e| format!("CDI seek: {e}"))?;
+    if file_size < 8 { return Err("CDI too short".to_string()); }
+
+    f.seek(SeekFrom::Start(file_size - 8)).map_err(|e| format!("CDI seek: {e}"))?;
+    let mut b4 = [0u8; 4];
+    f.read_exact(&mut b4).map_err(|e| format!("CDI read: {e}"))?;
+    let version = u32::from_le_bytes(b4);
+    f.read_exact(&mut b4).map_err(|e| format!("CDI read: {e}"))?;
+    let header_offset = u32::from_le_bytes(b4);
+
+    if version < 0x80000004 || version > 0x80000006 {
+        return Err(format!("Not a CDI image (version {version:#010X})"));
+    }
+
+    let desc_start: u64 = if version == CDI_V35 {
+        file_size.saturating_sub(header_offset as u64)
+    } else {
+        header_offset as u64
+    };
+    f.seek(SeekFrom::Start(desc_start)).map_err(|e| format!("CDI seek: {e}"))?;
+
+    let mut b1 = [0u8; 1];
+    let mut b2 = [0u8; 2];
+    macro_rules! r1 { () => {{ f.read_exact(&mut b1).map_err(|e| format!("CDI read: {e}"))?; b1[0] }} }
+    macro_rules! r2 { () => {{ f.read_exact(&mut b2).map_err(|e| format!("CDI read: {e}"))?; u16::from_le_bytes(b2) }} }
+    macro_rules! r4 { () => {{ f.read_exact(&mut b4).map_err(|e| format!("CDI read: {e}"))?; u32::from_le_bytes(b4) }} }
+    macro_rules! sk { ($n:expr) => {{ f.seek(SeekFrom::Current($n as i64)).map_err(|e| format!("CDI seek: {e}"))?; }} }
+
+    let num_sessions = r2!() as u32;
+    let mut tracks: Vec<TrackInfo> = Vec::new();
+    let mut track_num: u32 = 0;
+    let mut cur_offset: u64 = 0;
+
+    for sess in 0..num_sessions {
+        let num_tracks = r2!() as u32;
+
+        for _ in 0..num_tracks {
+            let marker = r4!();
+            if marker != 0 { sk!(8); }
+            sk!(20);
+            sk!(4);
+            let fn_len = r1!() as i64;
+            sk!(fn_len);
+            sk!(19);
+            let dj4 = r4!();
+            if dj4 == 0x80000000 { sk!(8); }
+            sk!(2);
+            let _pregap      = r4!() as u64;
+            let track_length = r4!() as u64;
+            sk!(6);
+            let track_mode   = r4!();
+            sk!(12);
+            let start_lba    = r4!() as u64;
+            let total_len    = r4!() as u64;
+            sk!(16);
+            let sector_size_value = r4!();
+            sk!(29);
+            if version != CDI_V2 {
+                sk!(5);
+                let extra = r4!();
+                if extra == 0xffffffff { sk!(78); }
+            }
+
+            let stride: u64 = match sector_size_value { 0 => 2048, 1 => 2336, _ => 2352 };
+            let is_data = track_mode != 0;
+            let mode = match (track_mode, stride) {
+                (0, _)    => "AUDIO".to_string(),
+                (_, 2048) => "MODE1/2048".to_string(),
+                (_, 2336) => "MODE2/2336".to_string(),
+                (1, _)    => "MODE1/2352".to_string(),
+                _         => "MODE2/2352".to_string(),
+            };
+
+            track_num += 1;
+            tracks.push(TrackInfo {
+                number: track_num,
+                is_data,
+                mode,
+                start_lba,
+                num_sectors: track_length,
+                session: sess + 1,
+                bin_path: path.to_string_lossy().into_owned(),
+            });
+
+            cur_offset += stride * total_len;
+            let _ = cur_offset; // suppress unused warning; kept for future use
+        }
+
+        sk!(12);
+        if version != CDI_V2 { sk!(1); }
+    }
+
+    if tracks.is_empty() { return Err("No tracks found in CDI".to_string()); }
+    Ok(tracks)
+}
+
+#[tauri::command]
+fn get_cdi_tracks(cdi_path: String) -> Result<Vec<TrackInfo>, String> {
+    get_cdi_track_list(Path::new(&cdi_path))
+}
+
+// ── CSO/CISO (Compressed ISO) support ────────────────────────────────────────
+// Block-level zlib-deflate compressed ISO. Each 2048-byte sector is its own
+// compressed block. Common for PSP UMD images.
+
+const CSO_MAGIC: &[u8; 4] = b"CISO";
+
+pub struct CsoReader {
+    file:       File,
+    block_size: u64,
+    total_bytes: u64,
+    align:      u8,
+    index:      Vec<u32>,   // (num_blocks + 1) entries
+    cache:      Option<(u64, Vec<u8>)>, // (block_idx, decompressed)
+}
+
+impl CsoReader {
+    pub fn open(path: &Path) -> Result<Self, String> {
+        let mut f = File::open(path).map_err(|e| format!("Cannot open CSO: {e}"))?;
+        let mut hdr = [0u8; 24];
+        f.read_exact(&mut hdr).map_err(|e| format!("CSO header: {e}"))?;
+        if &hdr[0..4] != CSO_MAGIC {
+            return Err("Not a CSO file".to_string());
+        }
+        let total_bytes = u64::from_le_bytes(hdr[8..16].try_into().unwrap());
+        let block_size  = u32::from_le_bytes(hdr[16..20].try_into().unwrap()) as u64;
+        let align       = hdr[21];
+        if block_size == 0 { return Err("Invalid CSO: block_size=0".to_string()); }
+
+        let num_blocks = ((total_bytes + block_size - 1) / block_size) as usize;
+        let mut index = vec![0u32; num_blocks + 1];
+        let mut buf4 = [0u8; 4];
+        for entry in index.iter_mut() {
+            f.read_exact(&mut buf4).map_err(|e| format!("CSO index: {e}"))?;
+            *entry = u32::from_le_bytes(buf4);
+        }
+
+        Ok(CsoReader { file: f, block_size, total_bytes, align, index, cache: None })
+    }
+
+    fn decompress_block(&mut self, block_idx: u64) -> io::Result<()> {
+        if self.cache.as_ref().map_or(false, |(i, _)| *i == block_idx) { return Ok(()); }
+
+        let entry      = self.index[block_idx as usize];
+        let next_entry = self.index[block_idx as usize + 1];
+        let is_plain   = (entry & 1) != 0;
+        let offset     = ((entry      & !1) as u64) << self.align;
+        let next_off   = ((next_entry & !1) as u64) << self.align;
+        let comp_len   = (next_off - offset) as usize;
+
+        self.file.seek(SeekFrom::Start(offset))?;
+        let mut comp = vec![0u8; comp_len];
+        self.file.read_exact(&mut comp)?;
+
+        let block = if is_plain {
+            comp
+        } else {
+            let mut dec = DeflateDecoder::new(&comp[..]);
+            let mut out = vec![0u8; self.block_size as usize];
+            dec.read_exact(&mut out).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            out
+        };
+
+        self.cache = Some((block_idx, block));
+        Ok(())
+    }
+}
+
+impl ISO9660Reader for CsoReader {
+    // CSO stores 2048-byte logical sectors; `lba` maps 1:1 to block index when block_size==2048.
+    fn read_at(&mut self, buf: &mut [u8], lba: u64) -> io::Result<usize> {
+        let byte_pos   = lba * 2048;
+        let block_idx  = byte_pos / self.block_size;
+        let block_off  = (byte_pos % self.block_size) as usize;
+
+        self.decompress_block(block_idx)?;
+
+        let block = &self.cache.as_ref().unwrap().1;
+        let avail  = block.len().saturating_sub(block_off);
+        let to_copy = buf.len().min(avail);
+        buf[..to_copy].copy_from_slice(&block[block_off..block_off + to_copy]);
+        Ok(to_copy)
+    }
+}
+
+fn open_cso_fs(path: &Path) -> Result<ISO9660<CsoReader>, String> {
+    let reader = CsoReader::open(path)?;
+    ISO9660::new(reader).map_err(|e| format!("ISO9660 (CSO): {e}"))
+}
+
+fn detect_filesystems_cso(path: &Path) -> Vec<String> {
+    if open_cso_fs(path).is_ok() { vec!["ISO 9660".to_string()] } else { vec![] }
+}
+
+// ── ECM (Error Code Modeler) support ─────────────────────────────────────────
+// ECM strips ECC/EDC parity bytes from CD sectors to compress them.
+// Sector types stored: 0=raw bytes, 1=Mode1 (2048B user data),
+// 2=Mode2 Form1 (2048B), 3=Mode2 Form2 (2336B).
+// We decode by reading the stored bytes and reconstructing full 2352-byte raw sectors.
+
+const ECM_MAGIC: &[u8; 4] = b"ECM\0";
+
+pub struct EcmReader {
+    // Fully decoded sector cache: sector_index → 2352 raw bytes.
+    // Built lazily on first access; stored in a flat Vec for O(1) lookup.
+    sectors: Vec<[u8; 2352]>,
+}
+
+impl EcmReader {
+    pub fn open(path: &Path) -> Result<Self, String> {
+        let raw = fs::read(path).map_err(|e| format!("Cannot read ECM: {e}"))?;
+        if raw.len() < 4 || &raw[0..4] != ECM_MAGIC {
+            return Err("Not an ECM file".to_string());
+        }
+
+        let mut pos = 4usize;
+        let mut sectors: Vec<[u8; 2352]> = Vec::new();
+
+        // Each ECM chunk: variable-length count encoding then data.
+        // Count encoding: read bytes; low 7 bits = value fragment, high bit = more.
+        // The type is in the low 2 bits of the FIRST byte before shifting.
+        while pos < raw.len() {
+            // Check for end marker (four 0xFF bytes).
+            if pos + 4 <= raw.len() && raw[pos..pos+4] == [0xFF, 0xFF, 0xFF, 0xFF] { break; }
+
+            let b0 = raw[pos]; pos += 1;
+            let typ = b0 & 3;
+            let mut count = ((b0 >> 2) & 0x1F) as u64;
+            let mut shift = 5u32;
+
+            // Continuation bytes for the count.
+            while raw.get(pos).copied().map_or(false, |b| b & 0x80 != 0) {
+                let b = raw[pos]; pos += 1;
+                count |= ((b & 0x7F) as u64) << shift;
+                shift += 7;
+            }
+            // One final byte (high bit clear).
+            if let Some(&b) = raw.get(pos) {
+                count |= (b as u64) << shift;
+                pos += 1;
+            }
+
+            let n = count + 1; // actual number of units
+
+            match typ {
+                0 => {
+                    // Type 0: n raw bytes (not sector-aligned; pad into sectors).
+                    let bytes = raw.get(pos..pos + n as usize)
+                        .ok_or_else(|| "ECM: truncated type-0 data".to_string())?;
+                    pos += n as usize;
+                    // Type-0 data is written verbatim into the output stream (rare in practice).
+                    // Pad into 2352-byte sectors; leftover bytes go into the next sector.
+                    let mut off = 0usize;
+                    while off < bytes.len() {
+                        let mut sec = [0u8; 2352];
+                        let copy = (bytes.len() - off).min(2352);
+                        sec[..copy].copy_from_slice(&bytes[off..off + copy]);
+                        sectors.push(sec);
+                        off += copy;
+                    }
+                }
+                1 => {
+                    // Type 1: n Mode1 sectors (sync+header+2048B user data stored; ECC reconstructed).
+                    for _ in 0..n {
+                        let mut sec = [0u8; 2352];
+                        // Sync
+                        sec[0] = 0x00;
+                        sec[1..12].fill(0xFF); sec[11] = 0x00;
+                        // Header (MSF + mode): read 4 bytes
+                        let hdr = raw.get(pos..pos+4).ok_or_else(|| "ECM: truncated type-1 header".to_string())?;
+                        sec[12..16].copy_from_slice(hdr); pos += 4;
+                        sec[15] = 0x01; // Mode 1
+                        // User data (2048 bytes)
+                        let ud = raw.get(pos..pos+2048).ok_or_else(|| "ECM: truncated type-1 data".to_string())?;
+                        sec[16..2064].copy_from_slice(ud); pos += 2048;
+                        // EDC/ECC reconstruction skipped — user data is at bytes 16..2064.
+                        // ECC bytes (2064..2352) left as zeros; sufficient for ISO9660 reads.
+                        sectors.push(sec);
+                    }
+                }
+                2 => {
+                    // Type 2: n Mode2 Form1 sectors (sub-header + 2048B user data).
+                    for _ in 0..n {
+                        let mut sec = [0u8; 2352];
+                        sec[0] = 0x00; sec[1..12].fill(0xFF); sec[11] = 0x00;
+                        sec[15] = 0x02;
+                        // Sub-header (8 bytes: repeated twice in raw sector at 16..24).
+                        let sub = raw.get(pos..pos+4).ok_or_else(|| "ECM: truncated type-2 sub-hdr".to_string())?;
+                        sec[16..20].copy_from_slice(sub);
+                        sec[20..24].copy_from_slice(sub);
+                        pos += 4;
+                        // User data (2048 bytes at 24..2072)
+                        let ud = raw.get(pos..pos+2048).ok_or_else(|| "ECM: truncated type-2 data".to_string())?;
+                        sec[24..2072].copy_from_slice(ud); pos += 2048;
+                        sectors.push(sec);
+                    }
+                }
+                3 => {
+                    // Type 3: n Mode2 Form2 sectors (sub-header + 2324B user data).
+                    for _ in 0..n {
+                        let mut sec = [0u8; 2352];
+                        sec[0] = 0x00; sec[1..12].fill(0xFF); sec[11] = 0x00;
+                        sec[15] = 0x02;
+                        let sub = raw.get(pos..pos+4).ok_or_else(|| "ECM: truncated type-3 sub-hdr".to_string())?;
+                        sec[16..20].copy_from_slice(sub);
+                        sec[20..24].copy_from_slice(sub);
+                        pos += 4;
+                        // Form2 data (2324 bytes at 24..2348)
+                        let ud = raw.get(pos..pos+2324).ok_or_else(|| "ECM: truncated type-3 data".to_string())?;
+                        sec[24..2348].copy_from_slice(ud); pos += 2324;
+                        sectors.push(sec);
+                    }
+                }
+                _ => unreachable!(),
+            }
+        }
+
+        Ok(EcmReader { sectors })
+    }
+}
+
+impl ISO9660Reader for EcmReader {
+    fn read_at(&mut self, buf: &mut [u8], lba: u64) -> io::Result<usize> {
+        let sec = self.sectors.get(lba as usize)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "ECM: LBA out of range"))?;
+        // User data is at offset 16 for Mode1, 24 for Mode2 Form1/2. Determine from mode byte.
+        let mode = sec[15];
+        let udo: usize = match mode {
+            2 => 24,
+            _ => 16,
+        };
+        let avail = 2352usize.saturating_sub(udo);
+        let to_copy = buf.len().min(avail);
+        buf[..to_copy].copy_from_slice(&sec[udo..udo + to_copy]);
+        Ok(to_copy)
+    }
+}
+
+fn open_ecm_fs(path: &Path) -> Result<ISO9660<EcmReader>, String> {
+    let reader = EcmReader::open(path)?;
+    ISO9660::new(reader).map_err(|e| format!("ISO9660 (ECM): {e}"))
+}
+
+fn detect_filesystems_ecm(path: &Path) -> Vec<String> {
+    if open_ecm_fs(path).is_ok() { vec!["ISO 9660".to_string()] } else { vec![] }
+}
+
+// ── DPM (Dynamic Position Measurement) ───────────────────────────────────────
+// DPM records the angular spindle position at each sector so a virtual drive
+// can replay copy-protection timing checks (e.g. SafeDisc). Each u32 sample
+// is a raw angular velocity reading; resolution = sectors between samples.
+//
+// An image may contain multiple DPM blocks (e.g. one coarse + one fine-grained).
+// A disc emulator should prefer the block with the smallest resolution (finest
+// granularity) that covers the queried sector.
+
+#[derive(Serialize, Clone)]
+pub struct DpmBlock {
+    pub start_sector: u32,
+    pub resolution: u32,   // sectors between consecutive samples
+    pub data: Vec<u32>,    // raw angular velocity samples, length = num_entries
+}
+
+impl DpmBlock {
+    /// Last sector covered by this block (exclusive).
+    pub fn end_sector(&self) -> u32 {
+        self.start_sector.saturating_add(self.resolution.saturating_mul(self.data.len() as u32))
+    }
+
+    /// True if this block contains a sample for `sector`.
+    pub fn covers(&self, sector: u32) -> bool {
+        sector >= self.start_sector && sector < self.end_sector()
+    }
+
+    /// Angular velocity sample for `sector`, or None if out of range.
+    /// Index = (sector - start_sector) / resolution; no interpolation.
+    pub fn sample_at(&self, sector: u32) -> Option<u32> {
+        if !self.covers(sector) { return None; }
+        let idx = ((sector - self.start_sector) / self.resolution) as usize;
+        self.data.get(idx).copied()
+    }
+}
+
+#[derive(Serialize, Clone)]
+pub struct DpmData {
+    pub blocks: Vec<DpmBlock>,
+}
+
+impl DpmData {
+    /// Best available angular velocity sample for `sector`.
+    /// Prefers the block with the finest resolution (smallest value) that covers the sector.
+    pub fn sample_at(&self, sector: u32) -> Option<u32> {
+        self.blocks.iter()
+            .filter(|b| b.covers(sector))
+            .min_by_key(|b| b.resolution)
+            .and_then(|b| b.sample_at(sector))
+    }
+}
+
+fn parse_dpm_block(raw: &[u8], block_off: usize) -> Option<DpmBlock> {
+    // Block layout: block_number(u32) · start_sector(u32) · resolution(u32) · num_entries(u32)
+    if block_off + 16 > raw.len() { return None; }
+    let start_sector = read_u32_le(raw, block_off + 4);
+    let resolution   = read_u32_le(raw, block_off + 8);
+    let num_entries  = read_u32_le(raw, block_off + 12) as usize;
+    if resolution == 0 || num_entries == 0 { return None; }
+    let data_off = block_off + 16;
+    if data_off + num_entries * 4 > raw.len() { return None; }
+    let data: Vec<u32> = (0..num_entries).map(|i| read_u32_le(raw, data_off + i * 4)).collect();
+    Some(DpmBlock { start_sector, resolution, data })
+}
+
+fn parse_mds_dpm(mds_path: &Path) -> Option<DpmData> {
+    let raw = fs::read(mds_path).ok()?;
+    // MDS header is 0x58 bytes; dpm_blocks_offset is at 0x54 (last u32 in header).
+    if raw.len() < 0x58 || !raw.starts_with(MDS_SIGNATURE) { return None; }
+
+    let table_off = read_u32_le(&raw, 0x54) as usize;
+    if table_off == 0 || table_off + 8 > raw.len() { return None; }
+
+    let num_blocks = read_u32_le(&raw, table_off) as usize;
+    if num_blocks == 0 { return None; }
+
+    let mut blocks = Vec::with_capacity(num_blocks);
+    for i in 0..num_blocks {
+        let ptr_off = table_off + 4 + i * 4;
+        if ptr_off + 4 > raw.len() { break; }
+        let block_off = read_u32_le(&raw, ptr_off) as usize;
+        if let Some(block) = parse_dpm_block(&raw, block_off) {
+            blocks.push(block);
+        }
+    }
+
+    if blocks.is_empty() { None } else { Some(DpmData { blocks }) }
+}
+
+fn parse_bwa_dpm(bwa_path: &Path) -> Option<DpmData> {
+    // BlindWrite Angular sidecar (.bwa) — 11-word header before data:
+    //   [u32×4] fixed signature words
+    //   [u32] block_len1  [u32] block_len2  [u32×2] reserved
+    //   [u32] start_sector  [u32] resolution  [u32] num_entries
+    //   [u32×num_entries] data
+    let raw = fs::read(bwa_path).ok()?;
+    if raw.len() < 44 { return None; }
+    let start_sector = read_u32_le(&raw, 32);
+    let resolution   = read_u32_le(&raw, 36);
+    let num_entries  = read_u32_le(&raw, 40) as usize;
+    if resolution == 0 || num_entries == 0 { return None; }
+    let data_off = 44;
+    if data_off + num_entries * 4 > raw.len() { return None; }
+    let data: Vec<u32> = (0..num_entries).map(|i| read_u32_le(&raw, data_off + i * 4)).collect();
+    Some(DpmData { blocks: vec![DpmBlock { start_sector, resolution, data }] })
+}
+
+fn parse_b6t_dpm(b6t_path: &Path) -> Option<DpmData> {
+    // B6T DPM lives inside B6T_DiscBlock_2 at a variable offset requiring full
+    // sequential parsing of the B6T structure. The sidecar .bwa file is equivalent
+    // and simpler; prefer it when present.
+    let bwa_path = b6t_path.with_extension("bwa");
+    parse_bwa_dpm(&bwa_path)
+}
+
+/// Return all DPM blocks for the given image file, or null if none present.
+/// For a disc emulator, call `sample_at(sector)` on the result to get the
+/// angular velocity at any sector (picks finest-resolution covering block).
+#[tauri::command]
+fn get_dpm_data(image_path: String) -> Option<DpmData> {
+    let path = Path::new(&image_path);
+    let lower = image_path.to_lowercase();
+    if lower.ends_with(".mds") {
+        parse_mds_dpm(path)
+    } else if lower.ends_with(".b6t") || lower.ends_with(".b5t") {
+        parse_b6t_dpm(path)
+    } else {
+        None
+    }
+}
+
+/// Look up the angular velocity sample for a single sector.
+/// Returns null if the image has no DPM or the sector is out of all block ranges.
+#[tauri::command]
+fn get_dpm_for_sector(image_path: String, sector: u32) -> Option<u32> {
+    get_dpm_data(image_path)?.sample_at(sector)
+}
+
 fn get_mds_track_list(mds_path: &Path) -> Result<Vec<TrackInfo>, String> {
     let data = fs::read(mds_path).map_err(|e| format!("Cannot read MDS: {e}"))?;
     if data.len() < 0x60 || !data.starts_with(MDS_SIGNATURE) {
@@ -1372,6 +1873,7 @@ fn mount_disc_image(
             "$d = Mount-DiskImage -ImagePath '{escaped}' -PassThru; ($d | Get-Volume).DriveLetter"
         );
         let out = Command::new("powershell")
+            .creation_flags(CREATE_NO_WINDOW)
             .args(["-NoProfile", "-Command", &script])
             .output()
             .map_err(|e| format!("Mount-DiskImage failed: {e}"))?;
@@ -1543,6 +2045,7 @@ fn unmount_disc_image(
         let escaped = device.replace('\'', "''");
         let script = format!("Dismount-DiskImage -ImagePath '{escaped}'");
         let out = Command::new("powershell")
+            .creation_flags(CREATE_NO_WINDOW)
             .args(["-NoProfile", "-Command", &script])
             .output()
             .map_err(|e| format!("Dismount-DiskImage failed: {e}"))?;
@@ -1596,6 +2099,7 @@ fn detach_all(devices: &[String]) {
         let escaped = device.replace('\'', "''");
         let script = format!("Dismount-DiskImage -ImagePath '{escaped}'");
         let _ = Command::new("powershell")
+            .creation_flags(CREATE_NO_WINDOW)
             .args(["-NoProfile", "-Command", &script])
             .output();
     }
@@ -1772,10 +2276,11 @@ fn get_cue_tracks(cue_path: String) -> Result<Vec<TrackInfo>, String> {
         let num_sectors = if i + 1 < raw.len() && raw[i + 1].bin_path == rt.bin_path {
             raw[i + 1].start_lba.saturating_sub(rt.start_lba)
         } else {
+            // Use the full BIN file size so sector counts include the pregap,
+            // matching what disc authoring tools report per-track.
             fs::metadata(&rt.bin_path)
                 .map(|m| m.len() / RAW_SECTOR_SIZE)
                 .unwrap_or(0)
-                .saturating_sub(rt.start_lba)
         };
         let is_data = rt.mode.starts_with("MODE") || rt.mode.starts_with("CDI");
         TrackInfo {
@@ -1871,6 +2376,27 @@ fn read_sector(image_path: String, lba: u64) -> Result<SectorData, String> {
     } else if lower.ends_with(".mdx") {
         let (ss, udo) = mdx_sector_format(path);
         (path.to_path_buf(), ss, udo, MDX_DATA_OFFSET)
+    } else if lower.ends_with(".cso") || lower.ends_with(".ciso") {
+        let mut reader = CsoReader::open(path).map_err(|e| format!("CSO: {e}"))?;
+        let total_sectors = reader.total_bytes / 2048;
+        if total_sectors == 0 { return Err("CSO is empty".to_string()); }
+        if lba >= total_sectors {
+            return Err(format!("Sector {lba} out of range (0–{})", total_sectors - 1));
+        }
+        let mut bytes = vec![0u8; 2048];
+        reader.read_at(&mut bytes, lba).map_err(|e| format!("Read error: {e}"))?;
+        return Ok(SectorData { bytes, sector_size: 2048, user_data_offset: 0, total_sectors, lba });
+    } else if lower.ends_with(".ecm") {
+        let reader = EcmReader::open(path).map_err(|e| format!("ECM: {e}"))?;
+        let total_sectors = reader.sectors.len() as u64;
+        if total_sectors == 0 { return Err("ECM is empty".to_string()); }
+        if lba >= total_sectors {
+            return Err(format!("Sector {lba} out of range (0–{})", total_sectors - 1));
+        }
+        let sec = reader.sectors[lba as usize];
+        const SYNC: [u8; 12] = [0x00,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0x00];
+        let udo = if sec[..12] == SYNC { if sec[15] == 2 { 24u32 } else { 16u32 } } else { 0u32 };
+        return Ok(SectorData { bytes: sec.to_vec(), sector_size: 2352, user_data_offset: udo, total_sectors, lba });
     } else {
         let udo = detect_raw_sector_offset(path).unwrap_or(0);
         (path.to_path_buf(), if udo > 0 { RAW_SECTOR_SIZE } else { 2048u64 }, udo, 0)
@@ -1920,7 +2446,8 @@ fn open_audio_src(track: &TrackInfo) -> Result<(File, u64), String> {
         .map_err(|e| format!("Cannot open BIN: {e}"))?;
     src.seek(SeekFrom::Start(track.start_lba * RAW_SECTOR_SIZE))
         .map_err(|e| format!("Seek error: {e}"))?;
-    Ok((src, track.num_sectors * RAW_SECTOR_SIZE))
+    // num_sectors is the full BIN size; subtract the pregap to get playable audio length.
+    Ok((src, track.num_sectors.saturating_sub(track.start_lba) * RAW_SECTOR_SIZE))
 }
 
 fn save_audio_as_wav(track: &TrackInfo, dest_path: &str) -> Result<(), String> {
@@ -2195,6 +2722,7 @@ $drives = Get-CimInstance Win32_CDROMDrive | Select-Object Name, Drive, VolumeNa
 if ($drives -eq $null) { '[]' } else { $drives | ConvertTo-Json -Compress }
 "#;
     let out = Command::new("powershell")
+            .creation_flags(CREATE_NO_WINDOW)
         .args(["-NoProfile", "-NonInteractive", "-Command", script])
         .output()
         .map_err(|e| format!("PowerShell failed: {e}"))?;
@@ -2344,6 +2872,7 @@ fn eject_disc(path: String) -> Result<(), String> {
             r#"(New-Object -ComObject Shell.Application).NameSpace(17).ParseName('{drive}').InvokeVerb('Eject')"#
         );
         Command::new("powershell")
+            .creation_flags(CREATE_NO_WINDOW)
             .args(["-NoProfile", "-NonInteractive", "-Command", &script])
             .output()
             .map_err(|e| format!("PowerShell eject failed: {e}"))?;
@@ -2497,6 +3026,12 @@ macro_rules! with_fs {
         } else if lower.ends_with(".mds") {
             let track = parse_mds_for_data_track(Path::new(path))?;
             let $fs = open_iso_fs(&track)?;
+            $body
+        } else if lower.ends_with(".cso") || lower.ends_with(".ciso") {
+            let $fs = open_cso_fs(Path::new(path))?;
+            $body
+        } else if lower.ends_with(".ecm") {
+            let $fs = open_ecm_fs(Path::new(path))?;
             $body
         } else {
             let file = File::open(path).map_err(|e| format!("Cannot open file: {e}"))?;
@@ -2717,6 +3252,10 @@ fn list_disc_contents(image_path: String, dir_path: String, filesystem: Option<S
         } else {
             collect_entries(&open_chd_iso(Path::new(path))?, &dir_path)
         }
+    } else if lower.ends_with(".cso") || lower.ends_with(".ciso") {
+        collect_entries(&open_cso_fs(Path::new(path))?, &dir_path)
+    } else if lower.ends_with(".ecm") {
+        collect_entries(&open_ecm_fs(Path::new(path))?, &dir_path)
     } else if lower.ends_with(".mdx") {
         let path_obj = Path::new(path);
         let track = parse_mdx_as_data_track(path_obj);
@@ -2829,6 +3368,10 @@ fn save_file(image_path: String, file_path: String, dest_path: String, filesyste
         } else {
             extract_file_from_fs(&open_chd_iso(Path::new(path))?, &file_path, &dest_path)
         }
+    } else if lower.ends_with(".cso") || lower.ends_with(".ciso") {
+        extract_file_from_fs(&open_cso_fs(Path::new(path))?, &file_path, &dest_path)
+    } else if lower.ends_with(".ecm") {
+        extract_file_from_fs(&open_ecm_fs(Path::new(path))?, &file_path, &dest_path)
     } else if lower.ends_with(".mdx") {
         let path_obj = Path::new(path);
         let track = parse_mdx_as_data_track(path_obj);
@@ -2942,6 +3485,10 @@ fn save_directory(image_path: String, dir_path: String, dest_path: String, files
         } else {
             extract_dir_from_fs(&open_chd_iso(Path::new(path))?, &dir_path, &dest_path)
         }
+    } else if lower.ends_with(".cso") || lower.ends_with(".ciso") {
+        extract_dir_from_fs(&open_cso_fs(Path::new(path))?, &dir_path, &dest_path)
+    } else if lower.ends_with(".ecm") {
+        extract_dir_from_fs(&open_ecm_fs(Path::new(path))?, &dir_path, &dest_path)
     } else if lower.ends_with(".mdx") {
         let path_obj = Path::new(path);
         let track = parse_mdx_as_data_track(path_obj);
@@ -3021,7 +3568,9 @@ pub fn run() {
             get_cue_tracks, get_gdi_tracks, save_audio_track, list_optical_drives,
             get_mds_tracks, mount_disc_image, unmount_disc_image,
             get_disc_filesystems, read_sector, get_platform, eject_disc,
-            check_cdemu_installed, install_cdemu
+            check_cdemu_installed, install_cdemu,
+            get_dpm_data, get_dpm_for_sector,
+            get_cdi_tracks
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

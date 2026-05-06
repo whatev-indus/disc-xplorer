@@ -3851,11 +3851,12 @@ dependencies = [
 
 [[package]]
 name = "tauri-app"
-version = "0.1.13"
+version = "0.2.0"
 dependencies = [
  "chd",
  "encoding_rs",
  "flac-bound",
+ "flate2",
  "iso9660",
  "mp3lame-encoder",
  "serde",

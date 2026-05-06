@@ -58,6 +58,12 @@ interface MountResult {
   device: string;
 }
 
+interface EmulatedDrive {
+  slot: string;
+  device: string;
+  image_path: string;
+}
+
 interface ColWidths {
   name: number;
   lba: number;
@@ -187,6 +193,8 @@ function App() {
   const [cdemuInstalling, setCdemuInstalling] = useState(false);
   const [cdemuInstallMsg, setCdemuInstallMsg] = useState<string | null>(null);
   const [cdemuInstallOk, setCdemuInstallOk] = useState(false);
+  const [emulatedDrives, setEmulatedDrives] = useState<EmulatedDrive[]>([]);
+  const [emulating, setEmulating] = useState(false);
 
   const dragRef = useRef<{ col: keyof ColWidths; startX: number; startWidth: number } | null>(null);
   const driveMenuRef = useRef<HTMLDivElement>(null);
@@ -491,6 +499,36 @@ function App() {
     }
     setMountedDevice(null);
     // Keep the disc image open in the app after unmounting.
+  }
+
+  function isCdemuEmulatable(path: string): boolean {
+    const lower = path.toLowerCase();
+    return [".cue", ".mds", ".mdx", ".nrg", ".ccd", ".cdi",
+            ".toc", ".b6t", ".bwt", ".c2d", ".pdi", ".gi", ".daa"]
+      .some(ext => lower.endsWith(ext));
+  }
+
+  async function emulateDrive() {
+    if (!sourceImagePath) return;
+    setEmulating(true);
+    try {
+      const drive = await invoke<EmulatedDrive>("emulate_drive", { imagePath: sourceImagePath });
+      setEmulatedDrives(prev => [...prev, drive]);
+      setError(null);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setEmulating(false);
+    }
+  }
+
+  async function ejectEmulatedDrive(slot: string) {
+    try {
+      await invoke("eject_emulated_drive", { slot });
+      setEmulatedDrives(prev => prev.filter(d => d.slot !== slot));
+    } catch (e) {
+      setError(String(e));
+    }
   }
 
   function unmountPhysicalDisc() {
@@ -844,6 +882,11 @@ function App() {
               ? <button className="btn-open btn-open-secondary" onClick={mountImage}>Mount Disc Image</button>
               : null
           }
+          {platform === "linux" && sourceImagePath && isCdemuEmulatable(sourceImagePath) && (
+            <button className="btn-open btn-open-secondary" onClick={emulateDrive} disabled={emulating}>
+              {emulating ? "Loading…" : "Emulate Drive"}
+            </button>
+          )}
           <div className="separator" />
           <div className="drive-menu-wrap" ref={driveMenuRef}>
             {physicalDiscActive
@@ -1067,6 +1110,18 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.`}</pre>
 
       {showSectorView && sourceImagePath && (
         <SectorView imagePath={sourceImagePath} onClose={() => setShowSectorView(false)} />
+      )}
+
+      {emulatedDrives.length > 0 && (
+        <div className="emulated-drives-bar">
+          {emulatedDrives.map(drive => (
+            <div key={drive.slot} className="emulated-drive-item">
+              <span className="emulated-drive-device">{drive.device}</span>
+              <span className="emulated-drive-name">{drive.image_path.split("/").pop()}</span>
+              <button className="btn-eject-emulated" onClick={() => ejectEmulatedDrive(drive.slot)} title="Unload virtual drive">⏏</button>
+            </div>
+          ))}
+        </div>
       )}
 
       {(imagePath || viewMode === "empty-drive") && (

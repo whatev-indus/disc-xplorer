@@ -2188,6 +2188,91 @@ fn install_cdemu() -> Result<String, String> {
     Err("Not supported on this platform.".to_string())
 }
 
+// ── CDemu drive emulation ─────────────────────────────────────────────────────
+
+#[derive(Serialize, Clone)]
+pub struct EmulatedDrive {
+    pub slot: String,
+    pub device: String,
+    pub image_path: String,
+}
+
+pub struct EmulatedDrives(pub Mutex<Vec<EmulatedDrive>>);
+
+#[tauri::command]
+fn emulate_drive(
+    image_path: String,
+    state: tauri::State<EmulatedDrives>,
+) -> Result<EmulatedDrive, String> {
+    #[cfg(not(target_os = "linux"))]
+    { let _ = (image_path, state); return Err("Drive emulation via CDemu is only available on Linux.".to_string()); }
+
+    #[cfg(target_os = "linux")]
+    {
+        let before = sr_devices();
+
+        let load_out = Command::new("cdemu")
+            .args(["load", "any", &image_path])
+            .output()
+            .map_err(|e| if e.kind() == std::io::ErrorKind::NotFound {
+                "CDemu is not installed. Install the 'cdemu' package to emulate drives.".to_string()
+            } else {
+                format!("cdemu load failed: {e}")
+            })?;
+
+        if !load_out.status.success() {
+            return Err(String::from_utf8_lossy(&load_out.stderr).trim().to_string());
+        }
+
+        let slot = String::from_utf8_lossy(&load_out.stdout)
+            .split_whitespace()
+            .last()
+            .map(|w| w.trim_end_matches('.').to_string())
+            .filter(|w| w.chars().all(|c| c.is_ascii_digit()))
+            .unwrap_or_else(|| "0".to_string());
+
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+
+        let after = sr_devices();
+        let device = after.into_iter()
+            .find(|d| !before.contains(d))
+            .ok_or_else(|| "CDemu: virtual drive did not appear as /dev/srN".to_string())?;
+
+        let drive = EmulatedDrive { slot, device, image_path };
+        state.0.lock().unwrap().push(drive.clone());
+        Ok(drive)
+    }
+}
+
+#[tauri::command]
+fn eject_emulated_drive(
+    slot: String,
+    state: tauri::State<EmulatedDrives>,
+) -> Result<(), String> {
+    #[cfg(not(target_os = "linux"))]
+    { let _ = (slot, state); return Err("Drive emulation via CDemu is only available on Linux.".to_string()); }
+
+    #[cfg(target_os = "linux")]
+    {
+        let out = Command::new("cdemu")
+            .args(["unload", &slot])
+            .output()
+            .map_err(|e| format!("cdemu unload failed: {e}"))?;
+
+        if !out.status.success() {
+            return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
+        }
+
+        state.0.lock().unwrap().retain(|d| d.slot != slot);
+        Ok(())
+    }
+}
+
+#[tauri::command]
+fn list_emulated_drives(state: tauri::State<EmulatedDrives>) -> Vec<EmulatedDrive> {
+    state.0.lock().unwrap().clone()
+}
+
 // ── CUE track listing ─────────────────────────────────────────────────────────
 
 #[derive(Serialize)]
@@ -3556,11 +3641,19 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .manage(MountedImages(Mutex::new(Vec::new())))
+        .manage(EmulatedDrives(Mutex::new(Vec::new())))
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::Destroyed = event {
                 let state = window.app_handle().state::<MountedImages>();
                 let devices = state.0.lock().unwrap().clone();
                 detach_all(&devices);
+                #[cfg(target_os = "linux")]
+                {
+                    let edrives = window.app_handle().state::<EmulatedDrives>();
+                    for drive in edrives.0.lock().unwrap().iter() {
+                        let _ = Command::new("cdemu").args(["unload", &drive.slot]).output();
+                    }
+                }
             }
         })
         .invoke_handler(tauri::generate_handler![
@@ -3570,7 +3663,8 @@ pub fn run() {
             get_disc_filesystems, read_sector, get_platform, eject_disc,
             check_cdemu_installed, install_cdemu,
             get_dpm_data, get_dpm_for_sector,
-            get_cdi_tracks
+            get_cdi_tracks,
+            emulate_drive, eject_emulated_drive, list_emulated_drives
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

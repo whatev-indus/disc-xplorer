@@ -107,35 +107,55 @@ export function SectorView({ imagePath, onClose }: { imagePath: string; onClose:
   const [data, setData] = useState<SectorData | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [inputVal, setInputVal] = useState("0");
+  // discOffset: constant difference between disc-absolute LBA (from sync header MSF)
+  // and track-relative LBA. Null until we've seen a sector with a valid CD sync header.
+  const [discOffset, setDiscOffset] = useState<number | null>(null);
+  const [discMode, setDiscMode] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
 
-  const load = useCallback(async (lba: number) => {
+  const toDisplay = (trackLba: number) =>
+    discMode && discOffset !== null ? trackLba + discOffset : trackLba;
+
+  const toTrack = (displayLba: number) =>
+    discMode && discOffset !== null ? displayLba - discOffset : displayLba;
+
+  const load = useCallback(async (trackLba: number) => {
     setError(null);
     try {
-      const result = await invoke<SectorData>("read_sector", { imagePath, lba });
+      const result = await invoke<SectorData>("read_sector", { imagePath, lba: trackLba });
+      const disc = parseDisc(result.bytes, result.sector_size);
+      if (disc !== null) setDiscOffset(disc.discLba - result.lba);
       setData(result);
-      setInputVal(String(lba));
     } catch (e) {
       setError(String(e));
     }
   }, [imagePath]);
+
+  // Sync input field whenever data or mode changes.
+  useEffect(() => {
+    if (data) setInputVal(String(toDisplay(data.lba)));
+  }, [data, discMode, discOffset]);
 
   useEffect(() => { load(0); }, [imagePath]);
 
   const lba = data?.lba ?? 0;
   const total = data?.total_sectors ?? 0;
 
-  function go(target: number) {
+  function go(targetTrackLba: number) {
     if (!total) return;
-    load(Math.max(0, Math.min(target, total - 1)));
+    load(Math.max(0, Math.min(targetTrackLba, total - 1)));
   }
 
   function commit() {
     const n = parseInt(inputVal, 10);
-    if (!isNaN(n)) go(n);
+    if (!isNaN(n)) go(toTrack(n));
   }
 
-  // Keyboard navigation (when input isn't focused)
+  function toggleMode() {
+    if (discOffset === null) return;
+    setDiscMode(m => !m);
+  }
+
   useEffect(() => {
     function onKey(e: KeyboardEvent) {
       if (e.target instanceof HTMLInputElement) return;
@@ -155,6 +175,9 @@ export function SectorView({ imagePath, onClose }: { imagePath: string; onClose:
   const layout = data ? getLayout(data.bytes, data.sector_size) : null;
   const isLastSector = total > 0 && lba >= total - 1;
 
+  const minInput = discMode && discOffset !== null ? discOffset : 0;
+  const maxInput = discMode && discOffset !== null ? total - 1 + discOffset : total > 0 ? total - 1 : 0;
+
   return (
     <div className="modal-overlay" onClick={onClose}>
       <div className="modal sv-modal" onClick={e => e.stopPropagation()}>
@@ -165,19 +188,30 @@ export function SectorView({ imagePath, onClose }: { imagePath: string; onClose:
         </div>
 
         <div className="sv-nav">
-          <span className="sv-nav-label">Sector</span>
+          <button
+            className={`sv-mode-toggle ${discMode ? 'sv-mode-toggle--active' : ''}`}
+            onClick={toggleMode}
+            disabled={discOffset === null}
+            title={discOffset === null ? 'No CD sync header — disc LBA unavailable' : discMode ? 'Switch to track-relative LBA' : 'Switch to disc-absolute LBA'}
+          >
+            {discMode ? 'Disc LBA' : 'Track LBA'}
+          </button>
           <input
             ref={inputRef}
             className="sv-input"
             type="number"
-            min={0}
-            max={total > 0 ? total - 1 : 0}
+            min={minInput}
+            max={maxInput}
             value={inputVal}
             onChange={e => setInputVal(e.target.value)}
             onKeyDown={e => { if (e.key === 'Enter') commit(); }}
             onBlur={commit}
           />
-          {total > 0 && <span className="sv-total">of {(total - 1).toLocaleString()}</span>}
+          {total > 0 && (
+            <span className="sv-total">
+              of {(discMode && discOffset !== null ? total - 1 + discOffset : total - 1).toLocaleString()}
+            </span>
+          )}
           <div className="sv-nav-btns">
             <button className="sv-btn" onClick={() => go(0)}           disabled={lba === 0}     title="First (Home)">⏮</button>
             <button className="sv-btn" onClick={() => go(lba - 1)}     disabled={lba === 0}     title="Previous (←)">◀</button>
@@ -194,9 +228,12 @@ export function SectorView({ imagePath, onClose }: { imagePath: string; onClose:
                   <span className="sv-badge sv-badge-cd">CD</span>
                   <span>Mode {disc.mode}</span>
                   <span className="sv-sep">·</span>
-                  <span>LBA <strong>{data.lba.toLocaleString()}</strong></span>
+                  {discMode
+                    ? <span title={`Track-relative LBA ${data.lba}`}>Disc LBA <strong>{disc.discLba.toLocaleString()}</strong></span>
+                    : <span title={`Disc-absolute LBA ${disc.discLba}`}>Track LBA <strong>{data.lba.toLocaleString()}</strong></span>
+                  }
                   <span className="sv-sep">·</span>
-                  <span title={`Disc-absolute LBA ${disc.discLba}`}>MSF {disc.msf}</span>
+                  <span>MSF {disc.msf}</span>
                   <span className="sv-sep">·</span>
                   <span>{data.sector_size}B raw</span>
                   {layout && layout.dataEnd > layout.dataStart && (

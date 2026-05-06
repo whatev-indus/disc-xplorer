@@ -612,6 +612,23 @@ th.col-save { text-align: center; }
   white-space: nowrap;
 }
 
+.sv-mode-toggle {
+  padding: 3px 8px;
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  color: var(--text-muted);
+  font-size: 11px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.sv-mode-toggle:hover:not(:disabled) { background: #3a3a3a; color: var(--text-bright); }
+.sv-mode-toggle:disabled { opacity: 0.3; cursor: default; }
+.sv-mode-toggle--active {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
 .sv-input {
   width: 88px;
   padding: 3px 6px;

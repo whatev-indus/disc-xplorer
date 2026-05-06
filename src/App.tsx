@@ -312,7 +312,7 @@ function App() {
       name: `Track ${String(t.number).padStart(2, "0")}`,
       start_lba: t.start_lba,
       num_sectors: t.num_sectors,
-      size_bytes: t.is_data ? (t.num_sectors - t.start_lba) * 2048 : t.num_sectors * 2352,
+      size_bytes: t.is_data ? t.num_sectors * 2048 : t.num_sectors * 2352,
       format: t.is_data ? t.mode : "CD Audio",
       is_data: t.is_data,
     }));

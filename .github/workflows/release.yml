@@ -21,10 +21,16 @@ jobs:
             artifact_suffix: macOS_ARM
           - platform: windows-latest
             target: x86_64-pc-windows-msvc
-            artifact_suffix: Windows
+            artifact_suffix: Windows_x64
+          - platform: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            artifact_suffix: Windows_ARM
           - platform: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
-            artifact_suffix: Linux
+            artifact_suffix: Linux_x64
+          - platform: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
+            artifact_suffix: Linux_ARM
 
     runs-on: ${{ matrix.platform }}
 
@@ -43,7 +49,7 @@ jobs:
           targets: ${{ matrix.target }}
 
       - name: Install Linux dependencies
-        if: matrix.platform == 'ubuntu-22.04'
+        if: startsWith(matrix.platform, 'ubuntu-')
         run: |
           sudo apt-get update
           sudo apt-get install -y \
@@ -56,11 +62,11 @@ jobs:
             libflac-dev
 
       - name: Install macOS audio dependencies
-        if: matrix.platform == 'macos-14'
+        if: startsWith(matrix.platform, 'macos-')
         run: brew install flac
 
       - name: Install Windows audio dependencies
-        if: matrix.platform == 'windows-latest'
+        if: startsWith(matrix.platform, 'windows-')
         shell: powershell
         run: |
           Invoke-WebRequest -Uri "https://github.com/xiph/flac/archive/refs/tags/1.4.3.zip" -OutFile flac-src.zip
@@ -97,34 +103,34 @@ jobs:
           args: --target ${{ matrix.target }}
 
       - name: Package macOS artifact
-        if: matrix.platform == 'macos-14'
+        if: startsWith(matrix.platform, 'macos-')
         run: |
           BUNDLE_DIR="src-tauri/target/${{ matrix.target }}/release/bundle/macos"
           codesign --force --deep --sign - "$BUNDLE_DIR/Disc Xplorer.app"
           cd "$BUNDLE_DIR"
-          zip -r "$GITHUB_WORKSPACE/Disc Xplorer_macOS_ARM_v${{ steps.version.outputs.VERSION }}.zip" "Disc Xplorer.app"
+          zip -r "$GITHUB_WORKSPACE/Disc Xplorer_${{ matrix.artifact_suffix }}_v${{ steps.version.outputs.VERSION }}.zip" "Disc Xplorer.app"
 
       - name: Package Windows artifact
-        if: matrix.platform == 'windows-latest'
+        if: startsWith(matrix.platform, 'windows-')
         shell: powershell
         run: |
           $msi = Get-ChildItem -Recurse -Path "src-tauri/target/${{ matrix.target }}/release/bundle/msi" -Filter "*.msi" | Select-Object -First 1
-          Copy-Item $msi.FullName "Disc Xplorer_Windows_v${{ steps.version.outputs.VERSION }}.msi"
+          Copy-Item $msi.FullName "Disc Xplorer_${{ matrix.artifact_suffix }}_v${{ steps.version.outputs.VERSION }}.msi"
 
       - name: Package Linux artifact
-        if: matrix.platform == 'ubuntu-22.04'
+        if: startsWith(matrix.platform, 'ubuntu-')
         run: |
           APPIMAGE=$(find src-tauri/target/${{ matrix.target }}/release/bundle/appimage -name "*.AppImage" | head -1)
-          cp "$APPIMAGE" "Disc Xplorer_Linux_v${{ steps.version.outputs.VERSION }}.AppImage"
+          cp "$APPIMAGE" "Disc Xplorer_${{ matrix.artifact_suffix }}_v${{ steps.version.outputs.VERSION }}.AppImage"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: disc-xplorer-${{ matrix.artifact_suffix }}
           path: |
-            Disc Xplorer_macOS_ARM_*.zip
-            Disc Xplorer_Windows_*.msi
-            Disc Xplorer_Linux_*.AppImage
+            Disc Xplorer_${{ matrix.artifact_suffix }}_*.zip
+            Disc Xplorer_${{ matrix.artifact_suffix }}_*.msi
+            Disc Xplorer_${{ matrix.artifact_suffix }}_*.AppImage
 
   release:
     needs: build
@@ -156,5 +162,7 @@ jobs:
           draft: false
           files: |
             Disc Xplorer_macOS_ARM_*.zip
-            Disc Xplorer_Windows_*.msi
-            Disc Xplorer_Linux_*.AppImage
+            Disc Xplorer_Windows_x64_*.msi
+            Disc Xplorer_Windows_ARM_*.msi
+            Disc Xplorer_Linux_x64_*.AppImage
+            Disc Xplorer_Linux_ARM_*.AppImage

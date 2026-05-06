@@ -1,6 +1,9 @@
 import { useState, useCallback, useRef, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
+import { getCurrentWindow } from "@tauri-apps/api/window";
+
+const IS_SECTOR_VIEW_WINDOW = getCurrentWindow().label.startsWith("sv");
 import { open, save } from "@tauri-apps/plugin-dialog";
 import { SectorView } from "./SectorView";
 import "./App.css";
@@ -195,6 +198,14 @@ function App() {
   const [cdemuInstallOk, setCdemuInstallOk] = useState(false);
   const [emulatedDrives, setEmulatedDrives] = useState<EmulatedDrive[]>([]);
   const [emulating, setEmulating] = useState(false);
+  const [svParams, setSvParams] = useState<{ imagePath: string; lba: number } | null>(null);
+
+  useEffect(() => {
+    if (!IS_SECTOR_VIEW_WINDOW) return;
+    invoke<{ image_path: string; lba: number } | null>("claim_sector_view_params").then(p => {
+      if (p) setSvParams({ imagePath: p.image_path, lba: p.lba });
+    });
+  }, []);
 
   const dragRef = useRef<{ col: keyof ColWidths; startX: number; startWidth: number } | null>(null);
   const driveMenuRef = useRef<HTMLDivElement>(null);
@@ -861,6 +872,18 @@ function App() {
   ];
 
   const cols = viewMode === "audio" ? audioCols : fsCols;
+
+  if (IS_SECTOR_VIEW_WINDOW) {
+    if (!svParams) return null;
+    return (
+      <SectorView
+        imagePath={svParams.imagePath}
+        initialLba={svParams.lba}
+        onClose={() => getCurrentWindow().close()}
+        standalone
+      />
+    );
+  }
 
   return (
     <div className="app">

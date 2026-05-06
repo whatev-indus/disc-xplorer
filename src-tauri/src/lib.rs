@@ -2199,6 +2199,43 @@ pub struct EmulatedDrive {
 
 pub struct EmulatedDrives(pub Mutex<Vec<EmulatedDrive>>);
 
+// ── Detached Sector View window ───────────────────────────────────────────────
+
+#[derive(Serialize, Clone)]
+struct SectorViewInitParams {
+    image_path: String,
+    lba: u64,
+}
+
+struct SectorViewParamStore(Mutex<std::collections::HashMap<String, SectorViewInitParams>>);
+
+#[tauri::command]
+fn open_sector_view_window(
+    app: tauri::AppHandle,
+    store: tauri::State<'_, SectorViewParamStore>,
+    image_path: String,
+    lba: u64,
+) -> Result<(), String> {
+    let label = format!("sv{}", std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis());
+    store.0.lock().unwrap().insert(label.clone(), SectorViewInitParams { image_path, lba });
+    tauri::WebviewWindowBuilder::new(&app, label, tauri::WebviewUrl::App("index.html".into()))
+        .title("Sector View — Disc Xplorer")
+        .inner_size(920.0, 680.0)
+        .min_inner_size(600.0, 400.0)
+        .build()
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+fn claim_sector_view_params(
+    window: tauri::WebviewWindow,
+    store: tauri::State<'_, SectorViewParamStore>,
+) -> Option<SectorViewInitParams> {
+    store.0.lock().unwrap().remove(window.label())
+}
+
 #[tauri::command]
 fn emulate_drive(
     image_path: String,
@@ -3643,6 +3680,7 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .manage(MountedImages(Mutex::new(Vec::new())))
         .manage(EmulatedDrives(Mutex::new(Vec::new())))
+        .manage(SectorViewParamStore(Mutex::new(std::collections::HashMap::new())))
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::Destroyed = event {
                 let state = window.app_handle().state::<MountedImages>();
@@ -3665,7 +3703,8 @@ pub fn run() {
             check_cdemu_installed, install_cdemu,
             get_dpm_data, get_dpm_for_sector,
             get_cdi_tracks,
-            emulate_drive, eject_emulated_drive, list_emulated_drives
+            emulate_drive, eject_emulated_drive, list_emulated_drives,
+            open_sector_view_window, claim_sector_view_params
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

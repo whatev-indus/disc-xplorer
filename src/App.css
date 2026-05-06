@@ -596,13 +596,37 @@ th.col-save { text-align: center; }
   flex-direction: column;
 }
 
-.sv-modal .modal-header {
+.sv-modal .modal-header,
+.sv-standalone .modal-header {
   display: grid;
   grid-template-columns: 1fr auto 1fr;
   align-items: center;
 }
-.sv-modal .modal-title { grid-column: 2; text-align: center; }
-.sv-modal .modal-close { grid-column: 3; justify-self: end; }
+.sv-modal .modal-title,
+.sv-standalone .modal-title { grid-column: 2; text-align: center; }
+.sv-modal .modal-close,
+.sv-standalone .modal-close { grid-column: 3; justify-self: end; }
+
+.sv-detach {
+  grid-column: 1;
+  background: none;
+  border: none;
+  color: var(--text-muted);
+  cursor: pointer;
+  font-size: 14px;
+  padding: 2px 6px;
+  border-radius: 4px;
+  line-height: 1;
+}
+.sv-detach:hover { color: var(--text-bright); background: #3a3a3a; }
+
+.sv-standalone {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  background: var(--bg);
+  overflow: hidden;
+}
 
 .sv-nav {
   display: flex;

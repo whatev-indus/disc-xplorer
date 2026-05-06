@@ -29,6 +29,8 @@ fn syscmd(program: &str) -> Command {
     let mut cmd = Command::new(program);
     cmd.env_remove("LD_LIBRARY_PATH")
        .env_remove("LD_PRELOAD")
+       .env_remove("PYTHONHOME")
+       .env_remove("PYTHONPATH");
     cmd
 }
 

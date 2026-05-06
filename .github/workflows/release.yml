@@ -59,7 +59,8 @@ jobs:
             patchelf \
             libssl-dev \
             libgtk-3-dev \
-            libflac-dev
+            libflac-dev \
+            xdg-utils
 
       - name: Install macOS audio dependencies
         if: startsWith(matrix.platform, 'macos-')

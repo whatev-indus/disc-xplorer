@@ -855,6 +855,15 @@ th.col-save { text-align: center; }
 
 .statusbar-version {
   opacity: 0.75;
+  background: none;
+  border: none;
+  color: inherit;
+  font: inherit;
+  padding: 0;
+  cursor: pointer;
+}
+.statusbar-version:hover {
+  opacity: 1;
 }
 
 .statusbar-update {

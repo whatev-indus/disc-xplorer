@@ -217,12 +217,13 @@ function App() {
     invoke<string>("get_platform").then(setPlatform);
   }, []);
 
-  useEffect(() => {
+  async function checkForUpdate() {
     if (IS_SECTOR_VIEW_WINDOW) return;
-    invoke<string | null>("check_for_update")
-      .then(v => { if (v) setUpdateVersion(v); })
-      .catch(() => {});
-  }, []);
+    try {
+      const v = await invoke<string | null>("check_for_update");
+      if (v) setUpdateVersion(v);
+    } catch { /* ignore */ }
+  }
 
   useEffect(() => {
     if (platform !== "linux") return;
@@ -1278,7 +1279,7 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.`}</pre>
               v{updateVersion} available
             </a>
           )}
-          <span className="statusbar-version">v0.2.2</span>
+          <button className="statusbar-version" onClick={checkForUpdate} title="Check for updates">v0.2.2</button>
         </span>
       </div>
     </div>

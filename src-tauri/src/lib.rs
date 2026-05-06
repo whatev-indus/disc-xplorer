@@ -1905,6 +1905,8 @@ fn mount_disc_image(
 
             let load_out = Command::new("cdemu")
                 .args(["load", "any", &image_path])
+                .env_remove("PYTHONHOME")
+                .env_remove("PYTHONPATH")
                 .output()
                 .map_err(|e| if e.kind() == std::io::ErrorKind::NotFound {
                     "CDemu is not installed. Install the 'cdemu' package to mount this image type.".to_string()
@@ -1951,7 +1953,7 @@ fn mount_disc_image(
             };
 
             if mount_point.is_empty() {
-                let _ = Command::new("cdemu").args(["unload", &slot]).output();
+                let _ = Command::new("cdemu").args(["unload", &slot]).env_remove("PYTHONHOME").env_remove("PYTHONPATH").output();
                 return Err("CDemu: could not determine mount point".to_string());
             }
 
@@ -2065,6 +2067,8 @@ fn unmount_disc_image(
             let _ = Command::new("udisksctl").args(["unmount", "-b", dev]).output();
             let out = Command::new("cdemu")
                 .args(["unload", slot])
+                .env_remove("PYTHONHOME")
+                .env_remove("PYTHONPATH")
                 .output()
                 .map_err(|e| format!("cdemu unload failed: {e}"))?;
             if !out.status.success() {
@@ -2111,7 +2115,7 @@ fn detach_all(devices: &[String]) {
             let slot = parts.get(1).copied().unwrap_or("0");
             let dev = parts.get(2).copied().unwrap_or("");
             let _ = Command::new("udisksctl").args(["unmount", "-b", dev]).output();
-            let _ = Command::new("cdemu").args(["unload", slot]).output();
+            let _ = Command::new("cdemu").args(["unload", slot]).env_remove("PYTHONHOME").env_remove("PYTHONPATH").output();
         } else {
             let _ = Command::new("udisksctl").args(["unmount", "-b", device]).output();
             let _ = Command::new("udisksctl").args(["loop-delete", "-b", device]).output();
@@ -2250,6 +2254,8 @@ fn emulate_drive(
 
         let load_out = Command::new("cdemu")
             .args(["load", "any", &image_path])
+            .env_remove("PYTHONHOME")
+            .env_remove("PYTHONPATH")
             .output()
             .map_err(|e| if e.kind() == std::io::ErrorKind::NotFound {
                 "CDemu is not installed. Install the 'cdemu' package to emulate drives.".to_string()
@@ -2293,6 +2299,8 @@ fn eject_emulated_drive(
     {
         let out = Command::new("cdemu")
             .args(["unload", &slot])
+            .env_remove("PYTHONHOME")
+            .env_remove("PYTHONPATH")
             .output()
             .map_err(|e| format!("cdemu unload failed: {e}"))?;
 
@@ -3690,7 +3698,7 @@ pub fn run() {
                 {
                     let edrives = window.app_handle().state::<EmulatedDrives>();
                     for drive in edrives.0.lock().unwrap().iter() {
-                        let _ = Command::new("cdemu").args(["unload", &drive.slot]).output();
+                        let _ = Command::new("cdemu").args(["unload", &drive.slot]).env_remove("PYTHONHOME").env_remove("PYTHONPATH").output();
                     }
                 }
             }

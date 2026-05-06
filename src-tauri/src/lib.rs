@@ -24,6 +24,14 @@ mod threedo_filesystem;
 mod udf_filesystem;
 mod xdvdfs_filesystem;
 
+// Spawn a system tool without the AppImage's library/Python env overrides bleeding in.
+fn syscmd(program: &str) -> Command {
+    let mut cmd = Command::new(program);
+    cmd.env_remove("LD_LIBRARY_PATH")
+       .env_remove("LD_PRELOAD")
+    cmd
+}
+
 fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), String> {
     fs::create_dir_all(dst).map_err(|e| format!("Cannot create dir {:?}: {e}", dst))?;
     for entry in fs::read_dir(src).map_err(|e| format!("Cannot read dir {:?}: {e}", src))? {
@@ -1903,10 +1911,8 @@ fn mount_disc_image(
         if use_cdemu {
             let before = sr_devices();
 
-            let load_out = Command::new("cdemu")
+            let load_out = syscmd("cdemu")
                 .args(["load", "any", &image_path])
-                .env_remove("PYTHONHOME")
-                .env_remove("PYTHONPATH")
                 .output()
                 .map_err(|e| if e.kind() == std::io::ErrorKind::NotFound {
                     "CDemu is not installed. Install the 'cdemu' package to mount this image type.".to_string()
@@ -1935,7 +1941,7 @@ fn mount_disc_image(
                 .ok_or_else(|| "CDemu: virtual drive did not appear as /dev/srN".to_string())?;
 
             // Mount via udisksctl; fall back to lsblk if auto-mounted by desktop.
-            let mount_out = Command::new("udisksctl")
+            let mount_out = syscmd("udisksctl")
                 .args(["mount", "-b", &new_dev])
                 .output()
                 .map_err(|e| format!("udisksctl mount failed: {e}"))?;
@@ -1945,7 +1951,7 @@ fn mount_disc_image(
                 text.split(" at ").nth(1).unwrap_or("").trim().trim_end_matches('.').to_string()
             } else {
                 // Desktop environment may have auto-mounted it — query lsblk.
-                let lsblk = Command::new("lsblk")
+                let lsblk = syscmd("lsblk")
                     .args(["-no", "MOUNTPOINT", &new_dev])
                     .output()
                     .map_err(|e| format!("lsblk failed: {e}"))?;
@@ -1953,7 +1959,6 @@ fn mount_disc_image(
             };
 
             if mount_point.is_empty() {
-                let _ = Command::new("cdemu").args(["unload", &slot]).env_remove("PYTHONHOME").env_remove("PYTHONPATH").output();
                 return Err("CDemu: could not determine mount point".to_string());
             }
 
@@ -1962,7 +1967,7 @@ fn mount_disc_image(
             return Ok(MountResult { mount_point, device: device_key });
         }
 
-        let loop_out = Command::new("udisksctl")
+        let loop_out = syscmd("udisksctl")
             .args(["loop-setup", "-f", &image_path])
             .output()
             .map_err(|e| format!("udisksctl loop-setup failed: {e}"))?;
@@ -1984,7 +1989,7 @@ fn mount_disc_image(
             return Err(format!("Unexpected loop-setup output: {loop_text}"));
         }
 
-        let mount_out = Command::new("udisksctl")
+        let mount_out = syscmd("udisksctl")
             .args(["mount", "-b", &loop_device])
             .output()
             .map_err(|e| format!("udisksctl mount failed: {e}"))?;
@@ -2064,19 +2069,17 @@ fn unmount_disc_image(
             let _ = parts.next();
             let slot = parts.next().unwrap_or("0");
             let dev = parts.next().unwrap_or("");
-            let _ = Command::new("udisksctl").args(["unmount", "-b", dev]).output();
-            let out = Command::new("cdemu")
+            let _ = syscmd("udisksctl").args(["unmount", "-b", dev]).output();
+            let out = syscmd("cdemu")
                 .args(["unload", slot])
-                .env_remove("PYTHONHOME")
-                .env_remove("PYTHONPATH")
                 .output()
                 .map_err(|e| format!("cdemu unload failed: {e}"))?;
             if !out.status.success() {
                 return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
             }
         } else {
-            let _ = Command::new("udisksctl").args(["unmount", "-b", &device]).output();
-            let out = Command::new("udisksctl")
+            let _ = syscmd("udisksctl").args(["unmount", "-b", &device]).output();
+            let out = syscmd("udisksctl")
                 .args(["loop-delete", "-b", &device])
                 .output()
                 .map_err(|e| format!("udisksctl loop-delete failed: {e}"))?;
@@ -2114,11 +2117,10 @@ fn detach_all(devices: &[String]) {
             let parts: Vec<&str> = device.splitn(3, ':').collect();
             let slot = parts.get(1).copied().unwrap_or("0");
             let dev = parts.get(2).copied().unwrap_or("");
-            let _ = Command::new("udisksctl").args(["unmount", "-b", dev]).output();
-            let _ = Command::new("cdemu").args(["unload", slot]).env_remove("PYTHONHOME").env_remove("PYTHONPATH").output();
+            let _ = syscmd("udisksctl").args(["unmount", "-b", dev]).output();
         } else {
-            let _ = Command::new("udisksctl").args(["unmount", "-b", device]).output();
-            let _ = Command::new("udisksctl").args(["loop-delete", "-b", device]).output();
+            let _ = syscmd("udisksctl").args(["unmount", "-b", device]).output();
+            let _ = syscmd("udisksctl").args(["loop-delete", "-b", device]).output();
         }
     }
 }
@@ -2138,7 +2140,7 @@ fn get_platform() -> &'static str {
 fn check_cdemu_installed() -> bool {
     #[cfg(target_os = "linux")]
     {
-        Command::new("which").arg("cdemu")
+        syscmd("which").arg("cdemu")
             .output()
             .map(|o| o.status.success())
             .unwrap_or(false)
@@ -2157,7 +2159,7 @@ fn cdemu_install_args() -> Option<(String, Vec<String>)> {
         ("eopkg",   &["install", "cdemu-client"]),
     ];
     for (bin, args) in managers {
-        if Command::new("which").arg(bin).output().map(|o| o.status.success()).unwrap_or(false) {
+        if syscmd("which").arg(bin).output().map(|o| o.status.success()).unwrap_or(false) {
             return Some((bin.to_string(), args.iter().map(|s| s.to_string()).collect()));
         }
     }
@@ -2171,7 +2173,7 @@ fn install_cdemu() -> Result<String, String> {
         let (pm, args) = cdemu_install_args()
             .ok_or_else(|| "Could not detect a supported package manager. Install cdemu-client manually.".to_string())?;
 
-        let out = Command::new("pkexec")
+        let out = syscmd("pkexec")
             .arg(&pm)
             .args(&args)
             .output()
@@ -2252,10 +2254,8 @@ fn emulate_drive(
     {
         let before = sr_devices();
 
-        let load_out = Command::new("cdemu")
+        let load_out = syscmd("cdemu")
             .args(["load", "any", &image_path])
-            .env_remove("PYTHONHOME")
-            .env_remove("PYTHONPATH")
             .output()
             .map_err(|e| if e.kind() == std::io::ErrorKind::NotFound {
                 "CDemu is not installed. Install the 'cdemu' package to emulate drives.".to_string()
@@ -2297,10 +2297,8 @@ fn eject_emulated_drive(
 
     #[cfg(target_os = "linux")]
     {
-        let out = Command::new("cdemu")
+        let out = syscmd("cdemu")
             .args(["unload", &slot])
-            .env_remove("PYTHONHOME")
-            .env_remove("PYTHONPATH")
             .output()
             .map_err(|e| format!("cdemu unload failed: {e}"))?;
 
@@ -2918,7 +2916,7 @@ if ($drives -eq $null) { '[]' } else { $drives | ConvertTo-Json -Compress }
 fn list_optical_drives() -> Result<Vec<DriveInfo>, String> {
     // -d: list devices without children (avoids partition sub-entries).
     // SIZE is non-zero when media is present; 0B/empty when drive is empty.
-    let out = match Command::new("lsblk")
+    let out = match syscmd("lsblk")
         .args(["-J", "-d", "-o", "NAME,TYPE,LABEL,MOUNTPOINT,MODEL,SIZE"])
         .output()
     {
@@ -3018,7 +3016,7 @@ fn eject_disc(path: String) -> Result<(), String> {
             Ok(out) => {
                 let eject_err = String::from_utf8_lossy(&out.stderr).trim().to_string();
                 // Try udisksctl as fallback
-                match Command::new("udisksctl")
+                match syscmd("udisksctl")
                     .args(["eject", "-b", &path])
                     .output()
                 {
@@ -3032,7 +3030,7 @@ fn eject_disc(path: String) -> Result<(), String> {
             }
             Err(_) => {
                 // `eject` not installed — try udisksctl
-                match Command::new("udisksctl")
+                match syscmd("udisksctl")
                     .args(["eject", "-b", &path])
                     .output()
                 {
@@ -3698,7 +3696,6 @@ pub fn run() {
                 {
                     let edrives = window.app_handle().state::<EmulatedDrives>();
                     for drive in edrives.0.lock().unwrap().iter() {
-                        let _ = Command::new("cdemu").args(["unload", &drive.slot]).env_remove("PYTHONHOME").env_remove("PYTHONPATH").output();
                     }
                 }
             }

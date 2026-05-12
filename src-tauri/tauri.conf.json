@@ -34,14 +34,6 @@
     "active": true,
     "targets": "all",
     "externalBin": ["binaries/redumper"],
-    "resources": {
-      "lib/libc++.1.0.dylib": "lib/libc++.1.0.dylib",
-      "lib/libc++.1.dylib": "lib/libc++.1.dylib",
-      "lib/libc++abi.1.0.dylib": "lib/libc++abi.1.0.dylib",
-      "lib/libc++abi.1.dylib": "lib/libc++abi.1.dylib",
-      "lib/libunwind.1.0.dylib": "lib/libunwind.1.0.dylib",
-      "lib/libunwind.1.dylib": "lib/libunwind.1.dylib"
-    },
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",

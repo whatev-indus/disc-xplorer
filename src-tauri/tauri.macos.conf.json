@@ -1,0 +1,12 @@
+{
+  "bundle": {
+    "resources": {
+      "lib/libc++.1.0.dylib": "lib/libc++.1.0.dylib",
+      "lib/libc++.1.dylib": "lib/libc++.1.dylib",
+      "lib/libc++abi.1.0.dylib": "lib/libc++abi.1.0.dylib",
+      "lib/libc++abi.1.dylib": "lib/libc++abi.1.dylib",
+      "lib/libunwind.1.0.dylib": "lib/libunwind.1.0.dylib",
+      "lib/libunwind.1.dylib": "lib/libunwind.1.dylib"
+    }
+  }
+}

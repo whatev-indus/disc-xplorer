@@ -153,9 +153,10 @@ jobs:
         run: |
           BUNDLE_DIR="src-tauri/target/${{ matrix.target }}/release/bundle/macos"
           codesign --force --deep --sign - "$BUNDLE_DIR/Disc Xplorer.app"
-          TARNAME="Disc Xplorer_${{ matrix.artifact_suffix }}_v${{ steps.version.outputs.VERSION }}.app.tar.gz"
-          cp "$BUNDLE_DIR/Disc Xplorer.app.tar.gz" "$GITHUB_WORKSPACE/$TARNAME" 2>/dev/null || true
-          cp "$BUNDLE_DIR/Disc Xplorer.app.tar.gz.sig" "$GITHUB_WORKSPACE/" 2>/dev/null || true
+          cd "$BUNDLE_DIR"
+          zip -r "$GITHUB_WORKSPACE/Disc Xplorer_${{ matrix.artifact_suffix }}_v${{ steps.version.outputs.VERSION }}.zip" "Disc Xplorer.app"
+          cp "Disc Xplorer.app.tar.gz" "$GITHUB_WORKSPACE/" 2>/dev/null || true
+          cp "Disc Xplorer.app.tar.gz.sig" "$GITHUB_WORKSPACE/" 2>/dev/null || true
 
       - name: Package Windows artifact
         if: startsWith(matrix.platform, 'windows-')
@@ -185,12 +186,13 @@ jobs:
         with:
           name: disc-xplorer-${{ matrix.artifact_suffix }}
           path: |
-            Disc Xplorer_${{ matrix.artifact_suffix }}_*.app.tar.gz
+            Disc Xplorer_${{ matrix.artifact_suffix }}_*.zip
             Disc Xplorer_${{ matrix.artifact_suffix }}_*.msi
             Disc Xplorer_${{ matrix.artifact_suffix }}_*-setup.exe
             Disc Xplorer_${{ matrix.artifact_suffix }}_*.updater.zip
             Disc Xplorer_${{ matrix.artifact_suffix }}_*.updater.zip.sig
             Disc Xplorer_${{ matrix.artifact_suffix }}_*.AppImage
+            Disc Xplorer.app.tar.gz
             Disc Xplorer.app.tar.gz.sig
             *.AppImage.sig
 
@@ -292,7 +294,7 @@ jobs:
 
             | Platform | File |
             |----------|------|
-            | **macOS** (Apple Silicon) | `Disc Xplorer_macOS_ARM_*.app.tar.gz` |
+            | **macOS** (Apple Silicon) | `Disc Xplorer_macOS_ARM_*.zip` |
             | **Windows** (x64) | `Disc Xplorer_Windows_x64_*-setup.exe` or `.msi` |
             | **Windows** (ARM) | `Disc Xplorer_Windows_ARM_*-setup.exe` or `.msi` |
             | **Linux** (x64) | `Disc Xplorer_Linux_x64_*.AppImage` |
@@ -300,7 +302,8 @@ jobs:
 
             > **Windows users:** Download the `-setup.exe` (NSIS installer) or `.msi` — either installs the app. The `.updater.zip` files are used internally by the in-app auto-updater; you do not need to download them manually.
           files: |
-            Disc Xplorer_macOS_ARM_*.app.tar.gz
+            Disc Xplorer_macOS_ARM_*.zip
+            Disc Xplorer.app.tar.gz
             Disc Xplorer_Windows_x64_*-setup.exe
             Disc Xplorer_Windows_x64_*.msi
             Disc Xplorer_Windows_x64_*.updater.zip

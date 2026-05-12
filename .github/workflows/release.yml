@@ -263,6 +263,31 @@ jobs:
           prerelease: ${{ contains(steps.tag.outputs.TAG, '-beta') || contains(steps.tag.outputs.TAG, '-alpha') }}
           draft: false
           body: |
+            ## What's New in ${{ steps.tag.outputs.TAG }}
+
+            ### Sector View — Compare Mode
+            - Load a second disc image alongside the first for side-by-side byte-level comparison
+            - Differing bytes highlighted in amber across both panels simultaneously
+            - **Prev diff / Next diff** buttons to jump between differing sectors — fast bulk-read scanner (~1000× faster than per-sector for flat images like ISO/BIN)
+            - Diff count per sector ("N bytes differ") and whole-disc "Images identical" indicator after full scan
+            - Compare state (both images) preserved when popping out to a standalone window
+            - Sync and ECC bytes now shown in blue instead of hard-to-read dark grey
+
+            ### Disc Dump (redumper)
+            - **Create Subfolder** option in the dump modal — defaults to disc Volume ID, falls back to timestamp, fully editable
+            - After a successful dump, non-image files (logs, cue sheets, etc.) are automatically moved into a `logs/` subfolder
+
+            ### Toolbar UX
+            - **Open Disc Image** button becomes **Close Disc Image** when an image is loaded
+            - Buttons hide contextually: Open Image hidden when disc from drive is active; drive buttons hidden when image is loaded or mounted
+            - **Auto-select drive** when only one disc is inserted — skips the dropdown entirely
+            - Removed vertical separators between toolbar buttons
+
+            ### Other
+            - Updated app icon (v3)
+
+            ---
+
             ## Download
 
             | Platform | File |

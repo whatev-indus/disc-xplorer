@@ -251,8 +251,8 @@ function App() {
     } else {
       document.documentElement.setAttribute("data-theme", theme);
     }
-    const tauriTheme = theme === "light" ? "Light" : theme === "dark" ? "Dark" : null;
-    getCurrentWindow().setTheme(tauriTheme as "Light" | "Dark" | null).catch(() => {});
+    const tauriTheme = theme === "light" ? "light" : theme === "dark" ? "dark" : null;
+    getCurrentWindow().setTheme(tauriTheme).catch(() => {});
   }, [theme]);
 
   useEffect(() => {

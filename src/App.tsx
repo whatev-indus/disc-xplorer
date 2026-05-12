@@ -219,7 +219,7 @@ function App() {
 
   useEffect(() => {
     if (!IS_SECTOR_VIEW_WINDOW) return;
-    invoke<{ image_path: string; lba: number } | null>("claim_sector_view_params").then(p => {
+    invoke<{ image_path: string; lba: number; compare_image_path: string | null } | null>("claim_sector_view_params").then(p => {
       if (p) setSvParams({ imagePath: p.image_path, lba: p.lba, compareImagePath: p.compare_image_path });
     });
   }, []);
@@ -827,21 +827,6 @@ function App() {
     } catch (e) { setError(String(e)); }
   }
 
-  async function dumpDisc() {
-    if (!imagePath) return;
-    const destPath = await open({ directory: true, title: "Choose destination for disc dump" });
-    if (!destPath) return;
-    const discName = imageName.replace(/\.[^/.]+$/, "") || "disc";
-    try {
-      await invoke("save_directory", {
-        imagePath,
-        dirPath: "/",
-        destPath: `${destPath}/${discName}`,
-      });
-    } catch (e) {
-      setError(String(e));
-    }
-  }
 
   async function handleTreeToggle(nodePath: string) {
     if (!imagePath) return;

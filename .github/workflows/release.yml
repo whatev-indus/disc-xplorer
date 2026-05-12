@@ -163,14 +163,12 @@ jobs:
         shell: powershell
         run: |
           $NAME = "Disc Xplorer_${{ matrix.artifact_suffix }}_v${{ steps.version.outputs.VERSION }}"
-          $msi = Get-ChildItem -Recurse -Path "src-tauri/target/${{ matrix.target }}/release/bundle/msi" -Filter "*.msi" | Where-Object { $_.Name -notlike "*.msi.zip*" } | Select-Object -First 1
-          if ($msi) { Copy-Item $msi.FullName "$NAME.msi" }
           $nsis = Get-ChildItem -Recurse -Path "src-tauri/target/${{ matrix.target }}/release/bundle/nsis" -Filter "*.exe" | Where-Object { $_.Name -notlike "*.exe.zip*" } | Select-Object -First 1
-          if ($nsis) { Copy-Item $nsis.FullName "$NAME-setup.exe" }
-          $msiZip = Get-ChildItem -Recurse -Path "src-tauri/target/${{ matrix.target }}/release/bundle/msi" -Filter "*.msi.zip" | Select-Object -First 1
-          if ($msiZip) { Copy-Item $msiZip.FullName "$NAME.updater.zip" }
-          $msiSig = Get-ChildItem -Recurse -Path "src-tauri/target/${{ matrix.target }}/release/bundle/msi" -Filter "*.msi.zip.sig" | Select-Object -First 1
-          if ($msiSig) { Copy-Item $msiSig.FullName "$NAME.updater.zip.sig" }
+          if ($nsis) { Copy-Item $nsis.FullName "$NAME.exe" }
+          $nsisZip = Get-ChildItem -Recurse -Path "src-tauri/target/${{ matrix.target }}/release/bundle/nsis" -Filter "*.exe.zip" | Select-Object -First 1
+          if ($nsisZip) { Copy-Item $nsisZip.FullName "$NAME.updater.zip" }
+          $nsisSig = Get-ChildItem -Recurse -Path "src-tauri/target/${{ matrix.target }}/release/bundle/nsis" -Filter "*.exe.zip.sig" | Select-Object -First 1
+          if ($nsisSig) { Copy-Item $nsisSig.FullName "$NAME.updater.zip.sig" }
 
       - name: Package Linux artifact
         if: startsWith(matrix.platform, 'ubuntu-')
@@ -187,8 +185,7 @@ jobs:
           name: disc-xplorer-${{ matrix.artifact_suffix }}
           path: |
             Disc Xplorer_${{ matrix.artifact_suffix }}_*.zip
-            Disc Xplorer_${{ matrix.artifact_suffix }}_*.msi
-            Disc Xplorer_${{ matrix.artifact_suffix }}_*-setup.exe
+            Disc Xplorer_${{ matrix.artifact_suffix }}_*.exe
             Disc Xplorer_${{ matrix.artifact_suffix }}_*.updater.zip
             Disc Xplorer_${{ matrix.artifact_suffix }}_*.updater.zip.sig
             Disc Xplorer_${{ matrix.artifact_suffix }}_*.AppImage
@@ -234,7 +231,7 @@ jobs:
               ("linux-x86_64",    "*_amd64.AppImage.sig",          "Disc Xplorer_Linux_x64_*.AppImage"),
               ("linux-aarch64",   "*_aarch64.AppImage.sig",        "Disc Xplorer_Linux_ARM_*.AppImage"),
               ("windows-x86_64",  "*Windows_x64*.updater.zip.sig", "*Windows_x64*.updater.zip"),
-              ("windows-aarch64", "*Windows_ARM*.updater.zip.sig", "*Windows_ARM*.updater.zip"),
+              ("windows-aarch64", "*Windows_ARM*.updater.zip.sig",  "*Windows_ARM*.updater.zip"),
           ]
 
           platforms = {}
@@ -295,20 +292,18 @@ jobs:
             | Platform | File |
             |----------|------|
             | **macOS** (Apple Silicon) | `Disc Xplorer_macOS_ARM_*.zip` |
-            | **Windows** (x64) | `Disc Xplorer_Windows_x64_*-setup.exe` or `.msi` |
-            | **Windows** (ARM) | `Disc Xplorer_Windows_ARM_*-setup.exe` or `.msi` |
+            | **Windows** (x64) | `Disc Xplorer_Windows_x64_*.exe` |
+            | **Windows** (ARM) | `Disc Xplorer_Windows_ARM_*.exe` |
             | **Linux** (x64) | `Disc Xplorer_Linux_x64_*.AppImage` |
             | **Linux** (ARM) | `Disc Xplorer_Linux_ARM_*.AppImage` |
 
-            > **Windows users:** Download the `-setup.exe` (NSIS installer) or `.msi` — either installs the app. The `.updater.zip` files are used internally by the in-app auto-updater; you do not need to download them manually.
+            > **Windows users:** The `.updater.zip` files are used internally by the in-app auto-updater; you do not need to download them manually.
           files: |
             Disc Xplorer_macOS_ARM_*.zip
             Disc Xplorer.app.tar.gz
-            Disc Xplorer_Windows_x64_*-setup.exe
-            Disc Xplorer_Windows_x64_*.msi
+            Disc Xplorer_Windows_x64_*.exe
             Disc Xplorer_Windows_x64_*.updater.zip
-            Disc Xplorer_Windows_ARM_*-setup.exe
-            Disc Xplorer_Windows_ARM_*.msi
+            Disc Xplorer_Windows_ARM_*.exe
             Disc Xplorer_Windows_ARM_*.updater.zip
             Disc Xplorer_Linux_x64_*.AppImage
             Disc Xplorer_Linux_ARM_*.AppImage

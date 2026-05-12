@@ -16,6 +16,11 @@ src-tauri/binaries/*
 !src-tauri/binaries/.gitkeep
 src-tauri/lib/
 
+icon/old/
+icon/wip/
+logos/old/
+logos/wip/
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json

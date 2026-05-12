@@ -8,6 +8,8 @@ const IS_SECTOR_VIEW_WINDOW = getCurrentWindow().label.startsWith("sv");
 import { open, save } from "@tauri-apps/plugin-dialog";
 import { downloadDir } from "@tauri-apps/api/path";
 import { SectorView } from "./SectorView";
+import iconDark from "./assets/icon_dark.png";
+import iconLight from "./assets/icon_light.png";
 import "./App.css";
 
 interface DiscEntry {
@@ -189,6 +191,14 @@ function App() {
   const [colWidths, setColWidths] = useState<ColWidths>({
     name: 280, lba: 80, size: 110, modified: 160, save: 56,
   });
+  const [theme, setTheme] = useState<"system" | "light" | "dark">(() => {
+    const stored = localStorage.getItem("theme") as "system" | "light" | "dark" | null;
+    const t = stored || "system";
+    if (t !== "system") document.documentElement.setAttribute("data-theme", t);
+    return t;
+  });
+  const isDark = theme === "dark" || (theme === "system" && window.matchMedia("(prefers-color-scheme: dark)").matches);
+  const appIcon = isDark ? iconDark : iconLight;
   const [showSettings, setShowSettings] = useState(false);
   const [showLicenses, setShowLicenses] = useState(false);
   const [audioFormat, setAudioFormat] = useState<"wav" | "flac" | "mp3">("wav");
@@ -233,6 +243,17 @@ function App() {
   useEffect(() => {
     invoke<string>("get_platform").then(setPlatform);
   }, []);
+
+  useEffect(() => {
+    localStorage.setItem("theme", theme);
+    if (theme === "system") {
+      document.documentElement.removeAttribute("data-theme");
+    } else {
+      document.documentElement.setAttribute("data-theme", theme);
+    }
+    const tauriTheme = theme === "light" ? "Light" : theme === "dark" ? "Dark" : null;
+    getCurrentWindow().setTheme(tauriTheme as "Light" | "Dark" | null).catch(() => {});
+  }, [theme]);
 
   useEffect(() => {
     if (showSettings && !redumperVersion) {
@@ -1088,7 +1109,7 @@ function App() {
         <div className="toolbar-center">
           {!mountedDevice && !physicalDiscActive && (
             sourceImagePath
-              ? <button className="btn-open btn-open-secondary btn-unmount" onClick={ejectImage}>Close Disc Image</button>
+              ? <button className="btn-open btn-close-disc" onClick={ejectImage}>Close Disc Image</button>
               : <button className="btn-open" onClick={openImage}>Open Disc Image</button>
           )}
           {mountedDevice
@@ -1230,6 +1251,17 @@ function App() {
               {redumperVersion && (
                 <span className="settings-hint">{redumperVersion}</span>
               )}
+            </div>
+          </div>
+          <div className="settings-row">
+            <span className="settings-label">Theme</span>
+            <div className="settings-radio-group">
+              {(["system", "light", "dark"] as const).map(t => (
+                <label key={t} className="settings-radio">
+                  <input type="radio" name="theme" value={t} checked={theme === t} onChange={() => setTheme(t)} />
+                  {t.charAt(0).toUpperCase() + t.slice(1)}
+                </label>
+              ))}
             </div>
           </div>
           <div className="settings-row">
@@ -1540,8 +1572,7 @@ underlying format specifications.`}</pre>
 
           {!imagePath && viewMode !== "empty-drive" && (
             <div className="empty-state">
-              <div className="empty-icon">💿</div>
-              <p>Open a Disc Image or insert a Disc into a Disc Drive to explore its contents.</p>
+              <img src={appIcon} className="empty-icon" style={{ width: 240, height: 240, opacity: 0.85, marginBottom: 24, borderRadius: 40 }} />
             </div>
           )}
 
@@ -1627,7 +1658,7 @@ underlying format specifications.`}</pre>
         <span className="statusbar-left">{statusText}</span>
         <a className="statusbar-brand" href="https://sites.google.com/view/whateverindustries/home" target="_blank" rel="noreferrer">whatev.indus</a>
         <span className="statusbar-right">
-          <button className="statusbar-version" onClick={checkForUpdate} title="Check for updates">v0.3.0</button>
+          <button className="statusbar-version" onClick={checkForUpdate} title="Check for updates">v0.3.1</button>
         </span>
       </div>
     </div>

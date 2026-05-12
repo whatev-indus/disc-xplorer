@@ -85,6 +85,49 @@ jobs:
           $libPath = Split-Path (Resolve-Path "flac-build\$libFile")
           echo "LIB=$libPath;$env:LIB" >> $env:GITHUB_ENV
 
+      - name: Download redumper
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG=$(gh api repos/superg/redumper/releases/latest --jq '.tag_name')
+          echo "REDUMPER_VERSION=$TAG" >> "$GITHUB_ENV"
+          case "${{ matrix.target }}" in
+            aarch64-apple-darwin)      ASSET="redumper-${TAG}-macos-arm64.zip"   ;;
+            x86_64-pc-windows-msvc)    ASSET="redumper-${TAG}-windows-x64.zip"   ;;
+            aarch64-pc-windows-msvc)   ASSET="redumper-${TAG}-windows-arm64.zip" ;;
+            x86_64-unknown-linux-gnu)  ASSET="redumper-${TAG}-linux-x64.zip"     ;;
+            aarch64-unknown-linux-gnu) ASSET="redumper-${TAG}-linux-arm64.zip"   ;;
+          esac
+          curl -fsSL "https://github.com/superg/redumper/releases/download/${TAG}/${ASSET}" -o redumper.zip
+          unzip -o redumper.zip -d redumper-extracted/
+          mkdir -p src-tauri/binaries
+          case "${{ matrix.target }}" in
+            *windows*)
+              BIN=$(find redumper-extracted -name "redumper.exe" | head -1)
+              cp "$BIN" "src-tauri/binaries/redumper-${{ matrix.target }}.exe"
+              ;;
+            *apple*)
+              BIN=$(find redumper-extracted -type f -name "redumper" | head -1)
+              DEST="src-tauri/binaries/redumper-${{ matrix.target }}"
+              cp "$BIN" "$DEST"
+              chmod +x "$DEST"
+              # Copy bundled dylibs — the binary uses @executable_path/../lib rpath
+              # and the app sets DYLD_LIBRARY_PATH to the resource lib dir at runtime
+              LIB_SRC=$(find redumper-extracted -type d -name "lib" | head -1)
+              mkdir -p src-tauri/lib
+              cp "$LIB_SRC"/libc++.1.0.dylib "$LIB_SRC"/libc++abi.1.0.dylib "$LIB_SRC"/libunwind.1.0.dylib src-tauri/lib/
+              ln -sf libc++.1.0.dylib src-tauri/lib/libc++.1.dylib
+              ln -sf libc++abi.1.0.dylib src-tauri/lib/libc++abi.1.dylib
+              ln -sf libunwind.1.0.dylib src-tauri/lib/libunwind.1.dylib
+              ;;
+            *)
+              BIN=$(find redumper-extracted -type f -name "redumper" | head -1)
+              cp "$BIN" "src-tauri/binaries/redumper-${{ matrix.target }}"
+              chmod +x "src-tauri/binaries/redumper-${{ matrix.target }}"
+              ;;
+          esac
+
       - name: Install frontend dependencies
         run: npm install
 
@@ -110,23 +153,23 @@ jobs:
         run: |
           BUNDLE_DIR="src-tauri/target/${{ matrix.target }}/release/bundle/macos"
           codesign --force --deep --sign - "$BUNDLE_DIR/Disc Xplorer.app"
-          cd "$BUNDLE_DIR"
-          zip -r "$GITHUB_WORKSPACE/Disc Xplorer_${{ matrix.artifact_suffix }}_v${{ steps.version.outputs.VERSION }}.zip" "Disc Xplorer.app"
-          # Copy update bundle (app.tar.gz + sig) to workspace root
-          cp "Disc Xplorer.app.tar.gz" "$GITHUB_WORKSPACE/" 2>/dev/null || true
-          cp "Disc Xplorer.app.tar.gz.sig" "$GITHUB_WORKSPACE/" 2>/dev/null || true
+          TARNAME="Disc Xplorer_${{ matrix.artifact_suffix }}_v${{ steps.version.outputs.VERSION }}.app.tar.gz"
+          cp "$BUNDLE_DIR/Disc Xplorer.app.tar.gz" "$GITHUB_WORKSPACE/$TARNAME" 2>/dev/null || true
+          cp "$BUNDLE_DIR/Disc Xplorer.app.tar.gz.sig" "$GITHUB_WORKSPACE/" 2>/dev/null || true
 
       - name: Package Windows artifact
         if: startsWith(matrix.platform, 'windows-')
         shell: powershell
         run: |
-          $msi = Get-ChildItem -Recurse -Path "src-tauri/target/${{ matrix.target }}/release/bundle/msi" -Filter "*.msi" | Select-Object -First 1
-          Copy-Item $msi.FullName "Disc Xplorer_${{ matrix.artifact_suffix }}_v${{ steps.version.outputs.VERSION }}.msi"
-          # Copy update bundle (.msi.zip + sig) to workspace root
+          $NAME = "Disc Xplorer_${{ matrix.artifact_suffix }}_v${{ steps.version.outputs.VERSION }}"
+          $msi = Get-ChildItem -Recurse -Path "src-tauri/target/${{ matrix.target }}/release/bundle/msi" -Filter "*.msi" | Where-Object { $_.Name -notlike "*.msi.zip*" } | Select-Object -First 1
+          if ($msi) { Copy-Item $msi.FullName "$NAME.msi" }
+          $nsis = Get-ChildItem -Recurse -Path "src-tauri/target/${{ matrix.target }}/release/bundle/nsis" -Filter "*.exe" | Where-Object { $_.Name -notlike "*.exe.zip*" } | Select-Object -First 1
+          if ($nsis) { Copy-Item $nsis.FullName "$NAME-setup.exe" }
           $msiZip = Get-ChildItem -Recurse -Path "src-tauri/target/${{ matrix.target }}/release/bundle/msi" -Filter "*.msi.zip" | Select-Object -First 1
-          if ($msiZip) { Copy-Item $msiZip.FullName . }
+          if ($msiZip) { Copy-Item $msiZip.FullName "$NAME.updater.zip" }
           $msiSig = Get-ChildItem -Recurse -Path "src-tauri/target/${{ matrix.target }}/release/bundle/msi" -Filter "*.msi.zip.sig" | Select-Object -First 1
-          if ($msiSig) { Copy-Item $msiSig.FullName . }
+          if ($msiSig) { Copy-Item $msiSig.FullName "$NAME.updater.zip.sig" }
 
       - name: Package Linux artifact
         if: startsWith(matrix.platform, 'ubuntu-')
@@ -142,14 +185,14 @@ jobs:
         with:
           name: disc-xplorer-${{ matrix.artifact_suffix }}
           path: |
-            Disc Xplorer_${{ matrix.artifact_suffix }}_*.zip
+            Disc Xplorer_${{ matrix.artifact_suffix }}_*.app.tar.gz
             Disc Xplorer_${{ matrix.artifact_suffix }}_*.msi
+            Disc Xplorer_${{ matrix.artifact_suffix }}_*-setup.exe
+            Disc Xplorer_${{ matrix.artifact_suffix }}_*.updater.zip
+            Disc Xplorer_${{ matrix.artifact_suffix }}_*.updater.zip.sig
             Disc Xplorer_${{ matrix.artifact_suffix }}_*.AppImage
-            Disc Xplorer.app.tar.gz
             Disc Xplorer.app.tar.gz.sig
             *.AppImage.sig
-            *.msi.zip
-            *.msi.zip.sig
 
   release:
     needs: build
@@ -185,11 +228,11 @@ jobs:
           base_url = f"https://github.com/whatev-indus/disc-xplorer/releases/download/{tag}"
 
           candidates = [
-              ("darwin-aarch64",  "*.app.tar.gz.sig",        "*.app.tar.gz"),
-              ("linux-x86_64",    "*_amd64.AppImage.sig",    "Disc Xplorer_Linux_x64_*.AppImage"),
-              ("linux-aarch64",   "*_aarch64.AppImage.sig",  "Disc Xplorer_Linux_ARM_*.AppImage"),
-              ("windows-x86_64",  "*x64*.msi.zip.sig",       "*x64*.msi.zip"),
-              ("windows-aarch64", "*arm64*.msi.zip.sig",     "*arm64*.msi.zip"),
+              ("darwin-aarch64",  "*.app.tar.gz.sig",              "*.app.tar.gz"),
+              ("linux-x86_64",    "*_amd64.AppImage.sig",          "Disc Xplorer_Linux_x64_*.AppImage"),
+              ("linux-aarch64",   "*_aarch64.AppImage.sig",        "Disc Xplorer_Linux_ARM_*.AppImage"),
+              ("windows-x86_64",  "*Windows_x64*.updater.zip.sig", "*Windows_x64*.updater.zip"),
+              ("windows-aarch64", "*Windows_ARM*.updater.zip.sig", "*Windows_ARM*.updater.zip"),
           ]
 
           platforms = {}
@@ -219,12 +262,26 @@ jobs:
           name: Disc Xplorer ${{ steps.tag.outputs.TAG }}
           prerelease: ${{ contains(steps.tag.outputs.TAG, '-beta') || contains(steps.tag.outputs.TAG, '-alpha') }}
           draft: false
+          body: |
+            ## Download
+
+            | Platform | File |
+            |----------|------|
+            | **macOS** (Apple Silicon) | `Disc Xplorer_macOS_ARM_*.app.tar.gz` |
+            | **Windows** (x64) | `Disc Xplorer_Windows_x64_*-setup.exe` or `.msi` |
+            | **Windows** (ARM) | `Disc Xplorer_Windows_ARM_*-setup.exe` or `.msi` |
+            | **Linux** (x64) | `Disc Xplorer_Linux_x64_*.AppImage` |
+            | **Linux** (ARM) | `Disc Xplorer_Linux_ARM_*.AppImage` |
+
+            > **Windows users:** Download the `-setup.exe` (NSIS installer) or `.msi` — either installs the app. The `.updater.zip` files are used internally by the in-app auto-updater; you do not need to download them manually.
           files: |
-            Disc Xplorer_macOS_ARM_*.zip
+            Disc Xplorer_macOS_ARM_*.app.tar.gz
+            Disc Xplorer_Windows_x64_*-setup.exe
             Disc Xplorer_Windows_x64_*.msi
+            Disc Xplorer_Windows_x64_*.updater.zip
+            Disc Xplorer_Windows_ARM_*-setup.exe
             Disc Xplorer_Windows_ARM_*.msi
+            Disc Xplorer_Windows_ARM_*.updater.zip
             Disc Xplorer_Linux_x64_*.AppImage
             Disc Xplorer_Linux_ARM_*.AppImage
-            Disc Xplorer.app.tar.gz
-            *.msi.zip
             latest.json

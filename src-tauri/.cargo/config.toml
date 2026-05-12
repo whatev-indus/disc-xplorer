@@ -1,5 +1,5 @@
 [build]
-target-dir = "/tmp/disc-xplorer-target"
+target-dir = "/private/tmp/disc-xplorer-target"
 
 [target.aarch64-apple-darwin]
 rustflags = ["-L", "/opt/homebrew/lib"]

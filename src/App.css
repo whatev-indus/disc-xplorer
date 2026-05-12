@@ -23,6 +23,7 @@
 html, body, #root {
   height: 100%;
   overflow: hidden;
+  background: var(--bg);
 }
 
 body {
@@ -368,6 +369,8 @@ body {
 }
 .drive-menu-loading:hover,
 .drive-menu-empty:hover { background: transparent; }
+.drive-menu-item--disabled { opacity: 0.45; cursor: default; }
+.drive-menu-item--disabled:hover { background: transparent; }
 
 .drive-item-name { font-size: 12px; color: var(--text-bright); }
 .drive-item-disc { font-size: 11px; color: var(--text-muted); }
@@ -596,6 +599,10 @@ th.col-save { text-align: center; }
   flex-direction: column;
 }
 
+.sv-modal--compare {
+  width: min(1340px, 96vw);
+}
+
 .sv-modal .modal-header,
 .sv-standalone .modal-header {
   display: grid;
@@ -604,11 +611,15 @@ th.col-save { text-align: center; }
 }
 .sv-modal .modal-title,
 .sv-standalone .modal-title { grid-column: 2; text-align: center; }
-.sv-modal .modal-close,
-.sv-standalone .modal-close { grid-column: 3; justify-self: end; }
+.sv-header-btns {
+  grid-column: 3;
+  justify-self: end;
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
 
 .sv-detach {
-  grid-column: 1;
   background: none;
   border: none;
   color: var(--text-muted);
@@ -700,6 +711,18 @@ th.col-save { text-align: center; }
 }
 .sv-btn:hover:not(:disabled) { background: #3a3a3a; color: var(--text-bright); }
 .sv-btn:disabled { opacity: 0.3; cursor: default; }
+
+.sv-export-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 12px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-panel);
+}
+.sv-export-label { font-size: 11px; color: var(--text-dim); }
+.sv-export-btn { padding: 3px 10px; font-size: 11px; }
+.sv-export-status { font-size: 11px; color: var(--text-dim); margin-left: 4px; }
 
 .sv-info {
   display: flex;
@@ -795,16 +818,79 @@ th.col-save { text-align: center; }
 
 /* Byte colour classes — hb-alt must come first so field colours override it */
 .hb-alt  { color: #8a8a8a; }
-.hb-sync { color: #4a4a4a; }
+.hb-sync { color: #1e4d72; }
 .hb-hdr  { color: #9cdcfe; }
 .hb-sub  { color: #dcdcaa; }
-.hb-ecc  { color: #505050; }
+.hb-ecc  { color: #1a4560; }
+.hb-diff { color: #e5a550 !important; }
 
 /* Swatch colours must match */
-.sv-swatch.hb-sync { background: #4a4a4a; }
+.sv-swatch.hb-sync { background: #1e4d72; }
 .sv-swatch.hb-hdr  { background: #9cdcfe; }
 .sv-swatch.hb-sub  { background: #dcdcaa; }
-.sv-swatch.hb-ecc  { background: #505050; }
+.sv-swatch.hb-ecc  { background: #1a4560; }
+.sv-swatch.hb-diff { background: #e5a550; }
+
+/* ── Compare ── */
+
+.sv-compare-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 12px;
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+  background: var(--bg-toolbar);
+}
+
+.sv-compare-path {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-dim);
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sv-compare-diff-count {
+  font-size: 11px;
+  margin-left: auto;
+}
+
+.sv-hex-area--compare {
+  display: flex;
+  flex-direction: row;
+  gap: 0;
+  overflow: auto;
+}
+
+.sv-hex-panel {
+  display: flex;
+  flex-direction: column;
+  min-width: 560px;
+  flex: 1;
+  overflow-x: auto;
+  overflow-y: hidden;
+  background: var(--bg);
+}
+
+.sv-hex-panel + .sv-hex-panel {
+  border-left: 1px solid var(--border);
+}
+
+.sv-hex-panel-label {
+  font-size: 10px;
+  font-family: var(--font-mono);
+  color: var(--text-dim);
+  padding: 4px 12px 2px;
+  background: var(--bg-toolbar);
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 
 /* ── Error ── */
 
@@ -923,3 +1009,29 @@ th.col-save { text-align: center; }
   opacity: 0.7;
 }
 .btn-eject-emulated:hover { opacity: 1; }
+.settings-hint { font-size: 11px; color: var(--text-muted); }
+.settings-input {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--text);
+  font-size: 13px;
+  padding: 4px 8px;
+  width: 260px;
+  font-family: var(--font-mono);
+}
+.settings-input:disabled { opacity: 0.5; }
+.dump-log {
+  background: #111;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: #aaa;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  height: 200px;
+  overflow-y: auto;
+  padding: 8px;
+  white-space: pre-wrap;
+  word-break: break-all;
+  margin-top: 4px;
+}

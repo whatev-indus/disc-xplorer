@@ -1,10 +1,12 @@
 import { useState, useCallback, useRef, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 
 const IS_SECTOR_VIEW_WINDOW = getCurrentWindow().label.startsWith("sv");
 import { open, save } from "@tauri-apps/plugin-dialog";
+import { downloadDir } from "@tauri-apps/api/path";
 import { SectorView } from "./SectorView";
 import "./App.css";
 
@@ -30,6 +32,7 @@ interface AudioEntry {
 interface DriveInfo {
   name: string;
   device_path: string;
+  raw_device_path: string;
   has_disc: boolean;
   volume_name: string | null;
   mount_point: string | null;
@@ -98,7 +101,7 @@ function isMountable(path: string, platform: string): boolean {
   if (platform === "linux" && (
     lower.endsWith(".cue") || lower.endsWith(".mds") || lower.endsWith(".mdx") ||
     lower.endsWith(".nrg") || lower.endsWith(".ccd") ||
-    lower.endsWith(".toc") || lower.endsWith(".b6t") || lower.endsWith(".bwt") ||
+    lower.endsWith(".toc") || lower.endsWith(".b5t") || lower.endsWith(".b6t") || lower.endsWith(".bwt") ||
     lower.endsWith(".c2d") || lower.endsWith(".pdi") || lower.endsWith(".gi") ||
     lower.endsWith(".daa")
   )) return true;
@@ -181,6 +184,7 @@ function App() {
   const [physicalDiscActive, setPhysicalDiscActive] = useState(false);
   const [drives, setDrives] = useState<DriveInfo[]>([]);
   const [showDriveMenu, setShowDriveMenu] = useState(false);
+  const [showDumpDriveMenu, setShowDumpDriveMenu] = useState(false);
   const [loadingDrives, setLoadingDrives] = useState(false);
   const [colWidths, setColWidths] = useState<ColWidths>({
     name: 280, lba: 80, size: 110, modified: 160, save: 56,
@@ -189,6 +193,18 @@ function App() {
   const [showLicenses, setShowLicenses] = useState(false);
   const [audioFormat, setAudioFormat] = useState<"wav" | "flac" | "mp3">("wav");
   const [defaultDownloadPath, setDefaultDownloadPath] = useState<string>("");
+  const [wiiuKeyPath, setWiiuKeyPath] = useState<string>("");
+  const [redumperSource, setRedumperSource] = useState<"internal" | "external">("internal");
+  const [redumperExternalPath, setRedumperExternalPath] = useState<string>("");
+  const [redumperVersion, setRedumperVersion] = useState<string>("");
+  const [showDumpModal, setShowDumpModal] = useState(false);
+  const [dumpDrive, setDumpDrive] = useState<string>("");
+  const [dumpOutputPath, setDumpOutputPath] = useState<string>("");
+  const [dumpCreateSubfolder, setDumpCreateSubfolder] = useState(true);
+  const [dumpSubfolder, setDumpSubfolder] = useState<string>("");
+  const [dumpRunning, setDumpRunning] = useState(false);
+  const [dumpLog, setDumpLog] = useState<string[]>([]);
+  const dumpLogRef = useRef<HTMLDivElement>(null);
   const [isDragOver, setIsDragOver] = useState(false);
   const [showSectorView, setShowSectorView] = useState(false);
   const [platform, setPlatform] = useState<string>("");
@@ -198,24 +214,31 @@ function App() {
   const [cdemuInstallOk, setCdemuInstallOk] = useState(false);
   const [emulatedDrives, setEmulatedDrives] = useState<EmulatedDrive[]>([]);
   const [emulating, setEmulating] = useState(false);
-  const [svParams, setSvParams] = useState<{ imagePath: string; lba: number } | null>(null);
+  const [svParams, setSvParams] = useState<{ imagePath: string; lba: number; compareImagePath?: string | null } | null>(null);
   const [updateVersion, setUpdateVersion] = useState<string | null>(null);
 
   useEffect(() => {
     if (!IS_SECTOR_VIEW_WINDOW) return;
     invoke<{ image_path: string; lba: number } | null>("claim_sector_view_params").then(p => {
-      if (p) setSvParams({ imagePath: p.image_path, lba: p.lba });
+      if (p) setSvParams({ imagePath: p.image_path, lba: p.lba, compareImagePath: p.compare_image_path });
     });
   }, []);
 
   const dragRef = useRef<{ col: keyof ColWidths; startX: number; startWidth: number } | null>(null);
   const driveMenuRef = useRef<HTMLDivElement>(null);
+  const dumpDriveMenuRef = useRef<HTMLDivElement>(null);
   const settingsRef = useRef<HTMLDivElement>(null);
   const settingsGearRef = useRef<HTMLButtonElement>(null);
 
   useEffect(() => {
     invoke<string>("get_platform").then(setPlatform);
   }, []);
+
+  useEffect(() => {
+    if (showSettings && !redumperVersion) {
+      fetchRedumperVersion(redumperSource, redumperExternalPath);
+    }
+  }, [showSettings]);
 
   async function checkForUpdate() {
     if (IS_SECTOR_VIEW_WINDOW) return;
@@ -241,6 +264,16 @@ function App() {
     if (showDriveMenu) document.addEventListener("mousedown", handleOutsideClick);
     return () => document.removeEventListener("mousedown", handleOutsideClick);
   }, [showDriveMenu]);
+
+  useEffect(() => {
+    function handleOutsideClick(e: MouseEvent) {
+      if (dumpDriveMenuRef.current && !dumpDriveMenuRef.current.contains(e.target as Node)) {
+        setShowDumpDriveMenu(false);
+      }
+    }
+    if (showDumpDriveMenu) document.addEventListener("mousedown", handleOutsideClick);
+    return () => document.removeEventListener("mousedown", handleOutsideClick);
+  }, [showDumpDriveMenu]);
 
   useEffect(() => {
     function handleOutsideClick(e: MouseEvent) {
@@ -273,6 +306,97 @@ function App() {
   async function pickDownloadLocation() {
     const dir = await open({ directory: true, title: "Set Default Download Location" });
     if (dir) setDefaultDownloadPath(dir as string);
+  }
+
+  async function pickWiiuKey() {
+    const file = await open({ filters: [{ name: "Key file", extensions: ["key"] }], title: "Select Wii U Common Key File" });
+    if (file) {
+      const path = file as string;
+      setWiiuKeyPath(path);
+      invoke("set_wiiu_key_path", { path });
+    }
+  }
+
+  async function fetchRedumperVersion(source: string, externalPath: string) {
+    setRedumperVersion("Checking…");
+    try {
+      const v = await invoke<string>("get_redumper_version", {
+        source,
+        externalPath: externalPath || null,
+      });
+      setRedumperVersion(v);
+    } catch (e) {
+      setRedumperVersion(source === "internal" ? "Not bundled (dev build)" : String(e));
+    }
+  }
+
+  async function pickRedumperExternal() {
+    const file = await open({ title: "Select redumper binary" });
+    if (file) {
+      const path = file as string;
+      setRedumperExternalPath(path);
+      fetchRedumperVersion("external", path);
+    }
+  }
+
+  function handleRedumperSourceChange(src: "internal" | "external") {
+    setRedumperSource(src);
+    fetchRedumperVersion(src, src === "internal" ? "" : redumperExternalPath);
+  }
+
+  async function pickDumpOutput() {
+    const dir = await open({ directory: true, title: "Choose dump output folder" });
+    if (dir) setDumpOutputPath(dir as string);
+  }
+
+  async function startDump() {
+    if (!dumpDrive || !dumpOutputPath) return;
+    const effectivePath = dumpCreateSubfolder && dumpSubfolder
+      ? `${dumpOutputPath}/${dumpSubfolder}`
+      : dumpOutputPath;
+    setDumpRunning(true);
+    setDumpLog([]);
+    const isProgress = (s: string) => /^\|\s*\[/.test(s) || /\d+\s*\/\s*\d+/.test(s);
+    const unlistenLog = await listen<string>("redumper-log", (e) => {
+      const line = e.payload.replace(/\r/g, "");
+      if (!line) return;
+      setDumpLog(prev => {
+        const last = prev[prev.length - 1] ?? "";
+        if (isProgress(line) && isProgress(last)) return [...prev.slice(0, -1), line];
+        return [...prev, line];
+      });
+      setTimeout(() => { dumpLogRef.current?.scrollTo(0, dumpLogRef.current.scrollHeight); }, 0);
+    });
+    const unlistenDone = await listen<number>("redumper-done", async (e) => {
+      const code = e.payload;
+      if (code === 0) {
+        try {
+          await invoke("organize_dump_logs", { dir: effectivePath });
+        } catch { /* non-fatal */ }
+      }
+      setDumpLog(prev => [...prev, code === 0 ? "\nCompleted successfully." : `\nFailed (exit code ${code})`]);
+      setDumpRunning(false);
+      unlistenLog();
+      unlistenDone();
+    });
+    try {
+      await invoke("start_redumper_dump", {
+        drive: dumpDrive,
+        outputPath: effectivePath,
+        source: redumperSource,
+        externalPath: redumperExternalPath || null,
+      });
+    } catch (e) {
+      setDumpLog(prev => [...prev, `Error: ${String(e)}`]);
+      setDumpRunning(false);
+      unlistenLog();
+      unlistenDone();
+    }
+  }
+
+  async function cancelDump() {
+    try { await invoke("cancel_redumper_dump"); } catch { /* ignore */ }
+    setDumpRunning(false);
   }
 
   function onResizeStart(col: keyof ColWidths, e: React.MouseEvent) {
@@ -462,7 +586,7 @@ function App() {
 
   async function openImage() {
     const selected = await open({
-      filters: [{ name: "Disc Images", extensions: ["iso", "img", "chd", "cue", "mds", "mdx", "nrg", "ccd", "cdi", "gdi", "toc", "b6t", "bwt", "c2d", "pdi", "gi", "daa", "cso", "ciso", "ecm"] }],
+      filters: [{ name: "Disc Images", extensions: ["iso", "img", "chd", "cue", "mds", "mdx", "nrg", "ccd", "cdi", "gdi", "toc", "b5t", "b6t", "bwt", "c2d", "pdi", "gi", "daa", "cso", "ciso", "ecm", "wbfs", "wux", "wud", "sdram", "sbram", "aif", "cif", "uif", "skeleton", "skeleton.zst", "iso.zst", "img.zst"] }],
     });
     if (!selected) return;
     await openImageAtPath(selected as string);
@@ -473,7 +597,7 @@ function App() {
     getCurrentWebview().onDragDropEvent((event) => {
       if (event.payload.type === "drop") {
         setIsDragOver(false);
-        const supported = ["iso", "img", "chd", "cue", "mds", "mdx", "nrg", "ccd", "cdi", "gdi", "toc", "b6t", "bwt", "c2d", "pdi", "gi", "daa", "cso", "ciso", "ecm"];
+        const supported = ["iso", "img", "chd", "cue", "mds", "mdx", "nrg", "ccd", "cdi", "gdi", "toc", "b5t", "b6t", "bwt", "c2d", "pdi", "gi", "daa", "cso", "ciso", "ecm", "wbfs", "wux", "wud", "sdram", "sbram", "aif", "cif", "uif", "skeleton", "skeleton.zst", "iso.zst", "img.zst"];
         const path = event.payload.paths.find((p) =>
           supported.some((ext) => p.toLowerCase().endsWith(`.${ext}`))
         );
@@ -521,10 +645,25 @@ function App() {
     // Keep the disc image open in the app after unmounting.
   }
 
+  function ejectImage() {
+    setSourceImagePath(null);
+    setImagePath(null);
+    setImageName("");
+    setEntries([]);
+    setAudioEntries([]);
+    setTree([]);
+    setCueTracks([]);
+    setActiveFilesystem("");
+    setSidebarPath("");
+    setError(null);
+    setStatusText("No disc loaded");
+    setViewMode("filesystem");
+  }
+
   function isCdemuEmulatable(path: string): boolean {
     const lower = path.toLowerCase();
     return [".iso", ".img", ".cue", ".mds", ".mdx", ".nrg", ".ccd", ".cdi",
-            ".gdi", ".toc", ".b6t", ".bwt", ".c2d", ".pdi", ".gi", ".daa"]
+            ".gdi", ".toc", ".b5t", ".b6t", ".bwt", ".c2d", ".pdi", ".gi", ".daa"]
       .some(ext => lower.endsWith(ext));
   }
 
@@ -578,16 +717,54 @@ function App() {
 
   async function openDisc() {
     setLoadingDrives(true);
-    setShowDriveMenu(true);
     try {
       const result = await invoke<DriveInfo[]>("list_optical_drives");
       setDrives(result);
+      const withDisc = result.filter(d => d.has_disc);
+      if (withDisc.length === 1) {
+        selectDrive(withDisc[0]);
+      } else {
+        setShowDriveMenu(true);
+      }
     } catch (e) {
       setError(String(e));
-      setShowDriveMenu(false);
     } finally {
       setLoadingDrives(false);
     }
+  }
+
+  async function openDumpDriveMenu() {
+    setLoadingDrives(true);
+    try {
+      const result = await invoke<DriveInfo[]>("list_optical_drives");
+      setDrives(result);
+      const withDisc = result.filter(d => d.has_disc);
+      if (withDisc.length === 1) {
+        selectDumpDrive(withDisc[0]);
+      } else {
+        setShowDumpDriveMenu(true);
+      }
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setLoadingDrives(false);
+    }
+  }
+
+  async function selectDumpDrive(drive: DriveInfo) {
+    setShowDumpDriveMenu(false);
+    setDumpDrive(drive.raw_device_path);
+    if (!dumpOutputPath) setDumpOutputPath(await downloadDir());
+    if (drive.volume_name) {
+      setDumpSubfolder(drive.volume_name);
+    } else {
+      const now = new Date();
+      const pad = (n: number, w = 2) => String(n).padStart(w, "0");
+      const yy = String(now.getFullYear()).slice(2);
+      const ts = `${yy}${pad(now.getMonth()+1)}${pad(now.getDate())}_${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`;
+      setDumpSubfolder(`dump_${ts}_${drive.raw_device_path}`);
+    }
+    setShowDumpModal(true);
   }
 
   async function selectDrive(drive: DriveInfo) {
@@ -614,6 +791,7 @@ function App() {
     setImagePath(drive.device_path);
     setImageName(name);
     setEmptyDriveName(null);
+    setDumpDrive(drive.raw_device_path);
 
     const rootNode: TreeNode = { name, path: "/", nodeType: "root", children: null, expanded: false };
     setTree([rootNode]);
@@ -903,6 +1081,7 @@ function App() {
       <SectorView
         imagePath={svParams.imagePath}
         initialLba={svParams.lba}
+        initialCompareImagePath={svParams.compareImagePath}
         onClose={() => getCurrentWindow().close()}
         standalone
       />
@@ -922,7 +1101,11 @@ function App() {
       <div className="toolbar">
         <div className="toolbar-left" />
         <div className="toolbar-center">
-          <button className="btn-open" onClick={openImage}>Open Disc Image</button>
+          {!mountedDevice && !physicalDiscActive && (
+            sourceImagePath
+              ? <button className="btn-open btn-open-secondary btn-unmount" onClick={ejectImage}>Close Disc Image</button>
+              : <button className="btn-open" onClick={openImage}>Open Disc Image</button>
+          )}
           {mountedDevice
             ? <button className="btn-open btn-open-secondary btn-unmount" onClick={unmountImage}>Unmount Disc Image</button>
             : sourceImagePath && isMountable(sourceImagePath, platform)
@@ -934,14 +1117,13 @@ function App() {
               {emulating ? "Loading…" : "Emulate Drive"}
             </button>
           )}
-          <div className="separator" />
           <div className="drive-menu-wrap" ref={driveMenuRef}>
             {physicalDiscActive
               ? <>
                   <button className="btn-open btn-open-secondary btn-unmount" onClick={unmountPhysicalDisc}>Unmount Disc</button>
                   <button className="btn-open btn-open-secondary btn-unmount btn-eject" onClick={ejectDisc} title="Eject disc">⏏</button>
                 </>
-              : <button className="btn-open btn-open-secondary" onClick={openDisc}>Open Disc from Drive ▾</button>
+              : !sourceImagePath && <button className="btn-open btn-open-secondary" onClick={openDisc}>Open Disc from Drive</button>
             }
             {showDriveMenu && (
               <div className="drive-menu">
@@ -962,37 +1144,54 @@ function App() {
               </div>
             )}
           </div>
-          {mountedDevice && (
-            <>
-              <div className="separator" />
-              <button className="btn-dump" onClick={dumpDisc} title="Extract all disc contents to a folder">
-                Dump Disc
-              </button>
-            </>
-          )}
+          {!mountedDevice && !physicalDiscActive && !sourceImagePath && <div className="drive-menu-wrap" ref={dumpDriveMenuRef}>
+            <button className="btn-open btn-open-secondary" onClick={openDumpDriveMenu}>Dump Disc from Drive</button>
+            {showDumpDriveMenu && (
+              <div className="drive-menu">
+                {loadingDrives ? (
+                  <div className="drive-menu-item drive-menu-loading">Detecting drives…</div>
+                ) : drives.length === 0 ? (
+                  <div className="drive-menu-item drive-menu-empty">No optical drives found</div>
+                ) : (
+                  drives.map((d) => (
+                    <div key={d.raw_device_path} className={`drive-menu-item${!d.has_disc ? " drive-menu-item--disabled" : ""}`}
+                         onClick={() => d.has_disc && selectDumpDrive(d)}>
+                      <span className="drive-item-name">{d.name}</span>
+                      <span className={`drive-item-disc ${d.has_disc ? "" : "drive-item-disc--empty"}`}>
+                        {d.has_disc ? (d.volume_name || "Disc inserted") : "No disc"}
+                      </span>
+                    </div>
+                  ))
+                )}
+              </div>
+            )}
+          </div>}
+
           {imagePath && viewMode === "filesystem" && (
             <>
-              <div className="separator" />
               <button className="btn-dump" onClick={dumpContents} title="Extract all disc contents to a folder">
                 Extract All Contents
               </button>
+              {physicalDiscActive && !mountedDevice && (
+                <button className="btn-dump" onClick={async () => { if (!dumpOutputPath) setDumpOutputPath(await downloadDir()); setShowDumpModal(true); }} title="Dump disc to image files">
+                  Dump Disc
+                </button>
+              )}
             </>
           )}
           {imagePath && viewMode === "filesystem" && (
-            <>
-              <div className="separator" />
-              <button className="btn-icon" onClick={navigateUp} disabled={currentPath === "/"} title="Up">↑</button>
-            </>
+            <button className="btn-icon" onClick={navigateUp} disabled={currentPath === "/"} title="Up">↑</button>
           )}
           {sourceImagePath && (
-            <>
-              <div className="separator" />
-              <button className="btn-icon" onClick={() => setShowSectorView(true)} title="Sector View">🔍</button>
-            </>
+            <button className="btn-icon" onClick={() => setShowSectorView(true)} title="Sector View">🔍</button>
           )}
         </div>
         <div className="toolbar-right">
-          <a className="btn-prerelease" href="https://github.com/whatev-indus/disc-xplorer/releases" target="_blank" rel="noreferrer">PRE-RELEASE BUILD! CLICK TO UPDATE</a>
+          {updateVersion && (
+            <a className="btn-prerelease" href="https://github.com/whatev-indus/disc-xplorer/releases" target="_blank" rel="noreferrer">
+              Update Available — v{updateVersion}
+            </a>
+          )}
           <button ref={settingsGearRef} className="btn-settings" title="Settings" onClick={() => setShowSettings(s => !s)}>⚙</button>
         </div>
       </div>
@@ -1013,6 +1212,39 @@ function App() {
                   .{fmt}
                 </label>
               ))}
+            </div>
+          </div>
+          <div className="settings-row">
+            <span className="settings-label">Wii U Common Key</span>
+            <button className="btn-open btn-open-secondary settings-path-btn" onClick={pickWiiuKey}>
+              {wiiuKeyPath ? wiiuKeyPath.split("/").pop() : "Not set — click to choose"}
+            </button>
+          </div>
+          <div className="settings-row">
+            <span className="settings-label">Disc Dumper (redumper)</span>
+            <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+              <div className="settings-radio-group">
+                {(["internal", "external"] as const).map(src => (
+                  <label key={src} className="settings-radio">
+                    <input
+                      type="radio"
+                      name="redumperSource"
+                      value={src}
+                      checked={redumperSource === src}
+                      onChange={() => handleRedumperSourceChange(src)}
+                    />
+                    {src.charAt(0).toUpperCase() + src.slice(1)}
+                  </label>
+                ))}
+              </div>
+              {redumperSource === "external" && (
+                <button className="btn-open btn-open-secondary settings-path-btn" onClick={pickRedumperExternal}>
+                  {redumperExternalPath || "Not set — click to choose"}
+                </button>
+              )}
+              {redumperVersion && (
+                <span className="settings-hint">{redumperVersion}</span>
+              )}
             </div>
           </div>
           <div className="settings-row">
@@ -1130,6 +1362,44 @@ DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
 THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
 (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.`}</pre>
+
+              <p className="license-package" style={{ marginTop: "16px" }}>redumper — disc dumping engine</p>
+              <pre className="license-text">{`Copyright (c) 2020-2024 superg and contributors.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are met:
+
+1. Redistributions of source code must retain the above copyright notice,
+   this list of conditions and the following disclaimer.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER BE LIABLE FOR ANY
+DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+POSSIBILITY OF SUCH DAMAGE.
+
+Source: https://github.com/superg/redumper`}</pre>
+              <p className="license-package" style={{ marginTop: "16px" }}>SabreTools.Serialization — format documentation reference</p>
+              <pre className="license-text">{`Copyright (c) Matt Nadareski and contributors.
+Licensed under the GNU Lesser General Public License (LGPL) v2.1 or later.
+https://github.com/SabreTools/SabreTools.Serialization
+
+Format documentation for disc image and filesystem types in this project
+was cross-referenced against SabreTools.Serialization. No source code
+from this project is included; all parsers are independent implementations
+derived from the underlying format specifications.`}</pre>
+
+              <p className="license-package" style={{ marginTop: "16px" }}>Aaru (Aaru.Filesystems, Aaru.Images) — format documentation reference</p>
+              <pre className="license-text">{`Copyright (c) Natalia Portillo and contributors.
+Licensed under the GNU Lesser General Public License (LGPL) v2.1 or later.
+https://github.com/aaru-dps/Aaru
+
+Format documentation for disc image and filesystem types in this project
+was cross-referenced against Aaru. No source code from this project is
+included; all parsers are independent implementations derived from the
+underlying format specifications.`}</pre>
             </div>
           </div>
         </div>
@@ -1158,6 +1428,82 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.`}</pre>
               <button className="btn-open btn-open-secondary" onClick={() => setShowCdemuPrompt(false)}>
                 {cdemuInstallOk ? "Done" : "Not Now"}
               </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {showDumpModal && (
+        <div className="modal-overlay" onClick={() => { if (!dumpRunning) setShowDumpModal(false); }}>
+          <div className="modal" onClick={e => e.stopPropagation()}>
+            <div className="modal-header">
+              <span className="modal-title">Dump Disc</span>
+              {!dumpRunning && (
+                <button className="modal-close" onClick={() => setShowDumpModal(false)}>✕</button>
+              )}
+            </div>
+            <div className="modal-body">
+              <div className="settings-row" style={{ marginBottom: 8 }}>
+                <span className="settings-label">Drive / Device</span>
+                <input
+                  className="settings-input"
+                  value={dumpDrive}
+                  onChange={e => setDumpDrive(e.target.value)}
+                  placeholder={platform === "windows" ? "D:" : "/dev/sr0"}
+                  disabled={dumpRunning}
+                />
+              </div>
+              <div className="settings-row" style={{ marginBottom: 8 }}>
+                <span className="settings-label">Output Folder</span>
+                <button
+                  className="btn-open btn-open-secondary settings-path-btn"
+                  onClick={pickDumpOutput}
+                  disabled={dumpRunning}
+                >
+                  {dumpOutputPath || "Not set — click to choose"}
+                </button>
+              </div>
+              <div className="settings-row" style={{ marginBottom: 8 }}>
+                <span className="settings-label">
+                  <label style={{ display: "flex", alignItems: "center", gap: 6, cursor: "pointer" }}>
+                    <input
+                      type="checkbox"
+                      checked={dumpCreateSubfolder}
+                      onChange={e => setDumpCreateSubfolder(e.target.checked)}
+                      disabled={dumpRunning}
+                    />
+                    Create Subfolder
+                  </label>
+                </span>
+                <input
+                  className="settings-input"
+                  value={dumpSubfolder}
+                  onChange={e => setDumpSubfolder(e.target.value)}
+                  disabled={!dumpCreateSubfolder || dumpRunning}
+                  style={{ opacity: dumpCreateSubfolder ? 1 : 0.4 }}
+                />
+              </div>
+              {dumpLog.length > 0 && (
+                <div className="dump-log" ref={dumpLogRef}>
+                  {dumpLog.map((line, i) => <div key={i}>{line}</div>)}
+                </div>
+              )}
+            </div>
+            <div className="modal-footer">
+              {dumpRunning ? (
+                <button className="btn-open btn-open-secondary" onClick={cancelDump}>Cancel</button>
+              ) : (
+                <>
+                  <button
+                    className="btn-open"
+                    onClick={startDump}
+                    disabled={!dumpDrive || !dumpOutputPath || (dumpCreateSubfolder && !dumpSubfolder)}
+                  >
+                    Start Dump
+                  </button>
+                  <button className="btn-open btn-open-secondary" onClick={() => setShowDumpModal(false)}>Close</button>
+                </>
+              )}
             </div>
           </div>
         </div>
@@ -1211,7 +1557,6 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.`}</pre>
             <div className="empty-state">
               <div className="empty-icon">💿</div>
               <p>Open a Disc Image or insert a Disc into a Disc Drive to explore its contents.</p>
-              <button onClick={openImage}>Open Disc Image</button>
             </div>
           )}
 
@@ -1297,12 +1642,7 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.`}</pre>
         <span className="statusbar-left">{statusText}</span>
         <a className="statusbar-brand" href="https://sites.google.com/view/whateverindustries/home" target="_blank" rel="noreferrer">whatev.indus</a>
         <span className="statusbar-right">
-          {updateVersion && (
-            <a className="statusbar-update" href="https://github.com/whatev-indus/disc-xplorer/releases" target="_blank" rel="noreferrer">
-              v{updateVersion} available
-            </a>
-          )}
-          <button className="statusbar-version" onClick={checkForUpdate} title="Check for updates">v0.2.2</button>
+          <button className="statusbar-version" onClick={checkForUpdate} title="Check for updates">v0.3.0</button>
         </span>
       </div>
     </div>

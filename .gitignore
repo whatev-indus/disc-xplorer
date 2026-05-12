@@ -12,6 +12,9 @@ dist
 dist-ssr
 *.local
 src-tauri/target/
+src-tauri/binaries/*
+!src-tauri/binaries/.gitkeep
+src-tauri/lib/
 
 # Editor directories and files
 .vscode/*

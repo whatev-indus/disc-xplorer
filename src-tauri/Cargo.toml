@@ -1,6 +1,6 @@
 [package]
 name = "tauri-app"
-version = "0.2.2"
+version = "0.2.3"
 description = "A Tauri App"
 authors = ["you"]
 edition = "2021"
@@ -22,6 +22,7 @@ tauri = { version = "2", features = [] }
 tauri-plugin-opener = "2"
 tauri-plugin-dialog = "2"
 tauri-plugin-updater = "2"
+tauri-plugin-shell = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 iso9660 = { path = "crates/iso9660" }
@@ -30,4 +31,7 @@ flac-bound = { version = "0.3", features = ["libflac-nobuild"], default-features
 mp3lame-encoder = "0.2.4"
 chd = { version = "0.3", features = ["cd_full"] }
 flate2 = "1"
+zstd = "0.13"
+aes = "0.8"
+cbc = "0.1"
 

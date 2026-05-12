@@ -23,6 +23,14 @@ Runs on macOS, Windows, and Linux.
 | CHD | MAME/RetroArch compressed hard-disk images |
 | CSO / CISO | Compressed ISO (PSP / PS2) |
 | ECM | Error Code Modeler compressed images |
+| WBFS | Wii Backup File System container images |
+| WUX | Wii U compressed disc images (deduplicating) |
+| BlindWrite 5/6 | BlindWrite BWT/B5T/B6T images (with B5I/B6I data file) |
+| UIF | MagicISO compressed images |
+| CIF | Easy CD Creator disc images |
+| AaruFormat | Aaru / DiscImageChef .aif images |
+| Redumper | Redumper raw DVD/BD dumps (.sdram/.sbram) |
+| Skeleton / Skeleton.zst | Disc images with zeroed file data; zstd-compressed variant supported |
 | CDR / DMG | macOS disc images (mount via hdiutil) |
 
 ### Filesystems
@@ -67,6 +75,7 @@ Runs on macOS, Windows, and Linux.
 - Lists connected optical drives
 - Open and browse physical discs the same way as image files
 - Eject drives from the UI
+- **Dump Disc** — create accurate disc image dumps via [redumper](https://github.com/superg/redumper) (bundled automatically; switch to an external binary in Settings)
 
 ### General
 
@@ -114,3 +123,17 @@ npm run tauri dev
 
 Audio export (MP3/FLAC) uses FFmpeg libraries bundled at build time.
 FFmpeg is licensed under the GNU LGPL v2.1 or later — see https://ffmpeg.org/legal.html.
+
+---
+
+## Third-party references
+
+Format documentation for several disc image and filesystem types was cross-referenced against the following projects. The native Rust parsers in this project are independent implementations derived from the underlying format specifications; no third-party code is included.
+
+**[SabreTools.Serialization](https://github.com/SabreTools/SabreTools.Serialization)** — Matt Nadareski. Well-documented C# parsers for a wide range of disc image and filesystem formats. Licensed LGPL-2.1.
+
+**[Aaru](https://github.com/aaru-dps/Aaru)** (`Aaru.Filesystems`, `Aaru.Images`) — Natalia Portillo. Comprehensive disc image preservation tool with format plugins for 70+ filesystem and 76+ image types. Licensed LGPL-2.1 (library components).
+
+**[Wiimms ISO Tools](https://github.com/Wiimm/wiimms-iso-tools)** — Wiimm. Reference implementation for the WBFS container format (`libwbfs`). Licensed GPL-2.0.
+
+**[redumper](https://github.com/superg/redumper)** — superg and contributors. Accurate optical disc dumping tool (C2 error correction, subchannel preservation). Bundled as a sidecar binary; BSD-1-Clause licensed. The redumper binary is not modified; it is downloaded from the official releases at build time and bundled for convenience.

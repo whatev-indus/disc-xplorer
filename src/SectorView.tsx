@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { open, save } from "@tauri-apps/plugin-dialog";
 
 interface SectorData {
   bytes: number[];
@@ -85,8 +86,12 @@ function byteClass(idx: number, layout: Layout): string {
   return 'hb-ecc';
 }
 
-function HexRow({ offset, bytes, layout }: { offset: number; bytes: number[]; layout: Layout }) {
-  // Build row as array of strings and elements — parent uses white-space:pre
+function HexRow({ offset, bytes, layout, diffMask }: {
+  offset: number;
+  bytes: number[];
+  layout: Layout;
+  diffMask?: boolean[];
+}) {
   const content: (string | React.JSX.Element)[] = [];
 
   content.push(<span key="addr" className="hex-addr">{offset.toString(16).padStart(4, '0').toUpperCase()}</span>);
@@ -96,8 +101,9 @@ function HexRow({ offset, bytes, layout }: { offset: number; bytes: number[]; la
     if (j === 8) content.push('  '); else if (j > 0) content.push(' ');
     const cls = byteClass(offset + j, layout);
     const alt = j % 2 === 1 ? 'hb-alt' : '';
+    const diff = diffMask?.[j] ? ' hb-diff' : '';
     const hex = bytes[j].toString(16).padStart(2, '0').toUpperCase();
-    content.push(<span key={`h${j}`} className={`hb ${alt} ${cls}`}>{hex}</span>);
+    content.push(<span key={`h${j}`} className={`hb ${alt} ${cls}${diff}`}>{hex}</span>);
   }
 
   content.push('  |');
@@ -106,8 +112,9 @@ function HexRow({ offset, bytes, layout }: { offset: number; bytes: number[]; la
     const b = bytes[j];
     const cls = byteClass(offset + j, layout);
     const alt = j % 2 === 1 ? 'hb-alt' : '';
+    const diff = diffMask?.[j] ? ' hb-diff' : '';
     const ch = b >= 0x20 && b < 0x7F ? String.fromCharCode(b) : '.';
-    content.push(<span key={`a${j}`} className={`ha ${alt} ${cls}`}>{ch}</span>);
+    content.push(<span key={`a${j}`} className={`ha ${alt} ${cls}${diff}`}>{ch}</span>);
   }
 
   content.push('|');
@@ -115,42 +122,67 @@ function HexRow({ offset, bytes, layout }: { offset: number; bytes: number[]; la
   return <div className="hex-row">{content}</div>;
 }
 
-function HexDump({ data, rawMode }: { data: SectorData; rawMode: boolean }) {
+function HexDump({ data, rawMode, compareBytes }: {
+  data: SectorData;
+  rawMode: boolean;
+  compareBytes?: number[];
+}) {
   const layout = getLayout(data.bytes, data.sector_size);
   const slice = (!rawMode && layout.hasCd)
     ? data.bytes.slice(layout.dataStart, layout.dataEnd)
     : data.bytes;
-  // Raw mode: offsets are absolute within the sector (0000 = sync start).
-  // User mode: offsets start at 0000 relative to user data start.
-  const baseOffset = 0;
+  const compareSlice = compareBytes
+    ? ((!rawMode && layout.hasCd) ? compareBytes.slice(layout.dataStart, layout.dataEnd) : compareBytes)
+    : undefined;
+
   const rows: React.JSX.Element[] = [];
   for (let i = 0; i < slice.length; i += 16) {
+    const rowBytes = slice.slice(i, i + 16);
+    const rowCmp = compareSlice?.slice(i, i + 16);
+    const diffMask = rowCmp ? rowBytes.map((b, j) => rowCmp[j] !== undefined && b !== rowCmp[j]) : undefined;
     rows.push(
       <HexRow
-        key={baseOffset + i}
-        offset={baseOffset + i}
-        bytes={slice.slice(i, i + 16)}
+        key={i}
+        offset={i}
+        bytes={rowBytes}
         layout={rawMode ? layout : { ...layout, hasCd: false }}
+        diffMask={diffMask}
       />
     );
   }
   return <div className="sv-hex-dump">{rows}</div>;
 }
 
-export function SectorView({ imagePath, onClose, standalone, initialLba }: {
+export function SectorView({ imagePath, onClose, standalone, initialLba, initialCompareImagePath }: {
   imagePath: string;
   onClose: () => void;
   standalone?: boolean;
   initialLba?: number;
+  initialCompareImagePath?: string | null;
 }) {
   const [data, setData] = useState<SectorData | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [inputVal, setInputVal] = useState("0");
+  const [showExport, setShowExport] = useState(false);
+  const [exportStart, setExportStart] = useState("0");
+  const [exportEnd, setExportEnd] = useState("0");
+  const [exporting, setExporting] = useState(false);
+  const [exportStatus, setExportStatus] = useState<string | null>(null);
   // discOffset: constant difference between disc-absolute LBA (from sync header MSF)
   // and track-relative LBA. Null until we've seen a sector with a valid CD sync header.
   const [discOffset, setDiscOffset] = useState<number | null>(null);
   const [discMode, setDiscMode] = useState(false);
   const [rawMode, setRawMode] = useState(true);
+
+  // Compare state
+  const [showCompare, setShowCompare] = useState(!!initialCompareImagePath);
+  const [compareImagePath, setCompareImagePath] = useState<string | null>(initialCompareImagePath ?? null);
+  const [compareData, setCompareData] = useState<SectorData | null>(null);
+  const [scanning, setScanning] = useState(false);
+  const [noPrevDiff, setNoPrevDiff] = useState(false);
+  const [noNextDiff, setNoNextDiff] = useState(false);
+  const [allIdentical, setAllIdentical] = useState(false);
+
   const inputRef = useRef<HTMLInputElement>(null);
 
   const toDisplay = (trackLba: number) =>
@@ -170,6 +202,17 @@ export function SectorView({ imagePath, onClose, standalone, initialLba }: {
       setError(String(e));
     }
   }, [imagePath]);
+
+  // Load compare sector whenever the primary LBA or compare image changes.
+  useEffect(() => {
+    if (!compareImagePath || data === null) {
+      setCompareData(null);
+      return;
+    }
+    invoke<SectorData>("read_sector", { imagePath: compareImagePath, lba: data.lba })
+      .then(setCompareData)
+      .catch(() => setCompareData(null));
+  }, [compareImagePath, data?.lba]);
 
   // Sync input field whenever data or mode changes.
   useEffect(() => {
@@ -211,6 +254,91 @@ export function SectorView({ imagePath, onClose, standalone, initialLba }: {
     return () => window.removeEventListener('keydown', onKey);
   }, [lba, total]);
 
+  function openExport() {
+    setExportStart(String(toDisplay(lba)));
+    setExportEnd(String(toDisplay(lba)));
+    setExportStatus(null);
+    setShowExport(true);
+  }
+
+  async function runExport() {
+    const start = parseInt(exportStart, 10);
+    const end = parseInt(exportEnd, 10);
+    if (isNaN(start) || isNaN(end) || end < start) {
+      setExportStatus("Invalid range");
+      return;
+    }
+    const destPath = await save({ defaultPath: "sectors.bin" });
+    if (!destPath) return;
+    setExporting(true);
+    setExportStatus(null);
+    try {
+      const written = await invoke<number>("export_sector_range", {
+        imagePath,
+        lbaStart: toTrack(start),
+        lbaEnd: toTrack(end),
+        destPath,
+      });
+      setExportStatus(`Exported ${written} sector${written === 1 ? "" : "s"}`);
+    } catch (e) {
+      setExportStatus(String(e));
+    } finally {
+      setExporting(false);
+    }
+  }
+
+  async function jumpToDiff(forward: boolean, fromLba = lba, inclusive = false) {
+    if (!compareImagePath || scanning) return;
+    setScanning(true);
+    try {
+      const found = await invoke<number | null>("find_diff_sector", {
+        imagePathA: imagePath,
+        imagePathB: compareImagePath,
+        fromLba,
+        forward,
+        inclusive,
+      });
+      if (found !== null) {
+        setNoPrevDiff(false);
+        setNoNextDiff(false);
+        setAllIdentical(false);
+        go(found);
+      } else {
+        if (forward) {
+          setNoNextDiff(true);
+          if (noPrevDiff || lba === 0) setAllIdentical(true);
+        } else {
+          setNoPrevDiff(true);
+          if (noNextDiff || lba >= total - 1) setAllIdentical(true);
+        }
+      }
+    } finally {
+      setScanning(false);
+    }
+  }
+
+  async function pickCompareImage() {
+    const path = await open({
+      title: "Open disc image to compare",
+      filters: [{ name: "Disc Images", extensions: ["iso","img","chd","cue","mds","mdx","nrg","ccd","cdi","gdi","toc","b5t","b6t","bwt","c2d","pdi","gi","daa","cso","ciso","ecm","wbfs","wux","wud","sdram","sbram","aif","cif","uif","skeleton","skeleton.zst","iso.zst","img.zst"] }],
+    });
+    if (path && typeof path === "string") {
+      setCompareImagePath(path);
+      setCompareData(null);
+      setNoPrevDiff(false);
+      setNoNextDiff(false);
+      setAllIdentical(false);
+    }
+  }
+
+  function clearCompare() {
+    setCompareImagePath(null);
+    setCompareData(null);
+    setNoPrevDiff(false);
+    setNoNextDiff(false);
+    setAllIdentical(false);
+  }
+
   const disc = data ? parseDisc(data.bytes, data.sector_size) : null;
   const layout = data ? getLayout(data.bytes, data.sector_size) : null;
   const isLastSector = total > 0 && lba >= total - 1;
@@ -218,22 +346,27 @@ export function SectorView({ imagePath, onClose, standalone, initialLba }: {
   const minInput = discMode && discOffset !== null ? discOffset : 0;
   const maxInput = discMode && discOffset !== null ? total - 1 + discOffset : total > 0 ? total - 1 : 0;
 
+  const compareFileName = compareImagePath?.split(/[/\\]/).pop() ?? null;
+
   const inner = (
-    <div className={standalone ? "sv-standalone" : "modal sv-modal"} onClick={e => e.stopPropagation()}>
+    <div className={`${standalone ? "sv-standalone" : `modal sv-modal${compareData ? " sv-modal--compare" : ""}`}`} onClick={e => e.stopPropagation()}>
 
       <div className="modal-header">
-        {!standalone && (
-          <button
-            className="sv-detach"
-            title="Open in separate window"
-            onClick={async () => {
-              await invoke("open_sector_view_window", { imagePath, lba: data?.lba ?? 0 });
-              onClose();
-            }}
-          >⧉</button>
-        )}
+        <span />
         <span className="modal-title">Sector View</span>
-        <button className="modal-close" onClick={onClose}>✕</button>
+        <div className="sv-header-btns">
+          {!standalone && (
+            <button
+              className="sv-detach"
+              title="Open in separate window"
+              onClick={async () => {
+                await invoke("open_sector_view_window", { imagePath, lba: data?.lba ?? 0, compareImagePath: compareImagePath ?? null });
+                onClose();
+              }}
+            >⧉</button>
+          )}
+          <button className="modal-close" onClick={onClose}>✕</button>
+        </div>
       </div>
 
         <div className="sv-nav">
@@ -278,7 +411,86 @@ export function SectorView({ imagePath, onClose, standalone, initialLba }: {
               {rawMode ? `${data!.sector_size}B raw` : `${layout.dataEnd - layout.dataStart}B user`}
             </button>
           )}
+          <button
+            className={`sv-mode-toggle ${showExport ? 'sv-mode-toggle--active' : ''}`}
+            onClick={() => showExport ? setShowExport(false) : openExport()}
+            disabled={!data}
+            title="Export sector range as raw binary"
+          >Export range</button>
+          <button
+            className={`sv-mode-toggle ${showCompare ? 'sv-mode-toggle--active' : ''}`}
+            onClick={() => { setShowCompare(s => !s); }}
+            disabled={!data}
+            title="Compare with a second disc image"
+          >Compare</button>
         </div>
+
+        {showExport && (
+          <div className="sv-export-row">
+            <span className="sv-export-label">LBA</span>
+            <input
+              className="sv-input"
+              type="number"
+              min={minInput}
+              max={maxInput}
+              value={exportStart}
+              onChange={e => setExportStart(e.target.value)}
+            />
+            <span className="sv-export-label">to</span>
+            <input
+              className="sv-input"
+              type="number"
+              min={minInput}
+              max={maxInput}
+              value={exportEnd}
+              onChange={e => setExportEnd(e.target.value)}
+            />
+            <button className="sv-btn sv-export-btn" onClick={runExport} disabled={exporting}>
+              {exporting ? "Exporting…" : "Export .bin"}
+            </button>
+            {exportStatus && <span className="sv-export-status">{exportStatus}</span>}
+          </div>
+        )}
+
+        {showCompare && (
+          <div className="sv-compare-row">
+            <button className="sv-btn sv-export-btn" onClick={pickCompareImage}>
+              {compareImagePath ? "Change…" : "Open image…"}
+            </button>
+            {compareFileName
+              ? <span className="sv-compare-path" title={compareImagePath ?? ""}>{compareFileName}</span>
+              : <span className="sv-export-label">No image selected</span>
+            }
+            {compareImagePath && (
+              <button className="sv-btn sv-export-btn" onClick={clearCompare}>Clear</button>
+            )}
+            {compareData && (
+              <>
+                <span className="sv-compare-diff-count">
+                  {allIdentical
+                    ? <span style={{ color: "#4ec94e" }}>Images identical</span>
+                    : (() => {
+                        const a = data!.bytes;
+                        const b = compareData.bytes;
+                        const len = Math.max(a.length, b.length);
+                        let diff = 0;
+                        for (let i = 0; i < len; i++) if (a[i] !== b[i]) diff++;
+                        return diff === 0
+                          ? <span style={{ color: "#4ec94e" }}>Sector identical</span>
+                          : <span style={{ color: "#e5a550" }}>{diff.toLocaleString()} byte{diff !== 1 ? "s" : ""} differ</span>;
+                      })()
+                  }
+                </span>
+                <button className="sv-btn sv-export-btn" onClick={() => jumpToDiff(false)} disabled={scanning || lba === 0 || noPrevDiff} title={noPrevDiff ? "No previous differences found" : "Jump to previous differing sector"}>
+                  ◀ Prev diff
+                </button>
+                <button className="sv-btn sv-export-btn" onClick={() => jumpToDiff(true)} disabled={scanning || lba >= total - 1 || noNextDiff} title={noNextDiff ? "No further differences found" : "Jump to next differing sector"}>
+                  {scanning ? "Scanning…" : "Next diff ▶"}
+                </button>
+              </>
+            )}
+          </div>
+        )}
 
         {data && (
           <div className="sv-info">
@@ -306,14 +518,26 @@ export function SectorView({ imagePath, onClose, standalone, initialLba }: {
               {layout?.hasCd && <><span className="sv-leg"><span className="sv-swatch hb-sync"/>Sync</span><span className="sv-leg"><span className="sv-swatch hb-hdr"/>Hdr</span></>}
               {layout?.hasCd && layout.subhdrEnd > layout.headerEnd && <span className="sv-leg"><span className="sv-swatch hb-sub"/>Sub-Hdr</span>}
               {layout?.hasCd && <span className="sv-leg"><span className="sv-swatch hb-ecc"/>ECC</span>}
+              {compareData && <span className="sv-leg"><span className="sv-swatch hb-diff"/>Diff</span>}
             </div>
           </div>
         )}
 
         {error && <div className="sv-error">{error}</div>}
 
-        <div className="sv-hex-area">
-          {data && <HexDump data={data} rawMode={rawMode} />}
+        <div className={`sv-hex-area ${compareData ? "sv-hex-area--compare" : ""}`}>
+          {data && (
+            <div className={compareData ? "sv-hex-panel" : undefined}>
+              {compareData && <div className="sv-hex-panel-label">Image A — {imagePath.split(/[/\\]/).pop()}</div>}
+              <HexDump data={data} rawMode={rawMode} compareBytes={compareData?.bytes} />
+            </div>
+          )}
+          {compareData && (
+            <div className="sv-hex-panel">
+              <div className="sv-hex-panel-label">Image B — {compareFileName}</div>
+              <HexDump data={compareData} rawMode={rawMode} compareBytes={data?.bytes} />
+            </div>
+          )}
         </div>
 
       </div>

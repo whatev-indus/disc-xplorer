@@ -1,27 +1,13 @@
 # TODO
 
-## Add optical drive emulation from CDemu
-
-CDemu provides virtual optical drive emulation on Linux. Investigate extending this to
-act as a full emulated drive (not just a mount point) so the guest OS sees a virtual
-optical drive with proper drive behavior, subchannel data, etc.
-
-## Add .sub and .mds (DPM) compatibility with bin/cue via drive emulation
-
-`.sub` files carry subchannel data alongside `.cue`/`.bin` images. `.mds` files include
-DPM (Data Position Measurement) data required by copy protection schemes (e.g. ProtectCD
-v5+). Currently these are not replayed during emulation. Via drive emulation, the
-subchannel and DPM streams should be fed through so that protected disc images behave
-correctly when authenticated by the guest software.
-
-
 ## SabreTools.Serialization — additional disc image format support
 
-Investigate https://github.com/SabreTools/SabreTools.Serialization for formats not yet
-supported by the native Rust parsers, particularly:
-- Xbox / Xbox 360 disc images (XGD)
-- Nintendo optical discs (NOD / GCM / WBFS)
-- Any other formats with broad community support
-
-SabreTools is C#, so direct use requires a Rust port or a subprocess call. Evaluate whether
-format specs are documented well enough to write pure Rust parsers instead.
+Added in v0.2.3 (cross-referenced against SabreTools / Aaru / Wiimm):
+- WBFS (Wii Backup File System) — full read + filesystem browse
+- BlindWrite 5/6 (.b5t/.b6t) — parse + browse via companion .b5i/.b6i
+- UIF (MagicISO compressed) — full read + browse
+- CIF (Easy CD Creator) — parse + browse (data embedded in .cif)
+- AaruFormat (.aif) — detect-only (complex multi-codec format)
+- Redumper raw dumps (.sdram/.sbram) — detect-only (requires EFM/EDC decode)
+- WUX (Wii U compressed) + WUD (uncompressed) — SI partition browse/extract; title key auto-loaded from .key file (AES-128-CBC IV=0); GM partition pending
+- Skeleton / Skeleton.zst — full read + browse (zstd-compressed variant)

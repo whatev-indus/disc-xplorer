@@ -1,5 +1,9 @@
 use flac_bound::FlacEncoder;
-use flate2::read::DeflateDecoder;
+use flate2::read::{DeflateDecoder, ZlibDecoder};
+use zstd;
+use aes::Aes128;
+use cbc::Decryptor;
+use aes::cipher::{BlockDecryptMut, KeyIvInit, block_padding::NoPadding};
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
 #[cfg(target_os = "windows")]
@@ -11,8 +15,8 @@ use std::fs::{self, File};
 use std::io::{self, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::Mutex;
-use tauri::Manager;
+use std::sync::{Arc, Mutex};
+use tauri::{Emitter, Manager};
 use chd::Chd;
 use chd::read::ChdReader;
 
@@ -22,6 +26,8 @@ mod hfs_filesystem;
 mod pce_filesystem;
 mod threedo_filesystem;
 mod udf_filesystem;
+mod wbfs_reader;
+mod wux_reader;
 mod xdvdfs_filesystem;
 
 // Spawn a system tool without the AppImage's library/Python env overrides bleeding in.
@@ -335,12 +341,14 @@ fn detect_filesystems_raw(path: &Path) -> Vec<String> {
 fn get_disc_filesystems(image_path: String) -> Result<Vec<String>, String> {
     let path = Path::new(&image_path);
     let lower = image_path.to_lowercase();
-    if lower.ends_with(".cue") || lower.ends_with(".mds") || lower.ends_with(".nrg") || lower.ends_with(".ccd") || lower.ends_with(".cdi") || lower.ends_with(".gdi") {
+    if lower.ends_with(".cue") || lower.ends_with(".mds") || lower.ends_with(".nrg") || lower.ends_with(".ccd") || lower.ends_with(".cdi") || lower.ends_with(".gdi") || lower.ends_with(".b5t") || lower.ends_with(".b6t") || lower.ends_with(".cif") {
         let track = if lower.ends_with(".cue") { parse_cue_for_data_track(path)? }
             else if lower.ends_with(".mds") { parse_mds_for_data_track(path)? }
             else if lower.ends_with(".nrg") { parse_nrg_for_data_track(path)? }
             else if lower.ends_with(".ccd") { parse_ccd_for_data_track(path)? }
             else if lower.ends_with(".gdi") { parse_gdi_for_data_track(path)? }
+            else if lower.ends_with(".b5t") || lower.ends_with(".b6t") { parse_b5t_for_data_track(path)? }
+            else if lower.ends_with(".cif") { parse_cif_for_data_track(path)? }
             else { parse_cdi_for_data_track(path)? };
         Ok(detect_filesystems_in_bin(&track.bin_path, track.track_offset, track.user_data_offset, track.lba_offset, track.descramble))
     } else if lower.ends_with(".chd") {
@@ -351,6 +359,20 @@ fn get_disc_filesystems(image_path: String) -> Result<Vec<String>, String> {
         Ok(detect_filesystems_cso(path))
     } else if lower.ends_with(".ecm") {
         Ok(detect_filesystems_ecm(path))
+    } else if lower.ends_with(".uif") {
+        Ok(detect_filesystems_uif(path))
+    } else if lower.ends_with(".aif") {
+        Ok(detect_filesystems_aif(path))
+    } else if lower.ends_with(".skeleton.zst") || lower.ends_with(".iso.zst") || lower.ends_with(".img.zst") {
+        Ok(detect_filesystems_zst(path))
+    } else if lower.ends_with(".wbfs") {
+        Ok(detect_filesystems_wbfs(path))
+    } else if lower.ends_with(".wux") || lower.ends_with(".wud") {
+        Ok(detect_filesystems_wux(path))
+    } else if lower.ends_with(".sdram") {
+        Ok(detect_filesystems_redumper_dvd(path))
+    } else if lower.ends_with(".sbram") {
+        Ok(detect_filesystems_redumper_bd(path))
     } else {
         Ok(detect_filesystems_raw(path))
     }
@@ -2280,12 +2302,144 @@ pub struct EmulatedDrive {
 
 pub struct EmulatedDrives(pub Mutex<Vec<EmulatedDrive>>);
 
+pub struct WiiUKeyState(pub Mutex<Option<PathBuf>>);
+
+pub struct RedumperDumpState(pub Arc<Mutex<Option<tauri_plugin_shell::process::CommandChild>>>);
+
+fn redumper_cmd(
+    source: &str,
+    external_path: Option<&str>,
+    app: &tauri::AppHandle,
+) -> Result<tauri_plugin_shell::process::Command, String> {
+    use tauri_plugin_shell::ShellExt;
+    let cmd = if source == "external" {
+        let p = external_path.ok_or("No external redumper path configured")?;
+        app.shell().command(p)
+    } else {
+        app.shell().sidecar("redumper").map_err(|e| e.to_string())?
+    };
+    // The bundled macOS binary has @executable_path/../lib rpath for libc++.
+    // Point DYLD_LIBRARY_PATH at the bundled dylibs so no binary patching is needed.
+    #[cfg(target_os = "macos")]
+    let cmd = {
+        let lib_dir = app.path().resource_dir()
+            .map(|p| p.join("lib"))
+            .unwrap_or_default();
+        cmd.env("DYLD_LIBRARY_PATH", lib_dir.to_string_lossy().as_ref())
+    };
+    Ok(cmd)
+}
+
+#[tauri::command]
+async fn get_redumper_version(
+    source: String,
+    external_path: Option<String>,
+    app: tauri::AppHandle,
+) -> Result<String, String> {
+    let out = redumper_cmd(&source, external_path.as_deref(), &app)?
+        .args(["--version"])
+        .output()
+        .await
+        .map_err(|e| e.to_string())?;
+    let text = String::from_utf8_lossy(&out.stdout).to_string()
+        + &String::from_utf8_lossy(&out.stderr);
+    Ok(text.lines().find(|l| !l.trim().is_empty()).unwrap_or("unknown").to_string())
+}
+
+#[tauri::command]
+async fn start_redumper_dump(
+    drive: String,
+    output_path: String,
+    source: String,
+    external_path: Option<String>,
+    app: tauri::AppHandle,
+    dump_state: tauri::State<'_, RedumperDumpState>,
+) -> Result<(), String> {
+    use tauri_plugin_shell::process::CommandEvent;
+    let (mut rx, child) = redumper_cmd(&source, external_path.as_deref(), &app)?
+        .args(["dump",
+               &format!("--drive={drive}"),
+               &format!("--image-path={output_path}"),
+               "--drive-type=GENERIC", "--force-split"])
+        .spawn()
+        .map_err(|e| format!("Failed to start redumper: {e}"))?;
+    let child_arc = dump_state.0.clone();
+    *child_arc.lock().unwrap() = Some(child);
+    let app2 = app.clone();
+    tauri::async_runtime::spawn(async move {
+        while let Some(event) = rx.recv().await {
+            match event {
+                CommandEvent::Stdout(line) => {
+                    let _ = app2.emit("redumper-log", String::from_utf8_lossy(&line).to_string());
+                }
+                CommandEvent::Stderr(line) => {
+                    let _ = app2.emit("redumper-log", String::from_utf8_lossy(&line).to_string());
+                }
+                CommandEvent::Terminated(status) => {
+                    let _ = app2.emit("redumper-done", status.code.unwrap_or(-1));
+                    *child_arc.lock().unwrap() = None;
+                    break;
+                }
+                _ => {}
+            }
+        }
+    });
+    Ok(())
+}
+
+#[tauri::command]
+fn cancel_redumper_dump(dump_state: tauri::State<'_, RedumperDumpState>) -> Result<(), String> {
+    if let Some(child) = dump_state.0.lock().unwrap().take() {
+        child.kill().map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn organize_dump_logs(dir: String) -> Result<(), String> {
+    let dir = std::path::Path::new(&dir);
+    let image_exts: &[&str] = &["iso", "bin", "cue"];
+    let entries: Vec<_> = std::fs::read_dir(dir)
+        .map_err(|e| e.to_string())?
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().is_file())
+        .filter(|e| {
+            let ext = e.path().extension()
+                .and_then(|s| s.to_str())
+                .map(|s| s.to_ascii_lowercase())
+                .unwrap_or_default();
+            !image_exts.contains(&ext.as_str())
+        })
+        .collect();
+    if entries.is_empty() {
+        return Ok(());
+    }
+    let logs_dir = dir.join("logs");
+    std::fs::create_dir_all(&logs_dir).map_err(|e| e.to_string())?;
+    for entry in entries {
+        let dest = logs_dir.join(entry.file_name());
+        std::fs::rename(entry.path(), &dest).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn set_wiiu_key_path(path: Option<String>, state: tauri::State<WiiUKeyState>) {
+    *state.0.lock().unwrap() = path.map(PathBuf::from);
+}
+
+#[tauri::command]
+fn get_wiiu_key_path(state: tauri::State<WiiUKeyState>) -> Option<String> {
+    state.0.lock().unwrap().as_ref().map(|p| p.to_string_lossy().into_owned())
+}
+
 // ── Detached Sector View window ───────────────────────────────────────────────
 
 #[derive(Serialize, Clone)]
 struct SectorViewInitParams {
     image_path: String,
     lba: u64,
+    compare_image_path: Option<String>,
 }
 
 struct SectorViewParamStore(Mutex<std::collections::HashMap<String, SectorViewInitParams>>);
@@ -2296,10 +2450,11 @@ fn open_sector_view_window(
     store: tauri::State<'_, SectorViewParamStore>,
     image_path: String,
     lba: u64,
+    compare_image_path: Option<String>,
 ) -> Result<(), String> {
     let label = format!("sv{}", std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis());
-    store.0.lock().unwrap().insert(label.clone(), SectorViewInitParams { image_path, lba });
+    store.0.lock().unwrap().insert(label.clone(), SectorViewInitParams { image_path, lba, compare_image_path });
     tauri::WebviewWindowBuilder::new(&app, label, tauri::WebviewUrl::App("index.html".into()))
         .title("Sector View — Disc Xplorer")
         .inner_size(920.0, 680.0)
@@ -2541,9 +2696,8 @@ pub struct SectorData {
     pub lba: u64,
 }
 
-#[tauri::command]
-fn read_sector(image_path: String, lba: u64) -> Result<SectorData, String> {
-    let path = Path::new(&image_path);
+fn read_sector_impl(image_path: &str, lba: u64) -> Result<SectorData, String> {
+    let path = Path::new(image_path);
     let lower = image_path.to_lowercase();
 
     let (file_path, sector_size, user_data_offset, data_offset): (PathBuf, u64, u64, u64) = if lower.ends_with(".cue") {
@@ -2610,6 +2764,63 @@ fn read_sector(image_path: String, lba: u64) -> Result<SectorData, String> {
         const SYNC: [u8; 12] = [0x00,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0x00];
         let udo = if sec[..12] == SYNC { if sec[15] == 2 { 24u32 } else { 16u32 } } else { 0u32 };
         return Ok(SectorData { bytes: sec.to_vec(), sector_size: 2352, user_data_offset: udo, total_sectors, lba });
+    } else if lower.ends_with(".b5t") || lower.ends_with(".b6t") {
+        let track = parse_b5t_for_data_track(path)?;
+        (track.bin_path, track.stride, track.user_data_offset, track.track_offset)
+    } else if lower.ends_with(".cif") {
+        let track = parse_cif_for_data_track(path)?;
+        (track.bin_path, track.stride, track.user_data_offset, track.track_offset)
+    } else if lower.ends_with(".uif") {
+        let mut reader = UifReader::open(path).map_err(|e| format!("UIF: {e}"))?;
+        let total_sectors = reader.total_sectors();
+        if total_sectors == 0 { return Err("UIF is empty".to_string()); }
+        if lba >= total_sectors {
+            return Err(format!("Sector {lba} out of range (0–{})", total_sectors - 1));
+        }
+        let ss = reader.sector_size as usize;
+        let mut bytes = vec![0u8; ss];
+        reader.read_at(&mut bytes, lba).map_err(|e| format!("Read error: {e}"))?;
+        const SYNC: [u8; 12] = [0x00,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0x00];
+        let udo = if ss > 2048 && bytes.len() >= 16 && bytes[0..12] == SYNC {
+            if bytes[15] == 2 { 24u32 } else { 16u32 }
+        } else { 0u32 };
+        return Ok(SectorData { bytes, sector_size: ss as u32, user_data_offset: udo, total_sectors, lba });
+    } else if lower.ends_with(".wbfs") {
+        let mut reader = wbfs_reader::WbfsReader::open(path).map_err(|e| format!("WBFS: {e}"))?;
+        let total_sectors = reader.disc_size() / 2048;
+        if total_sectors == 0 { return Err("WBFS is empty".to_string()); }
+        if lba >= total_sectors {
+            return Err(format!("Sector {lba} out of range (0–{})", total_sectors - 1));
+        }
+        reader.seek(SeekFrom::Start(lba * 2048)).map_err(|e| format!("Seek error: {e}"))?;
+        let mut bytes = vec![0u8; 2048];
+        reader.read_exact(&mut bytes).map_err(|e| format!("Read error: {e}"))?;
+        return Ok(SectorData { bytes, sector_size: 2048, user_data_offset: 0, total_sectors, lba });
+    } else if lower.ends_with(".skeleton.zst") || lower.ends_with(".iso.zst") || lower.ends_with(".img.zst") {
+        let reader = ZstReader::open(path).map_err(|e| format!("ZST: {e}"))?;
+        let ss = reader.sector_size;
+        let total_sectors = reader.data.len() as u64 / ss;
+        if total_sectors == 0 { return Err("ZST image is empty".to_string()); }
+        if lba >= total_sectors {
+            return Err(format!("Sector {lba} out of range (0–{})", total_sectors - 1));
+        }
+        let pos = (lba * ss) as usize;
+        let bytes = reader.data[pos..pos + ss as usize].to_vec();
+        let udo = reader.user_data_offset as u32;
+        return Ok(SectorData { bytes, sector_size: ss as u32, user_data_offset: udo, total_sectors, lba });
+    } else if lower.ends_with(".wux") {
+        let mut reader = wux_reader::WuxReader::open(path).map_err(|e| format!("WUX: {e}"))?;
+        let total_sectors = reader.total_bytes() / 2048;
+        if total_sectors == 0 { return Err("WUX is empty".to_string()); }
+        if lba >= total_sectors {
+            return Err(format!("Sector {lba} out of range (0–{})", total_sectors - 1));
+        }
+        reader.seek(SeekFrom::Start(lba * 2048)).map_err(|e| format!("Seek error: {e}"))?;
+        let mut bytes = vec![0u8; 2048];
+        reader.read_exact(&mut bytes).map_err(|e| format!("Read error: {e}"))?;
+        return Ok(SectorData { bytes, sector_size: 2048, user_data_offset: 0, total_sectors, lba });
+    } else if lower.ends_with(".aif") || lower.ends_with(".sdram") || lower.ends_with(".sbram") {
+        return Err("Sector view not supported for this format".to_string());
     } else {
         let udo = detect_raw_sector_offset(path).unwrap_or(0);
         (path.to_path_buf(), if udo > 0 { RAW_SECTOR_SIZE } else { 2048u64 }, udo, 0)
@@ -2630,6 +2841,370 @@ fn read_sector(image_path: String, lba: u64) -> Result<SectorData, String> {
     f.read_exact(&mut bytes).map_err(|e| format!("Read error: {e}"))?;
 
     Ok(SectorData { bytes, sector_size: sector_size as u32, user_data_offset: user_data_offset as u32, total_sectors, lba })
+}
+
+#[tauri::command]
+fn read_sector(image_path: String, lba: u64) -> Result<SectorData, String> {
+    read_sector_impl(&image_path, lba)
+}
+
+struct FlatInfo {
+    path: PathBuf,
+    sector_size: u64,
+    data_offset: u64,
+    total_sectors: u64,
+}
+
+fn flat_info(image_path: &str) -> Option<FlatInfo> {
+    let path = Path::new(image_path);
+    let lower = image_path.to_lowercase();
+    // Compressed / special formats — cannot do raw bulk reads.
+    if lower.ends_with(".chd") || lower.ends_with(".cso") || lower.ends_with(".ciso")
+        || lower.ends_with(".ecm") || lower.ends_with(".uif") || lower.ends_with(".wbfs")
+        || lower.ends_with(".wux") || lower.ends_with(".skeleton.zst")
+        || lower.ends_with(".iso.zst") || lower.ends_with(".img.zst")
+        || lower.ends_with(".aif") || lower.ends_with(".sdram") || lower.ends_with(".sbram")
+        || lower.ends_with(".wud")
+    {
+        return None;
+    }
+    let (file_path, sector_size, data_offset): (PathBuf, u64, u64) = if lower.ends_with(".cue") {
+        let track = parse_cue_all_data_tracks(path).ok()?.into_iter().next()?;
+        (track.bin_path, RAW_SECTOR_SIZE, track.track_offset)
+    } else if lower.ends_with(".mds") {
+        let track = parse_mds_for_data_track(path).ok()?;
+        (track.bin_path, RAW_SECTOR_SIZE, track.track_offset)
+    } else if lower.ends_with(".nrg") {
+        let track = parse_nrg_for_data_track(path).ok()?;
+        let ss = if track.user_data_offset > 0 { RAW_SECTOR_SIZE } else { 2048 };
+        (track.bin_path, ss, track.track_offset)
+    } else if lower.ends_with(".ccd") {
+        let track = parse_ccd_for_data_track(path).ok()?;
+        (track.bin_path, RAW_SECTOR_SIZE, track.track_offset)
+    } else if lower.ends_with(".cdi") {
+        let track = parse_cdi_for_data_track(path).ok()?;
+        (track.bin_path, track.stride, track.track_offset)
+    } else if lower.ends_with(".gdi") {
+        let track = parse_gdi_for_data_track(path).ok()?;
+        (track.bin_path, track.stride, track.track_offset)
+    } else if lower.ends_with(".b5t") || lower.ends_with(".b6t") {
+        let track = parse_b5t_for_data_track(path).ok()?;
+        (track.bin_path, track.stride, track.track_offset)
+    } else if lower.ends_with(".cif") {
+        let track = parse_cif_for_data_track(path).ok()?;
+        (track.bin_path, track.stride, track.track_offset)
+    } else if lower.ends_with(".mdx") {
+        let (ss, _) = mdx_sector_format(path);
+        (path.to_path_buf(), ss, MDX_DATA_OFFSET)
+    } else {
+        let udo = detect_raw_sector_offset(path).unwrap_or(0);
+        let ss = if udo > 0 { RAW_SECTOR_SIZE } else { 2048u64 };
+        (path.to_path_buf(), ss, 0)
+    };
+    let file_len = fs::metadata(&file_path).ok()?.len();
+    let total_sectors = file_len.saturating_sub(data_offset) / sector_size;
+    if total_sectors == 0 { return None; }
+    Some(FlatInfo { path: file_path, sector_size, data_offset, total_sectors })
+}
+
+// Fast bulk comparison for flat (non-compressed) images with the same sector stride.
+// Reads both files CHUNK_BYTES at a time; within a differing chunk, finds the exact sector.
+fn find_diff_flat(
+    a: &FlatInfo, b: &FlatInfo,
+    scan_start: u64, scan_end: u64, forward: bool,
+) -> Result<Option<u64>, String> {
+    const CHUNK_BYTES: u64 = 1 << 20; // 1 MB
+    let ss = a.sector_size;
+    let chunk_sectors = (CHUNK_BYTES / ss).max(1);
+
+    let mut fa = File::open(&a.path).map_err(|e| e.to_string())?;
+    let mut fb = File::open(&b.path).map_err(|e| e.to_string())?;
+    let mut buf_a = vec![0u8; (chunk_sectors * ss) as usize];
+    let mut buf_b = vec![0u8; (chunk_sectors * ss) as usize];
+
+    if forward {
+        let mut lba = scan_start;
+        while lba <= scan_end {
+            let batch = chunk_sectors.min(scan_end - lba + 1);
+            let n = (batch * ss) as usize;
+            fa.seek(SeekFrom::Start(a.data_offset + lba * ss)).map_err(|e| e.to_string())?;
+            fb.seek(SeekFrom::Start(b.data_offset + lba * ss)).map_err(|e| e.to_string())?;
+            fa.read_exact(&mut buf_a[..n]).map_err(|e| e.to_string())?;
+            fb.read_exact(&mut buf_b[..n]).map_err(|e| e.to_string())?;
+            if buf_a[..n] != buf_b[..n] {
+                for i in 0..batch {
+                    let s = (i * ss) as usize;
+                    let e2 = s + ss as usize;
+                    if buf_a[s..e2] != buf_b[s..e2] { return Ok(Some(lba + i)); }
+                }
+            }
+            lba += batch;
+        }
+    } else {
+        let mut lba_end = scan_end;
+        loop {
+            let batch = chunk_sectors.min(lba_end - scan_start + 1);
+            let batch_start = lba_end + 1 - batch;
+            let n = (batch * ss) as usize;
+            fa.seek(SeekFrom::Start(a.data_offset + batch_start * ss)).map_err(|e| e.to_string())?;
+            fb.seek(SeekFrom::Start(b.data_offset + batch_start * ss)).map_err(|e| e.to_string())?;
+            fa.read_exact(&mut buf_a[..n]).map_err(|e| e.to_string())?;
+            fb.read_exact(&mut buf_b[..n]).map_err(|e| e.to_string())?;
+            if buf_a[..n] != buf_b[..n] {
+                for i in (0..batch).rev() {
+                    let s = (i * ss) as usize;
+                    let e2 = s + ss as usize;
+                    if buf_a[s..e2] != buf_b[s..e2] { return Ok(Some(batch_start + i)); }
+                }
+            }
+            if batch_start == scan_start { break; }
+            lba_end = batch_start - 1;
+        }
+    }
+    Ok(None)
+}
+
+#[tauri::command]
+fn find_diff_sector(
+    image_path_a: String,
+    image_path_b: String,
+    from_lba: u64,
+    forward: bool,
+    inclusive: bool,
+) -> Result<Option<u64>, String> {
+    let total = read_sector_impl(&image_path_a, 0)
+        .map(|s| s.total_sectors)
+        .unwrap_or(0);
+    if total == 0 { return Ok(None); }
+
+    let (scan_start, scan_end) = if forward {
+        let start = if inclusive { from_lba } else { from_lba.saturating_add(1) };
+        (start, total - 1)
+    } else {
+        if from_lba == 0 { return Ok(None); }
+        (0, from_lba - 1)
+    };
+    if scan_start > scan_end { return Ok(None); }
+
+    // Fast path: both images are flat files with the same sector stride.
+    if let (Some(ia), Some(ib)) = (flat_info(&image_path_a), flat_info(&image_path_b)) {
+        if ia.sector_size == ib.sector_size {
+            return find_diff_flat(&ia, &ib, scan_start, scan_end, forward);
+        }
+    }
+
+    // Slow fallback: per-sector reads (necessary for compressed formats).
+    if forward {
+        for lba in scan_start..=scan_end {
+            let a = read_sector_impl(&image_path_a, lba).map(|s| s.bytes).unwrap_or_default();
+            let b = read_sector_impl(&image_path_b, lba).map(|s| s.bytes).unwrap_or_default();
+            let len = a.len().max(b.len());
+            if (0..len).any(|i| a.get(i) != b.get(i)) { return Ok(Some(lba)); }
+        }
+    } else {
+        for lba in (scan_start..=scan_end).rev() {
+            let a = read_sector_impl(&image_path_a, lba).map(|s| s.bytes).unwrap_or_default();
+            let b = read_sector_impl(&image_path_b, lba).map(|s| s.bytes).unwrap_or_default();
+            let len = a.len().max(b.len());
+            if (0..len).any(|i| a.get(i) != b.get(i)) { return Ok(Some(lba)); }
+        }
+    }
+    Ok(None)
+}
+
+// ── Sector range export ───────────────────────────────────────────────────────
+
+#[tauri::command]
+async fn export_sector_range(
+    image_path: String,
+    lba_start: u64,
+    lba_end: u64,
+    dest_path: String,
+) -> Result<u64, String> {
+    if lba_end < lba_start {
+        return Err("End LBA must be >= start LBA".to_string());
+    }
+    let count = lba_end - lba_start + 1;
+    let path = Path::new(&image_path);
+    let lower = image_path.to_lowercase();
+
+    let mut dest = File::create(&dest_path)
+        .map_err(|e| format!("Cannot create output: {e}"))?;
+
+    // ── compressed / special-reader formats ──────────────────────────────────
+
+    if lower.ends_with(".chd") {
+        let file = File::open(path).map_err(|e| format!("Cannot open CHD: {e}"))?;
+        let chd = Chd::open(BufReader::new(file), None)
+            .map_err(|e| format!("Cannot parse CHD: {e}"))?;
+        let stride = chd_stride(chd.header().hunk_size() as u64, chd.header().unit_bytes() as u64);
+        let total = if stride > 0 { chd.header().logical_bytes() / stride } else { 0 };
+        if lba_end >= total {
+            return Err(format!("LBA {lba_end} out of range (0–{})", total.saturating_sub(1)));
+        }
+        let mut reader = ChdReader::new(chd);
+        let mut buf = vec![0u8; stride as usize];
+        for lba in lba_start..=lba_end {
+            reader.seek(SeekFrom::Start(lba * stride))
+                .map_err(|e| format!("Seek error at LBA {lba}: {e}"))?;
+            reader.read_exact(&mut buf)
+                .map_err(|e| format!("Read error at LBA {lba}: {e}"))?;
+            dest.write_all(&buf).map_err(|e| format!("Write error: {e}"))?;
+        }
+        return Ok(count);
+    }
+
+    if lower.ends_with(".cso") || lower.ends_with(".ciso") {
+        let mut reader = CsoReader::open(path).map_err(|e| format!("CSO: {e}"))?;
+        let total = reader.total_bytes / 2048;
+        if lba_end >= total {
+            return Err(format!("LBA {lba_end} out of range (0–{})", total.saturating_sub(1)));
+        }
+        let mut buf = vec![0u8; 2048];
+        for lba in lba_start..=lba_end {
+            reader.read_at(&mut buf, lba).map_err(|e| format!("Read error at LBA {lba}: {e}"))?;
+            dest.write_all(&buf).map_err(|e| format!("Write error: {e}"))?;
+        }
+        return Ok(count);
+    }
+
+    if lower.ends_with(".ecm") {
+        let reader = EcmReader::open(path).map_err(|e| format!("ECM: {e}"))?;
+        let total = reader.sectors.len() as u64;
+        if lba_end >= total {
+            return Err(format!("LBA {lba_end} out of range (0–{})", total.saturating_sub(1)));
+        }
+        for lba in lba_start..=lba_end {
+            dest.write_all(&reader.sectors[lba as usize])
+                .map_err(|e| format!("Write error: {e}"))?;
+        }
+        return Ok(count);
+    }
+
+    if lower.ends_with(".uif") {
+        let mut reader = UifReader::open(path).map_err(|e| format!("UIF: {e}"))?;
+        let total = reader.total_sectors();
+        let ss = reader.sector_size as usize;
+        if lba_end >= total {
+            return Err(format!("LBA {lba_end} out of range (0–{})", total.saturating_sub(1)));
+        }
+        let mut buf = vec![0u8; ss];
+        for lba in lba_start..=lba_end {
+            reader.read_at(&mut buf, lba).map_err(|e| format!("Read error at LBA {lba}: {e}"))?;
+            dest.write_all(&buf).map_err(|e| format!("Write error: {e}"))?;
+        }
+        return Ok(count);
+    }
+
+    if lower.ends_with(".wbfs") {
+        let mut reader = wbfs_reader::WbfsReader::open(path)
+            .map_err(|e| format!("WBFS: {e}"))?;
+        let total = reader.disc_size() / 2048;
+        if lba_end >= total {
+            return Err(format!("LBA {lba_end} out of range (0–{})", total.saturating_sub(1)));
+        }
+        let mut buf = vec![0u8; 2048];
+        for lba in lba_start..=lba_end {
+            reader.seek(SeekFrom::Start(lba * 2048))
+                .map_err(|e| format!("Seek error at LBA {lba}: {e}"))?;
+            reader.read_exact(&mut buf)
+                .map_err(|e| format!("Read error at LBA {lba}: {e}"))?;
+            dest.write_all(&buf).map_err(|e| format!("Write error: {e}"))?;
+        }
+        return Ok(count);
+    }
+
+    if lower.ends_with(".wux") || lower.ends_with(".wud") {
+        let (mut reader, _) = open_wiiu_disc(path)?;
+        let total_bytes = if lower.ends_with(".wud") {
+            fs::metadata(path).map(|m| m.len()).unwrap_or(0)
+        } else {
+            wux_reader::WuxReader::open(path).map(|r| r.total_bytes()).unwrap_or(0)
+        };
+        let total = total_bytes / 2048;
+        if lba_end >= total {
+            return Err(format!("LBA {lba_end} out of range (0–{})", total.saturating_sub(1)));
+        }
+        let mut buf = vec![0u8; 2048];
+        for lba in lba_start..=lba_end {
+            reader.seek(SeekFrom::Start(lba * 2048))
+                .map_err(|e| format!("Seek error at LBA {lba}: {e}"))?;
+            reader.read_exact(&mut buf)
+                .map_err(|e| format!("Read error at LBA {lba}: {e}"))?;
+            dest.write_all(&buf).map_err(|e| format!("Write error: {e}"))?;
+        }
+        return Ok(count);
+    }
+
+    if lower.ends_with(".skeleton.zst") || lower.ends_with(".iso.zst") || lower.ends_with(".img.zst") {
+        let mut reader = ZstReader::open(path).map_err(|e| format!("ZST: {e}"))?;
+        let ss = reader.sector_size;
+        let total = reader.data.len() as u64 / ss;
+        if lba_end >= total {
+            return Err(format!("LBA {lba_end} out of range (0–{})", total.saturating_sub(1)));
+        }
+        let mut buf = vec![0u8; ss as usize];
+        for lba in lba_start..=lba_end {
+            reader.read_at(&mut buf, lba).map_err(|e| format!("Read error at LBA {lba}: {e}"))?;
+            dest.write_all(&buf).map_err(|e| format!("Write error: {e}"))?;
+        }
+        return Ok(count);
+    }
+
+    // ── file-based formats (seek + read loop) ────────────────────────────────
+
+    let (file_path, sector_size, data_offset): (PathBuf, u64, u64) = if lower.ends_with(".cue") {
+        let tracks = parse_cue_all_data_tracks(path)?;
+        let track = tracks.into_iter().next().ok_or("No data track in CUE")?;
+        (track.bin_path, RAW_SECTOR_SIZE, track.track_offset)
+    } else if lower.ends_with(".mds") {
+        let track = parse_mds_for_data_track(path)?;
+        (track.bin_path, RAW_SECTOR_SIZE, track.track_offset)
+    } else if lower.ends_with(".nrg") {
+        let track = parse_nrg_for_data_track(path)?;
+        let ss = if track.user_data_offset > 0 { RAW_SECTOR_SIZE } else { 2048 };
+        (track.bin_path, ss, track.track_offset)
+    } else if lower.ends_with(".ccd") {
+        let track = parse_ccd_for_data_track(path)?;
+        (track.bin_path, RAW_SECTOR_SIZE, track.track_offset)
+    } else if lower.ends_with(".cdi") {
+        let track = parse_cdi_for_data_track(path)?;
+        (track.bin_path, track.stride, track.track_offset)
+    } else if lower.ends_with(".gdi") {
+        let track = parse_gdi_for_data_track(path)?;
+        (track.bin_path, track.stride, track.track_offset)
+    } else if lower.ends_with(".b5t") || lower.ends_with(".b6t") {
+        let track = parse_b5t_for_data_track(path)?;
+        (track.bin_path, RAW_SECTOR_SIZE, track.track_offset)
+    } else if lower.ends_with(".cif") {
+        let track = parse_cif_for_data_track(path)?;
+        (track.bin_path, track.stride, track.track_offset)
+    } else if lower.ends_with(".mdx") {
+        let (ss, _) = mdx_sector_format(path);
+        (path.to_path_buf(), ss, MDX_DATA_OFFSET)
+    } else {
+        let udo = detect_raw_sector_offset(path).unwrap_or(0);
+        (path.to_path_buf(), if udo > 0 { RAW_SECTOR_SIZE } else { 2048u64 }, 0)
+    };
+
+    let file_len = fs::metadata(&file_path)
+        .map_err(|e| format!("Cannot stat image: {e}"))?.len();
+    let total = file_len.saturating_sub(data_offset) / sector_size;
+    if lba_end >= total {
+        return Err(format!("LBA {lba_end} out of range (0–{})", total.saturating_sub(1)));
+    }
+
+    let mut src = File::open(&file_path).map_err(|e| format!("Cannot open: {e}"))?;
+    let mut buf = vec![0u8; sector_size as usize];
+    for lba in lba_start..=lba_end {
+        src.seek(SeekFrom::Start(data_offset + lba * sector_size))
+            .map_err(|e| format!("Seek error at LBA {lba}: {e}"))?;
+        src.read_exact(&mut buf)
+            .map_err(|e| format!("Read error at LBA {lba}: {e}"))?;
+        dest.write_all(&buf).map_err(|e| format!("Write error: {e}"))?;
+    }
+
+    Ok(count)
 }
 
 // ── WAV export ────────────────────────────────────────────────────────────────
@@ -2786,6 +3361,7 @@ fn save_audio_track(cue_path: String, track_number: u32, dest_path: String, form
 pub struct DriveInfo {
     pub name: String,
     pub device_path: String,
+    pub raw_device_path: String,
     pub has_disc: bool,
     pub volume_name: Option<String>,
     pub mount_point: Option<String>,
@@ -2908,10 +3484,13 @@ fn list_optical_drives() -> Result<Vec<DriveInfo>, String> {
         let device_path = if node.starts_with("/dev/") { node } else { format!("/dev/{node}") };
         let (has_disc, volume_name, mount_point) = check_disc_in_drive(&device_path);
         let access_path = mount_point.clone().unwrap_or_else(|| device_path.clone());
+        // redumper expects just the BSD name (e.g. "disk11") for --drive on macOS
+        let raw_device_path = device_path.trim_start_matches("/dev/").to_string();
 
         result.push(DriveInfo {
             name: name.to_string(),
             device_path: access_path,
+            raw_device_path,
             has_disc,
             volume_name,
             mount_point,
@@ -2981,6 +3560,7 @@ if ($drives -eq $null) { '[]' } else { $drives | ConvertTo-Json -Compress }
 
         result.push(DriveInfo {
             name,
+            raw_device_path: device_path.clone(),
             device_path,
             has_disc: media_loaded,
             volume_name,
@@ -3052,7 +3632,8 @@ fn list_optical_drives() -> Result<Vec<DriveInfo>, String> {
 
         result.push(DriveInfo {
             name: model,
-            device_path: device_node,  // always raw device for sector reads and eject
+            raw_device_path: device_node.clone(),
+            device_path: device_node,
             has_disc,
             volume_name: label,
             mount_point: mount,
@@ -3326,6 +3907,744 @@ fn open_gcm_chd(path: &Path) -> Result<gcm_filesystem::GcmFs<ChdReader<BufReader
     gcm_filesystem::GcmFs::new(reader, 0)
 }
 
+fn detect_filesystems_wbfs(path: &Path) -> Vec<String> {
+    let Ok(mut reader) = wbfs_reader::WbfsReader::open(path) else { return vec![] };
+    match gcm_filesystem::detect_gcm_reader(&mut reader) {
+        Some(kind) => vec![gcm_kind_label(kind)],
+        None => vec![],
+    }
+}
+
+fn open_gcm_wbfs(path: &Path) -> Result<gcm_filesystem::GcmFs<wbfs_reader::WbfsReader>, String> {
+    let reader = wbfs_reader::WbfsReader::open(path)?;
+    gcm_filesystem::GcmFs::new(reader, 0)
+}
+
+// ── WUX (Wii U compressed disc image) support ────────────────────────────────
+// Wii U game discs (Blu-ray based, 25 GB).  The WuxReader deduplication layer
+// maps the WUD logical layout.  The cleartext SI (System Information) partition
+// is at logical disc offset 0x28000 and contains title.cert, title.tik,
+// title.tmd inside an FST under the "01/" content directory.
+//
+// FST layout (all multi-byte integers big-endian):
+//   Header 0x20 bytes: magic "FST\0", offsetFactor (u32), numSections (u32)
+//   Section headers (numSections × 0x20): [0x00] size_sectors, [0x04] base_sectors
+//   File entries (entry_count × 0x10), root entry first:
+//     [0x00] u8 flags (bit 0 = directory)
+//     [0x01-0x03] u24 name_off in string table
+//     [0x04-0x07] u32 data_off (file: in offsetFactor units; dir: parent entry idx)
+//     [0x08-0x0B] u32 size (file: bytes; dir: next-entry idx = subtree end)
+//     [0x0C-0x0D] u16 flags2
+//     [0x0E-0x0F] u16 content_idx (section index)
+//   String table immediately follows the last file entry.
+//
+// File disc byte offset = SecHdr[content_idx].base_sectors * sector_size
+//                       + data_off * offsetFactor
+
+const WIIU_SI_FST_OFFSET: u64 = 0x28000;
+
+trait WiiUDisc: Read + Seek + Send {}
+impl WiiUDisc for wux_reader::WuxReader {}
+impl WiiUDisc for File {}  // .wud is a plain raw disc image
+
+struct WiiUFstEntry {
+    flags:       u8,
+    name_off:    u32,
+    data_off:    u32,
+    size:        u32,
+    content_idx: u16,
+}
+
+struct WiiUFst {
+    entries:       Vec<WiiUFstEntry>,
+    string_table:  Vec<u8>,
+    sec_hdrs:      Vec<(u64, u64)>,  // (base_sectors, size_sectors)
+    sector_size:   u64,
+    offset_factor: u64,
+}
+
+impl WiiUFst {
+    fn name(&self, idx: usize) -> &str {
+        let off = self.entries[idx].name_off as usize;
+        let end = self.string_table[off..].iter().position(|&b| b == 0)
+            .map(|p| off + p).unwrap_or(self.string_table.len());
+        std::str::from_utf8(&self.string_table[off..end]).unwrap_or("?")
+    }
+
+    fn is_dir(&self, idx: usize) -> bool {
+        self.entries[idx].flags & 1 != 0
+    }
+
+    fn disc_offset(&self, idx: usize) -> u64 {
+        let e = &self.entries[idx];
+        let (base, _) = self.sec_hdrs.get(e.content_idx as usize).copied().unwrap_or((0, 0));
+        base * self.sector_size + e.data_off as u64 * self.offset_factor
+    }
+
+    // Direct children of the directory at dir_idx.
+    fn list_children(&self, dir_idx: usize) -> Vec<usize> {
+        let end = self.entries[dir_idx].size as usize;
+        let mut result = Vec::new();
+        let mut i = dir_idx + 1;
+        while i < end && i < self.entries.len() {
+            result.push(i);
+            if self.is_dir(i) { i = self.entries[i].size as usize; }
+            else               { i += 1; }
+        }
+        result
+    }
+
+    fn find_entry(&self, path: &str) -> Option<usize> {
+        let mut current = 0usize;
+        for part in path.split('/').filter(|s| !s.is_empty()) {
+            if !self.is_dir(current) { return None; }
+            let children = self.list_children(current);
+            current = *children.iter().find(|&&i| self.name(i) == part)?;
+        }
+        Some(current)
+    }
+}
+
+fn parse_wiiu_fst(buf: &[u8], sector_size: u64) -> Result<WiiUFst, String> {
+    if buf.len() < 0x20 { return Err("WUX FST: buffer too small".to_string()); }
+    if &buf[0..4] != b"FST\0" {
+        return Err(format!("WUX FST: bad magic {:08X}",
+            u32::from_be_bytes(buf[0..4].try_into().unwrap())));
+    }
+    let offset_factor = u32::from_be_bytes(buf[4..8].try_into().unwrap()) as u64;
+    let num_sec_hdrs  = u32::from_be_bytes(buf[8..12].try_into().unwrap()) as usize;
+
+    let sec_start = 0x20usize;
+    let sec_end   = sec_start + num_sec_hdrs * 0x20;
+    if buf.len() < sec_end + 0x10 {
+        return Err("WUX FST: buffer too small for section headers".to_string());
+    }
+
+    let mut sec_hdrs = Vec::with_capacity(num_sec_hdrs);
+    for i in 0..num_sec_hdrs {
+        let b = sec_start + i * 0x20;
+        let size   = u32::from_be_bytes(buf[b..b+4].try_into().unwrap()) as u64;
+        let base   = u32::from_be_bytes(buf[b+4..b+8].try_into().unwrap()) as u64;
+        sec_hdrs.push((base, size));
+    }
+
+    // Root entry at sec_end; its size field = total entry count.
+    let root_base   = sec_end;
+    let entry_count = u32::from_be_bytes(buf[root_base+8..root_base+12].try_into().unwrap()) as usize;
+    let entries_end = root_base + entry_count * 0x10;
+    if buf.len() < entries_end {
+        return Err(format!("WUX FST: buffer too small for {entry_count} entries"));
+    }
+
+    let mut entries = Vec::with_capacity(entry_count);
+    for i in 0..entry_count {
+        let b = root_base + i * 0x10;
+        entries.push(WiiUFstEntry {
+            flags:       buf[b],
+            name_off:    u32::from_be_bytes([0, buf[b+1], buf[b+2], buf[b+3]]),
+            data_off:    u32::from_be_bytes(buf[b+4..b+8].try_into().unwrap()),
+            size:        u32::from_be_bytes(buf[b+8..b+12].try_into().unwrap()),
+            content_idx: u16::from_be_bytes(buf[b+14..b+16].try_into().unwrap()),
+        });
+    }
+
+    let string_table = buf[entries_end..].to_vec();
+    Ok(WiiUFst { entries, string_table, sec_hdrs, sector_size, offset_factor })
+}
+
+// Load a Wii U title key from a same-named .key file alongside the disc image.
+// Title key files contain exactly 16 raw bytes (the AES-128 key).
+fn load_title_key(disc_path: &Path) -> Option<[u8; 16]> {
+    let key_path = disc_path.with_extension("key");
+    let data = fs::read(key_path).ok()?;
+    if data.len() < 16 { return None; }
+    let mut key = [0u8; 16];
+    key.copy_from_slice(&data[..16]);
+    Some(key)
+}
+
+// AES-128-CBC decrypt with IV = 0 (Wii U per-sector scheme).
+// Each 0x8000-byte disc sector is an independent CBC stream starting with IV=0.
+fn wiiu_decrypt_sector(key: &[u8; 16], data: &mut [u8]) {
+    let iv = [0u8; 16];
+    if let Ok(dec) = Decryptor::<Aes128>::new_from_slices(key, &iv) {
+        let _ = dec.decrypt_padded_mut::<NoPadding>(data);
+    }
+}
+
+fn open_wiiu_disc(path: &Path) -> Result<(Box<dyn WiiUDisc>, u64), String> {
+    let lower = path.to_string_lossy().to_lowercase();
+    if lower.ends_with(".wud") {
+        // .wud is a plain raw disc image — read directly from the file.
+        let f = File::open(path).map_err(|e| format!("Cannot open WUD: {e}"))?;
+        Ok((Box::new(f), 0x8000))
+    } else {
+        let r = wux_reader::WuxReader::open(path)?;
+        let ss = r.sector_size();
+        Ok((Box::new(r), ss))
+    }
+}
+
+fn open_wiiu_si_fst(path: &Path) -> Result<(WiiUFst, Box<dyn WiiUDisc>, Option<[u8; 16]>), String> {
+    let (mut reader, sector_size) = open_wiiu_disc(path)?;
+    reader.seek(SeekFrom::Start(WIIU_SI_FST_OFFSET))
+        .map_err(|e| format!("WiiU SI seek: {e}"))?;
+    // One 0x8000-byte sector is ample for the SI FST (typically < 1 KB).
+    let mut buf = vec![0u8; 0x8000];
+    let n = reader.read(&mut buf).map_err(|e| format!("WiiU SI read: {e}"))?;
+    buf.truncate(n);
+
+    // Try cleartext (CAT-R / dev discs).
+    if buf.starts_with(b"FST\0") {
+        let fst = parse_wiiu_fst(&buf, sector_size)?;
+        return Ok((fst, reader, None));
+    }
+
+    // Encrypted (retail disc) — look for a same-named .key file with the title key.
+    let title_key = load_title_key(path)
+        .ok_or_else(|| "Wii U disc is encrypted; place a matching .key file alongside it".to_string())?;
+
+    let mut dec_buf = buf.clone();
+    wiiu_decrypt_sector(&title_key, &mut dec_buf);
+
+    if !dec_buf.starts_with(b"FST\0") {
+        return Err("Wii U SI FST decryption failed — wrong title key?".to_string());
+    }
+
+    let fst = parse_wiiu_fst(&dec_buf, sector_size)?;
+    Ok((fst, reader, Some(title_key)))
+}
+
+// Read `size` bytes from `disc_off`, decrypting each 0x8000-byte sector with IV=0
+// if a title key is provided.
+fn wiiu_read_at<R: Read + Seek>(
+    reader: &mut R,
+    disc_off: u64,
+    size: u64,
+    title_key: Option<&[u8; 16]>,
+) -> io::Result<Vec<u8>> {
+    const WSECTOR: u64 = 0x8000;
+    let mut result = Vec::with_capacity(size as usize);
+    let mut remaining = size;
+    let mut cur = disc_off;
+    while remaining > 0 {
+        let sec_base = (cur / WSECTOR) * WSECTOR;
+        let sec_off  = (cur - sec_base) as usize;
+        let chunk    = ((WSECTOR - sec_off as u64).min(remaining)) as usize;
+        if let Some(key) = title_key {
+            let mut sector = vec![0u8; WSECTOR as usize];
+            reader.seek(SeekFrom::Start(sec_base))?;
+            reader.read_exact(&mut sector)?;
+            wiiu_decrypt_sector(key, &mut sector);
+            result.extend_from_slice(&sector[sec_off..sec_off + chunk]);
+        } else {
+            let mut raw = vec![0u8; chunk];
+            reader.seek(SeekFrom::Start(cur))?;
+            reader.read_exact(&mut raw)?;
+            result.extend_from_slice(&raw);
+        }
+        remaining -= chunk as u64;
+        cur       += chunk as u64;
+    }
+    Ok(result)
+}
+
+fn wiiu_fst_list_dir(fst: &WiiUFst, dir_path: &str) -> Result<Vec<DiscEntry>, String> {
+    let dir_idx = fst.find_entry(dir_path)
+        .ok_or_else(|| format!("WUX: directory not found: {dir_path}"))?;
+    if !fst.is_dir(dir_idx) {
+        return Err(format!("WUX: not a directory: {dir_path}"));
+    }
+    let mut entries = Vec::new();
+    for idx in fst.list_children(dir_idx) {
+        let is_dir = fst.is_dir(idx);
+        let e = &fst.entries[idx];
+        let size_bytes = if is_dir { 0 } else { e.size };
+        let lba = if is_dir { 0 } else { (fst.disc_offset(idx) / 2048) as u32 };
+        entries.push(DiscEntry {
+            name:       fst.name(idx).to_string(),
+            is_dir,
+            lba,
+            size:       size_bytes,
+            size_bytes,
+            modified:   String::new(),
+        });
+    }
+    Ok(entries)
+}
+
+fn wiiu_fst_extract_file<R: Read + Seek>(
+    fst: &WiiUFst, reader: &mut R, file_path: &str, dest_path: &str,
+    title_key: Option<&[u8; 16]>,
+) -> Result<(), String> {
+    let idx = fst.find_entry(file_path)
+        .ok_or_else(|| format!("WiiU: file not found: {file_path}"))?;
+    if fst.is_dir(idx) {
+        return Err(format!("WiiU: {file_path} is a directory"));
+    }
+    let disc_off = fst.disc_offset(idx);
+    let size     = fst.entries[idx].size as u64;
+    let data = wiiu_read_at(reader, disc_off, size, title_key)
+        .map_err(|e| format!("WiiU file read: {e}"))?;
+    let mut out = File::create(dest_path)
+        .map_err(|e| format!("Create dest file: {e}"))?;
+    out.write_all(&data).map_err(|e| format!("Write: {e}"))?;
+    Ok(())
+}
+
+fn wiiu_fst_extract_dir<R: Read + Seek>(
+    fst: &WiiUFst, reader: &mut R, dir_path: &str, dest_path: &str,
+    title_key: Option<&[u8; 16]>,
+) -> Result<(), String> {
+    let dir_idx = fst.find_entry(dir_path)
+        .ok_or_else(|| format!("WiiU: directory not found: {dir_path}"))?;
+    if !fst.is_dir(dir_idx) {
+        return Err(format!("WiiU: {dir_path} is not a directory"));
+    }
+    fs::create_dir_all(dest_path)
+        .map_err(|e| format!("Create dir {dest_path}: {e}"))?;
+    for idx in fst.list_children(dir_idx) {
+        let name      = fst.name(idx).to_string();
+        let child_dest = format!("{dest_path}/{name}");
+        let child_src  = if dir_path == "/" || dir_path.is_empty() {
+            format!("/{name}")
+        } else {
+            format!("{dir_path}/{name}")
+        };
+        if fst.is_dir(idx) {
+            wiiu_fst_extract_dir(fst, reader, &child_src, &child_dest, title_key)?;
+        } else {
+            wiiu_fst_extract_file(fst, reader, &child_src, &child_dest, title_key)?;
+        }
+    }
+    Ok(())
+}
+
+fn wux_disc_label(path: &Path) -> Option<String> {
+    let (mut reader, _) = open_wiiu_disc(path).ok()?;
+    // Wii U disc header at offset 0: bytes 0x20–0x5F contain the title string.
+    let mut hdr = [0u8; 0x60];
+    reader.seek(SeekFrom::Start(0)).ok()?;
+    reader.read_exact(&mut hdr).ok()?;
+    let title_raw = &hdr[0x20..0x60];
+    let title_end = title_raw.iter().position(|&b| b == 0).unwrap_or(title_raw.len());
+    let title = String::from_utf8_lossy(&title_raw[..title_end]).trim().to_string();
+    if title.is_empty() {
+        Some("Wii U disc".to_string())
+    } else {
+        Some(format!("Wii U — {title}"))
+    }
+}
+
+fn detect_filesystems_wux(path: &Path) -> Vec<String> {
+    match wux_disc_label(path) {
+        Some(label) => vec![label],
+        None => vec![],
+    }
+}
+
+// ── Redumper raw dump support ─────────────────────────────────────────────────
+// .sdram — Redumper scrambled DVD dump (raw EFM/ECC encoded sectors)
+// .sbram — Redumper Blu-ray dump (2052-byte sectors: 2048 data + 4 EDC)
+// Neither format maps directly to 2048-byte logical ISO sectors without full
+// EFM decoding / EDC stripping; filesystem browsing is not yet supported.
+
+fn detect_filesystems_redumper_dvd(_path: &Path) -> Vec<String> {
+    vec!["Redumper DVD dump".to_string()]
+}
+
+fn detect_filesystems_redumper_bd(_path: &Path) -> Vec<String> {
+    vec!["Redumper BD dump".to_string()]
+}
+
+// ── BlindWrite 5/6 (.b5t/.b6t) support ──────────────────────────────────────
+// BWT5 single-file metadata format + companion .b5i/.b6i data file.
+// Header layout (260 bytes, all LE):
+//   [0x00]  u8[16]  signature "BWT5 STREAM SIGN"
+//   [0x10]  u32[8]  unknown1
+//   [0x30]  u16     profile  (0–8 = CD types; >=9 = DVD → use dvdInfoLen)
+//   [0x32]  u16     sessions
+//   [0x34]  u32[3]  unknown2
+//   [0x40]  bool[3] mcnIsValid
+//   [0x43]  u8[13]  mcn
+//   [0x50]  u16     unknown3
+//   [0x52]  u32[4]  unknown4
+//   [0x62]  u16     pmaLen
+//   [0x64]  u16     atipLen
+//   [0x66]  u16     cdtLen
+//   [0x68]  u16     cdInfoLen
+//   [0x6A]  u32     bcaLen
+//   [0x6E]  u32[3]  unknown5
+//   [0x7A]  u32     dvdStrLen
+//   [0x7E]  u32     dvdInfoLen
+//   [0x82]  u8[32]  unknown6
+//   [0xA2]  u8[8]   manufacturer
+//   [0xAA]  u8[16]  product
+//   [0xBA]  u8[4]   revision
+//   [0xBE]  u8[20]  vendor
+//   [0xD2]  u8[32]  volumeId
+//   [0xF2]  u32     mode2ALen
+//   [0xF6]  u32     unkBlkLen
+//   [0xFA]  u32     dataLen
+//   [0xFE]  u32     sessionsLen
+//   [0x102] u32     dpmLen
+//
+// After header: blobs in order: mode2A, unkBlk, pma, atip, cdt, bca, dvdStr, discInfo
+// Then: u32 pathCharCount + pathCharCount*2 UTF-16LE bytes
+// Then: u32 dataBlockCount + dataBlockCount × DataFile records
+// DataFile fixed block (52 bytes):
+//   [0x00] u32 type, [0x04] u32 length,
+//   [0x08] u32[4] unknown1, [0x18] u32 offset (into .b5i/.b6i),
+//   [0x1C] u32[3] unknown2, [0x28] i32 startLba, [0x2C] i32 sectors,
+//   [0x30] u32 filenameLen
+// Followed by filenameLen UTF-16LE bytes + 4 bytes unknown3.
+// TrackType: 0=NotData, 1=Audio, 2=Mode1, 3=Mode2, 4=Mode2F1, 5=Mode2F2, 6=Dvd
+
+const B5T_SIGNATURE: &[u8; 16] = b"BWT5 STREAM SIGN";
+
+fn parse_b5t_for_data_track(path: &Path) -> Result<DataTrack, String> {
+    use encoding_rs::UTF_16LE;
+    let data = fs::read(path).map_err(|e| format!("Cannot read BlindWrite: {e}"))?;
+    if data.len() < 260 || &data[0..16] != B5T_SIGNATURE {
+        return Err("Not a BlindWrite 5/6 file".to_string());
+    }
+
+    let r16 = |off: usize| u16::from_le_bytes([data[off], data[off+1]]) as usize;
+    let r32 = |off: usize| u32::from_le_bytes([data[off], data[off+1], data[off+2], data[off+3]]) as usize;
+
+    let profile      = r16(0x30) as u16;
+    let pma_len      = r16(0x62);
+    let atip_len     = r16(0x64);
+    let cdt_len      = r16(0x66);
+    let cd_info_len  = r16(0x68);
+    let bca_len      = r32(0x6A);
+    let dvd_str_len  = r32(0x7A);
+    let dvd_info_len = r32(0x7E);
+    let mode2a_len   = r32(0xF2);
+    let unk_blk_len  = r32(0xF6);
+
+    let disc_info_len = if profile <= 8 { cd_info_len } else { dvd_info_len };
+    let blob_skip = mode2a_len + unk_blk_len + pma_len + atip_len + cdt_len + bca_len + dvd_str_len + disc_info_len;
+
+    let mut pos = 260 + blob_skip;
+    if pos + 4 > data.len() { return Err("BlindWrite: truncated after blobs".to_string()); }
+
+    let path_char_count = r32(pos);
+    pos += 4 + path_char_count * 2;
+    if pos + 4 > data.len() { return Err("BlindWrite: truncated before dataBlockCount".to_string()); }
+
+    let data_block_count = r32(pos);
+    pos += 4;
+
+    let companion_ext = if path.extension().map_or(false, |e| e.eq_ignore_ascii_case("b5t")) { "b5i" } else { "b6i" };
+    let parent_dir = path.parent().unwrap_or(Path::new("."));
+
+    for _ in 0..data_block_count {
+        if pos + 52 > data.len() { break; }
+        let df_type      = u32::from_le_bytes([data[pos], data[pos+1], data[pos+2], data[pos+3]]);
+        let df_offset    = u32::from_le_bytes([data[pos+0x18], data[pos+0x19], data[pos+0x1A], data[pos+0x1B]]) as u64;
+        let filename_len = u32::from_le_bytes([data[pos+0x30], data[pos+0x31], data[pos+0x32], data[pos+0x33]]) as usize;
+        pos += 52;
+        if pos + filename_len > data.len() { break; }
+        let fname_bytes = &data[pos..pos+filename_len];
+        pos += filename_len + 4; // skip filename + Unknown3
+
+        // Skip NotData (0) and Audio (1)
+        if df_type == 0 || df_type == 1 { continue; }
+
+        let (stride, user_data_offset) = match df_type {
+            6 => (2048u64, 0u64),       // DVD
+            2 | 4 => (2352u64, 16u64),  // Mode1, Mode2Form1
+            _ => (2352u64, 24u64),      // Mode2, Mode2Form2
+        };
+
+        // Resolve companion file: try decoded filename, then extension swap
+        let (decoded, _, _) = UTF_16LE.decode(fname_bytes);
+        let decoded_name = decoded.trim_end_matches('\0');
+        let bin_path = if !decoded_name.is_empty() {
+            let candidate = parent_dir.join(Path::new(decoded_name).file_name().unwrap_or_default());
+            if candidate.exists() { candidate } else { path.with_extension(companion_ext) }
+        } else {
+            path.with_extension(companion_ext)
+        };
+
+        let lba_offset = if user_data_offset > 0 { sector_lba_at(&bin_path, df_offset) } else { 0 };
+
+        return Ok(DataTrack {
+            bin_path, track_offset: df_offset, user_data_offset, stride,
+            lba_offset, descramble: false, sector_count: 0,
+        });
+    }
+
+    Err("BlindWrite: no data track found".to_string())
+}
+
+fn detect_filesystems_b5t(path: &Path) -> Vec<String> {
+    let Ok(track) = parse_b5t_for_data_track(path) else { return vec![] };
+    detect_filesystems_in_bin(&track.bin_path, track.track_offset, track.user_data_offset, track.lba_offset, track.descramble)
+}
+
+// ── UIF (MagicISO compressed image) support ───────────────────────────────────
+// BBIS footer (56 bytes at file_end - 56) points to BLHR block.
+// BLHR contains a zlib-compressed table of sector-block descriptors.
+// Each block covers `size` sectors, compressed with zlib or stored raw.
+
+const UIF_BBIS_SIGN: u32 = 0x73696262; // "bbis" LE
+const UIF_BLHR_SIGN: u32 = 0x72686C62; // "blhr" LE
+
+struct BlhrEntry {
+    offset: u64,
+    zsize:  u32,
+    sector: u32,
+    size:   u32,
+    typ:    u32,
+}
+
+pub struct UifReader {
+    file:        File,
+    entries:     Vec<BlhrEntry>,
+    sector_size: u32,
+    cache:       Option<(usize, Vec<u8>)>, // (entry_idx, decompressed block)
+}
+
+impl UifReader {
+    pub fn open(path: &Path) -> Result<Self, String> {
+        let mut f = File::open(path).map_err(|e| format!("Cannot open UIF: {e}"))?;
+        let file_len = fs::metadata(path).map_err(|e| format!("UIF stat: {e}"))?.len();
+        if file_len < 56 { return Err("UIF: file too small".to_string()); }
+
+        // Read BBIS footer
+        f.seek(SeekFrom::Start(file_len - 56)).map_err(|e| format!("UIF BBIS seek: {e}"))?;
+        let mut footer = [0u8; 56];
+        f.read_exact(&mut footer).map_err(|e| format!("UIF BBIS read: {e}"))?;
+
+        if u32::from_le_bytes([footer[0], footer[1], footer[2], footer[3]]) != UIF_BBIS_SIGN {
+            return Err("Not a UIF file".to_string());
+        }
+        let sector_size = u32::from_le_bytes([footer[0x14], footer[0x15], footer[0x16], footer[0x17]]);
+        let blhr_off = u64::from_le_bytes(footer[0x1C..0x24].try_into().unwrap());
+        if sector_size == 0 { return Err("UIF: sector_size=0".to_string()); }
+
+        // Read BLHR header
+        f.seek(SeekFrom::Start(blhr_off)).map_err(|e| format!("UIF BLHR seek: {e}"))?;
+        let mut blhr_hdr = [0u8; 16];
+        f.read_exact(&mut blhr_hdr).map_err(|e| format!("UIF BLHR header: {e}"))?;
+        if u32::from_le_bytes([blhr_hdr[0], blhr_hdr[1], blhr_hdr[2], blhr_hdr[3]]) != UIF_BLHR_SIGN {
+            return Err("UIF: invalid BLHR signature".to_string());
+        }
+        let blhr_size    = u32::from_le_bytes([blhr_hdr[4], blhr_hdr[5], blhr_hdr[6], blhr_hdr[7]]) as usize;
+        let num_entries  = u32::from_le_bytes([blhr_hdr[12], blhr_hdr[13], blhr_hdr[14], blhr_hdr[15]]) as usize;
+
+        // Compressed entry table follows; size field includes the ver+num fields (8 bytes).
+        let comp_size = blhr_size.saturating_sub(8);
+        let mut comp_data = vec![0u8; comp_size];
+        f.read_exact(&mut comp_data).map_err(|e| format!("UIF BLHR data: {e}"))?;
+
+        let expected_raw = num_entries * 24;
+        let mut raw = vec![0u8; expected_raw];
+        ZlibDecoder::new(&comp_data[..])
+            .read_exact(&mut raw)
+            .map_err(|e| format!("UIF BLHR decompress: {e}"))?;
+
+        let entries: Vec<BlhrEntry> = raw.chunks_exact(24).map(|e| BlhrEntry {
+            offset: u64::from_le_bytes(e[0..8].try_into().unwrap()),
+            zsize:  u32::from_le_bytes([e[8],  e[9],  e[10], e[11]]),
+            sector: u32::from_le_bytes([e[12], e[13], e[14], e[15]]),
+            size:   u32::from_le_bytes([e[16], e[17], e[18], e[19]]),
+            typ:    u32::from_le_bytes([e[20], e[21], e[22], e[23]]),
+        }).collect();
+
+        Ok(UifReader { file: f, entries, sector_size, cache: None })
+    }
+
+    pub fn total_sectors(&self) -> u64 {
+        self.entries.last().map(|e| (e.sector + e.size) as u64).unwrap_or(0)
+    }
+
+    fn find_entry(&self, lba: u64) -> Option<usize> {
+        let lba32 = lba as u32;
+        self.entries.iter().position(|e| lba32 >= e.sector && lba32 < e.sector + e.size)
+    }
+
+    fn load_entry(&mut self, idx: usize) -> io::Result<()> {
+        if self.cache.as_ref().map_or(false, |(i, _)| *i == idx) { return Ok(()); }
+        let e = &self.entries[idx];
+        self.file.seek(SeekFrom::Start(e.offset))?;
+        let mut comp = vec![0u8; e.zsize as usize];
+        self.file.read_exact(&mut comp)?;
+        let block = match e.typ {
+            1 => comp, // raw/uncompressed
+            3 => vec![0u8; (e.size * self.sector_size) as usize], // zero-fill
+            _ => {
+                let out_size = (e.size * self.sector_size) as usize;
+                let mut out = vec![0u8; out_size];
+                ZlibDecoder::new(&comp[..])
+                    .read_exact(&mut out)
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                out
+            }
+        };
+        self.cache = Some((idx, block));
+        Ok(())
+    }
+}
+
+impl ISO9660Reader for UifReader {
+    fn read_at(&mut self, buf: &mut [u8], lba: u64) -> io::Result<usize> {
+        let idx = self.find_entry(lba)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "UIF: LBA not found"))?;
+        self.load_entry(idx)?;
+        let e = &self.entries[idx];
+        let block_off = ((lba as u32 - e.sector) * self.sector_size) as usize;
+        let block = &self.cache.as_ref().unwrap().1;
+        let avail = block.len().saturating_sub(block_off);
+        let to_copy = buf.len().min(avail);
+        buf[..to_copy].copy_from_slice(&block[block_off..block_off + to_copy]);
+        Ok(to_copy)
+    }
+}
+
+fn open_uif_fs(path: &Path) -> Result<ISO9660<UifReader>, String> {
+    let reader = UifReader::open(path)?;
+    ISO9660::new(reader).map_err(|e| format!("ISO9660 (UIF): {e}"))
+}
+
+fn detect_filesystems_uif(path: &Path) -> Vec<String> {
+    if open_uif_fs(path).is_ok() { vec!["ISO 9660".to_string()] } else { vec![] }
+}
+
+// ── CIF (Easy CD Creator) support ─────────────────────────────────────────────
+// Pure RIFF file: form type "imag". Data tracks are embedded in the .cif itself.
+// The "ofs " chunk holds an offset table mapping tracks to in-file data positions.
+// Each CifOffsetEntry (22 bytes): signature(4) + length(4) + type(4) + offset(4) + dummy(6).
+// Type "info" (0x6F666E69) = data track; add 12 to entry.offset to skip RIFF block header.
+
+const CIF_RIFF:   u32 = 0x46464952; // "RIFF" LE
+const CIF_IMAG:   u32 = 0x67616D69; // "imag" LE
+const CIF_OFS_ID: u32 = 0x2073666F; // "ofs " LE (6F 66 73 20)
+const CIF_INFO:   u32 = 0x6F666E69; // "info" LE
+
+fn parse_cif_for_data_track(path: &Path) -> Result<DataTrack, String> {
+    let data = fs::read(path).map_err(|e| format!("Cannot read CIF: {e}"))?;
+    if data.len() < 12 { return Err("Not a CIF file".to_string()); }
+    let riff_id  = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+    let form_type = u32::from_le_bytes([data[8], data[9], data[10], data[11]]);
+    if riff_id != CIF_RIFF || form_type != CIF_IMAG {
+        return Err("Not a CIF (Easy CD Creator) file".to_string());
+    }
+
+    // Scan for "ofs " chunk by iterating RIFF blocks starting at byte 12.
+    let mut scan = 12usize;
+    while scan + 8 <= data.len() {
+        let chunk_id  = u32::from_le_bytes([data[scan], data[scan+1], data[scan+2], data[scan+3]]);
+        let chunk_len = u32::from_le_bytes([data[scan+4], data[scan+5], data[scan+6], data[scan+7]]) as usize;
+        let chunk_data_start = scan + 8;
+        let next_chunk = chunk_data_start + chunk_len;
+
+        if chunk_id == CIF_OFS_ID && chunk_len >= 14 {
+            // "ofs " chunk: 8 dummy bytes + u16 numEntries + entries
+            let entries_start = chunk_data_start + 8;
+            if entries_start + 2 > data.len() { break; }
+            let num_entries = u16::from_le_bytes([data[entries_start], data[entries_start+1]]) as usize;
+            let mut ep = entries_start + 2;
+            for _ in 0..num_entries {
+                if ep + 22 > data.len() { break; }
+                let entry_type   = u32::from_le_bytes([data[ep+8], data[ep+9], data[ep+10], data[ep+11]]);
+                let entry_offset = u32::from_le_bytes([data[ep+12], data[ep+13], data[ep+14], data[ep+15]]) as u64;
+                ep += 22;
+                if entry_type != CIF_INFO { continue; }
+                // Data sector data starts 12 bytes after the raw RIFF block header offset
+                let data_start = entry_offset + 12;
+                let (stride, user_data_offset) = detect_sector_format_at(path, data_start);
+                return Ok(DataTrack {
+                    bin_path: path.to_path_buf(),
+                    track_offset: data_start,
+                    user_data_offset,
+                    stride,
+                    lba_offset: 0,
+                    descramble: false,
+                    sector_count: 0,
+                });
+            }
+            break;
+        }
+
+        // Each RIFF chunk is padded to even length
+        let padded = chunk_len + (chunk_len & 1);
+        scan = chunk_data_start + padded;
+    }
+
+    Err("CIF: no data track found".to_string())
+}
+
+fn detect_filesystems_cif(path: &Path) -> Vec<String> {
+    let Ok(track) = parse_cif_for_data_track(path) else { return vec![] };
+    detect_filesystems_in_bin(&track.bin_path, track.track_offset, track.user_data_offset, track.lba_offset, track.descramble)
+}
+
+// ── AaruFormat (.aif) support ─────────────────────────────────────────────────
+// Complex multi-compression format (LZMA, zstd, zlib, raw).  We detect the
+// magic and report the format name; full filesystem browsing is not yet
+// implemented.
+
+const AARU_MAGIC: &[u8; 8] = b"AARUFRMT";
+const DICM_MAGIC: &[u8; 8] = b"DICMFRMT";
+
+fn detect_filesystems_aif(path: &Path) -> Vec<String> {
+    let Ok(mut f) = File::open(path) else { return vec![] };
+    let mut magic = [0u8; 8];
+    if f.read_exact(&mut magic).is_err() { return vec![]; }
+    if &magic == AARU_MAGIC || &magic == DICM_MAGIC {
+        vec!["AaruFormat image".to_string()]
+    } else {
+        vec![]
+    }
+}
+
+// ── Zstandard-compressed disc images (.skeleton.zst, etc.) ───────────────────
+// Decompress the entire file into memory, then detect + serve sectors normally.
+// Skeleton images compress to near-nothing (all-zero file data), so even a
+// DVD-sized skeleton fits comfortably in RAM after decompression.
+
+pub struct ZstReader {
+    data:             Vec<u8>,
+    sector_size:      u64,
+    user_data_offset: u64,
+}
+
+impl ZstReader {
+    pub fn open(path: &Path) -> Result<Self, String> {
+        let f = File::open(path).map_err(|e| format!("Cannot open ZST: {e}"))?;
+        let data = zstd::decode_all(f).map_err(|e| format!("ZST decompress: {e}"))?;
+        const SYNC: [u8; 12] = [0x00,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0x00];
+        let (sector_size, user_data_offset) = if data.len() >= 16 && data[0..12] == SYNC {
+            (2352u64, if data[15] == 2 { 24u64 } else { 16u64 })
+        } else {
+            (2048u64, 0u64)
+        };
+        Ok(ZstReader { data, sector_size, user_data_offset })
+    }
+}
+
+impl ISO9660Reader for ZstReader {
+    fn read_at(&mut self, buf: &mut [u8], lba: u64) -> io::Result<usize> {
+        let pos = (lba * self.sector_size + self.user_data_offset) as usize;
+        if pos >= self.data.len() { return Ok(0); }
+        let avail = (self.data.len() - pos).min(buf.len());
+        buf[..avail].copy_from_slice(&self.data[pos..pos + avail]);
+        Ok(avail)
+    }
+}
+
+fn open_zst_fs(path: &Path) -> Result<ISO9660<ZstReader>, String> {
+    let reader = ZstReader::open(path)?;
+    ISO9660::new(reader).map_err(|e| format!("ISO9660 (ZST): {e}"))
+}
+
+fn detect_filesystems_zst(path: &Path) -> Vec<String> {
+    if open_zst_fs(path).is_ok() { vec!["ISO 9660".to_string()] } else { vec![] }
+}
+
 fn open_xdvdfs_fs(track: &DataTrack) -> Result<xdvdfs_filesystem::XDVDFSFs<File>, String> {
     let bin = File::open(&track.bin_path).map_err(|e| format!("Cannot open: {e}"))?;
     xdvdfs_filesystem::XDVDFSFs::new(bin, track.track_offset)
@@ -3429,12 +4748,14 @@ fn list_disc_contents(image_path: String, dir_path: String, filesystem: Option<S
 
     let lower = path.to_lowercase();
 
-    if lower.ends_with(".cue") || lower.ends_with(".mds") || lower.ends_with(".nrg") || lower.ends_with(".ccd") || lower.ends_with(".cdi") || lower.ends_with(".gdi") {
+    if lower.ends_with(".cue") || lower.ends_with(".mds") || lower.ends_with(".nrg") || lower.ends_with(".ccd") || lower.ends_with(".cdi") || lower.ends_with(".gdi") || lower.ends_with(".b5t") || lower.ends_with(".b6t") || lower.ends_with(".cif") {
         let track = if lower.ends_with(".cue") { parse_cue_for_data_track(Path::new(path))? }
             else if lower.ends_with(".mds") { parse_mds_for_data_track(Path::new(path))? }
             else if lower.ends_with(".nrg") { parse_nrg_for_data_track(Path::new(path))? }
             else if lower.ends_with(".ccd") { parse_ccd_for_data_track(Path::new(path))? }
             else if lower.ends_with(".gdi") { parse_gdi_for_data_track(Path::new(path))? }
+            else if lower.ends_with(".b5t") || lower.ends_with(".b6t") { parse_b5t_for_data_track(Path::new(path))? }
+            else if lower.ends_with(".cif") { parse_cif_for_data_track(Path::new(path))? }
             else { parse_cdi_for_data_track(Path::new(path))? };
         if cdi_filesystem::is_cdi_disc(&track.bin_path, track.track_offset, track.user_data_offset, track.lba_offset, track.descramble) {
             open_cdi_fs(&track)?.list_directory(&dir_path)
@@ -3469,6 +4790,19 @@ fn list_disc_contents(image_path: String, dir_path: String, filesystem: Option<S
         collect_entries(&open_cso_fs(Path::new(path))?, &dir_path)
     } else if lower.ends_with(".ecm") {
         collect_entries(&open_ecm_fs(Path::new(path))?, &dir_path)
+    } else if lower.ends_with(".uif") {
+        collect_entries(&open_uif_fs(Path::new(path))?, &dir_path)
+    } else if lower.ends_with(".aif") {
+        Err("AaruFormat full browsing is not yet supported".to_string())
+    } else if lower.ends_with(".skeleton.zst") || lower.ends_with(".iso.zst") || lower.ends_with(".img.zst") {
+        collect_entries(&open_zst_fs(Path::new(path))?, &dir_path)
+    } else if lower.ends_with(".wbfs") {
+        open_gcm_wbfs(Path::new(path))?.list_directory(&dir_path)
+    } else if lower.ends_with(".wux") || lower.ends_with(".wud") {
+        let (fst, _, _) = open_wiiu_si_fst(Path::new(path))?;
+        wiiu_fst_list_dir(&fst, &dir_path)
+    } else if lower.ends_with(".sdram") || lower.ends_with(".sbram") {
+        Err("Redumper raw dumps require EFM/EDC decoding; browsing not yet supported".to_string())
     } else if lower.ends_with(".mdx") {
         let path_obj = Path::new(path);
         let track = parse_mdx_as_data_track(path_obj);
@@ -3545,12 +4879,14 @@ fn save_file(image_path: String, file_path: String, dest_path: String, filesyste
 
     let lower = path.to_lowercase();
 
-    if lower.ends_with(".cue") || lower.ends_with(".mds") || lower.ends_with(".nrg") || lower.ends_with(".ccd") || lower.ends_with(".cdi") || lower.ends_with(".gdi") {
+    if lower.ends_with(".cue") || lower.ends_with(".mds") || lower.ends_with(".nrg") || lower.ends_with(".ccd") || lower.ends_with(".cdi") || lower.ends_with(".gdi") || lower.ends_with(".b5t") || lower.ends_with(".b6t") || lower.ends_with(".cif") {
         let track = if lower.ends_with(".cue") { parse_cue_for_data_track(Path::new(path))? }
             else if lower.ends_with(".mds") { parse_mds_for_data_track(Path::new(path))? }
             else if lower.ends_with(".nrg") { parse_nrg_for_data_track(Path::new(path))? }
             else if lower.ends_with(".ccd") { parse_ccd_for_data_track(Path::new(path))? }
             else if lower.ends_with(".gdi") { parse_gdi_for_data_track(Path::new(path))? }
+            else if lower.ends_with(".b5t") || lower.ends_with(".b6t") { parse_b5t_for_data_track(Path::new(path))? }
+            else if lower.ends_with(".cif") { parse_cif_for_data_track(Path::new(path))? }
             else { parse_cdi_for_data_track(Path::new(path))? };
         if cdi_filesystem::is_cdi_disc(&track.bin_path, track.track_offset, track.user_data_offset, track.lba_offset, track.descramble) {
             open_cdi_fs(&track)?.extract_file(&file_path, &dest_path)
@@ -3585,6 +4921,19 @@ fn save_file(image_path: String, file_path: String, dest_path: String, filesyste
         extract_file_from_fs(&open_cso_fs(Path::new(path))?, &file_path, &dest_path)
     } else if lower.ends_with(".ecm") {
         extract_file_from_fs(&open_ecm_fs(Path::new(path))?, &file_path, &dest_path)
+    } else if lower.ends_with(".uif") {
+        extract_file_from_fs(&open_uif_fs(Path::new(path))?, &file_path, &dest_path)
+    } else if lower.ends_with(".aif") {
+        Err("AaruFormat full browsing is not yet supported".to_string())
+    } else if lower.ends_with(".skeleton.zst") || lower.ends_with(".iso.zst") || lower.ends_with(".img.zst") {
+        extract_file_from_fs(&open_zst_fs(Path::new(path))?, &file_path, &dest_path)
+    } else if lower.ends_with(".wbfs") {
+        open_gcm_wbfs(Path::new(path))?.extract_file(&file_path, &dest_path)
+    } else if lower.ends_with(".wux") || lower.ends_with(".wud") {
+        let (fst, mut reader, key) = open_wiiu_si_fst(Path::new(path))?;
+        wiiu_fst_extract_file(&fst, &mut reader, &file_path, &dest_path, key.as_ref())
+    } else if lower.ends_with(".sdram") || lower.ends_with(".sbram") {
+        Err("Redumper raw dumps require EFM/EDC decoding; browsing not yet supported".to_string())
     } else if lower.ends_with(".mdx") {
         let path_obj = Path::new(path);
         let track = parse_mdx_as_data_track(path_obj);
@@ -3662,12 +5011,14 @@ fn save_directory(image_path: String, dir_path: String, dest_path: String, files
 
     let lower = path.to_lowercase();
 
-    if lower.ends_with(".cue") || lower.ends_with(".mds") || lower.ends_with(".nrg") || lower.ends_with(".ccd") || lower.ends_with(".cdi") || lower.ends_with(".gdi") {
+    if lower.ends_with(".cue") || lower.ends_with(".mds") || lower.ends_with(".nrg") || lower.ends_with(".ccd") || lower.ends_with(".cdi") || lower.ends_with(".gdi") || lower.ends_with(".b5t") || lower.ends_with(".b6t") || lower.ends_with(".cif") {
         let track = if lower.ends_with(".cue") { parse_cue_for_data_track(Path::new(path))? }
             else if lower.ends_with(".mds") { parse_mds_for_data_track(Path::new(path))? }
             else if lower.ends_with(".nrg") { parse_nrg_for_data_track(Path::new(path))? }
             else if lower.ends_with(".ccd") { parse_ccd_for_data_track(Path::new(path))? }
             else if lower.ends_with(".gdi") { parse_gdi_for_data_track(Path::new(path))? }
+            else if lower.ends_with(".b5t") || lower.ends_with(".b6t") { parse_b5t_for_data_track(Path::new(path))? }
+            else if lower.ends_with(".cif") { parse_cif_for_data_track(Path::new(path))? }
             else { parse_cdi_for_data_track(Path::new(path))? };
         if cdi_filesystem::is_cdi_disc(&track.bin_path, track.track_offset, track.user_data_offset, track.lba_offset, track.descramble) {
             open_cdi_fs(&track)?.extract_directory(&dir_path, &dest_path)
@@ -3702,6 +5053,19 @@ fn save_directory(image_path: String, dir_path: String, dest_path: String, files
         extract_dir_from_fs(&open_cso_fs(Path::new(path))?, &dir_path, &dest_path)
     } else if lower.ends_with(".ecm") {
         extract_dir_from_fs(&open_ecm_fs(Path::new(path))?, &dir_path, &dest_path)
+    } else if lower.ends_with(".uif") {
+        extract_dir_from_fs(&open_uif_fs(Path::new(path))?, &dir_path, &dest_path)
+    } else if lower.ends_with(".aif") {
+        Err("AaruFormat full browsing is not yet supported".to_string())
+    } else if lower.ends_with(".skeleton.zst") || lower.ends_with(".iso.zst") || lower.ends_with(".img.zst") {
+        extract_dir_from_fs(&open_zst_fs(Path::new(path))?, &dir_path, &dest_path)
+    } else if lower.ends_with(".wbfs") {
+        open_gcm_wbfs(Path::new(path))?.extract_directory(&dir_path, &dest_path)
+    } else if lower.ends_with(".wux") || lower.ends_with(".wud") {
+        let (fst, mut reader, key) = open_wiiu_si_fst(Path::new(path))?;
+        wiiu_fst_extract_dir(&fst, &mut reader, &dir_path, &dest_path, key.as_ref())
+    } else if lower.ends_with(".sdram") || lower.ends_with(".sbram") {
+        Err("Redumper raw dumps require EFM/EDC decoding; browsing not yet supported".to_string())
     } else if lower.ends_with(".mdx") {
         let path_obj = Path::new(path);
         let track = parse_mdx_as_data_track(path_obj);
@@ -3782,9 +5146,12 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_shell::init())
         .manage(MountedImages(Mutex::new(Vec::new())))
         .manage(EmulatedDrives(Mutex::new(Vec::new())))
         .manage(SectorViewParamStore(Mutex::new(std::collections::HashMap::new())))
+        .manage(WiiUKeyState(Mutex::new(None)))
+        .manage(RedumperDumpState(Arc::new(Mutex::new(None))))
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::Destroyed = event {
                 let state = window.app_handle().state::<MountedImages>();
@@ -3803,13 +5170,17 @@ pub fn run() {
             list_disc_contents, save_file, save_directory,
             get_cue_tracks, get_gdi_tracks, save_audio_track, list_optical_drives,
             get_mds_tracks, mount_disc_image, unmount_disc_image,
-            get_disc_filesystems, read_sector, get_platform, eject_disc,
+            get_disc_filesystems, read_sector, find_diff_sector, get_platform, eject_disc,
             check_cdemu_installed, install_cdemu,
             get_dpm_data, get_dpm_for_sector,
             get_cdi_tracks,
             emulate_drive, eject_emulated_drive, list_emulated_drives,
             open_sector_view_window, claim_sector_view_params,
-            check_for_update
+            export_sector_range,
+            check_for_update,
+            set_wiiu_key_path, get_wiiu_key_path,
+            get_redumper_version, start_redumper_dump, cancel_redumper_dump,
+            organize_dump_logs
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

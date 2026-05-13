@@ -2360,7 +2360,7 @@ async fn start_redumper_dump(
         .args(["dump",
                &format!("--drive={drive}"),
                &format!("--image-path={output_path}"),
-               "--drive-type=GENERIC", "--force-split"])
+               "--drive-type=GENERIC", "--force-split", "--leave-unchanged"])
         .spawn()
         .map_err(|e| format!("Failed to start redumper: {e}"))?;
     let child_arc = dump_state.0.clone();

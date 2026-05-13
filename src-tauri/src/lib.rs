@@ -363,6 +363,8 @@ fn get_disc_filesystems(image_path: String) -> Result<Vec<String>, String> {
         Ok(detect_filesystems_uif(path))
     } else if lower.ends_with(".aif") {
         Ok(detect_filesystems_aif(path))
+    } else if lower.ends_with(".skeleton") {
+        Ok(detect_filesystems_skeleton(path))
     } else if lower.ends_with(".skeleton.zst") || lower.ends_with(".iso.zst") || lower.ends_with(".img.zst") {
         Ok(detect_filesystems_zst(path))
     } else if lower.ends_with(".wbfs") {
@@ -4601,6 +4603,46 @@ fn detect_filesystems_aif(path: &Path) -> Vec<String> {
     }
 }
 
+// ── Skeleton disc images (.skeleton) ─────────────────────────────────────────
+// Disc images with zeroed file data; structurally identical to a raw ISO/BIN.
+// Sector size is auto-detected (2048 logical or 2352 raw with sync bytes).
+
+pub struct SkeletonReader {
+    file:             File,
+    file_len:         u64,
+    sector_size:      u64,
+    user_data_offset: u64,
+}
+
+impl SkeletonReader {
+    pub fn open(path: &Path) -> Result<Self, String> {
+        let mut file = File::open(path).map_err(|e| format!("Cannot open Skeleton: {e}"))?;
+        let file_len = file.seek(SeekFrom::End(0)).map_err(|e| format!("Seek error: {e}"))?;
+        let user_data_offset = detect_raw_sector_offset(path).unwrap_or(0);
+        let sector_size = if user_data_offset > 0 { RAW_SECTOR_SIZE } else { 2048 };
+        Ok(SkeletonReader { file, file_len, sector_size, user_data_offset })
+    }
+}
+
+impl ISO9660Reader for SkeletonReader {
+    fn read_at(&mut self, buf: &mut [u8], lba: u64) -> io::Result<usize> {
+        let pos = lba * self.sector_size + self.user_data_offset;
+        if pos >= self.file_len { return Ok(0); }
+        self.file.seek(SeekFrom::Start(pos))?;
+        let avail = ((self.file_len - pos) as usize).min(buf.len());
+        self.file.read(&mut buf[..avail])
+    }
+}
+
+fn open_skeleton_fs(path: &Path) -> Result<ISO9660<SkeletonReader>, String> {
+    let reader = SkeletonReader::open(path)?;
+    ISO9660::new(reader).map_err(|e| format!("ISO9660 (Skeleton): {e}"))
+}
+
+fn detect_filesystems_skeleton(path: &Path) -> Vec<String> {
+    if open_skeleton_fs(path).is_ok() { vec!["ISO 9660".to_string()] } else { vec![] }
+}
+
 // ── Zstandard-compressed disc images (.skeleton.zst, etc.) ───────────────────
 // Decompress the entire file into memory, then detect + serve sectors normally.
 // Skeleton images compress to near-nothing (all-zero file data), so even a
@@ -4794,6 +4836,8 @@ fn list_disc_contents(image_path: String, dir_path: String, filesystem: Option<S
         collect_entries(&open_uif_fs(Path::new(path))?, &dir_path)
     } else if lower.ends_with(".aif") {
         Err("AaruFormat full browsing is not yet supported".to_string())
+    } else if lower.ends_with(".skeleton") {
+        collect_entries(&open_skeleton_fs(Path::new(path))?, &dir_path)
     } else if lower.ends_with(".skeleton.zst") || lower.ends_with(".iso.zst") || lower.ends_with(".img.zst") {
         collect_entries(&open_zst_fs(Path::new(path))?, &dir_path)
     } else if lower.ends_with(".wbfs") {
@@ -4925,6 +4969,8 @@ fn save_file(image_path: String, file_path: String, dest_path: String, filesyste
         extract_file_from_fs(&open_uif_fs(Path::new(path))?, &file_path, &dest_path)
     } else if lower.ends_with(".aif") {
         Err("AaruFormat full browsing is not yet supported".to_string())
+    } else if lower.ends_with(".skeleton") {
+        extract_file_from_fs(&open_skeleton_fs(Path::new(path))?, &file_path, &dest_path)
     } else if lower.ends_with(".skeleton.zst") || lower.ends_with(".iso.zst") || lower.ends_with(".img.zst") {
         extract_file_from_fs(&open_zst_fs(Path::new(path))?, &file_path, &dest_path)
     } else if lower.ends_with(".wbfs") {
@@ -5057,6 +5103,8 @@ fn save_directory(image_path: String, dir_path: String, dest_path: String, files
         extract_dir_from_fs(&open_uif_fs(Path::new(path))?, &dir_path, &dest_path)
     } else if lower.ends_with(".aif") {
         Err("AaruFormat full browsing is not yet supported".to_string())
+    } else if lower.ends_with(".skeleton") {
+        extract_dir_from_fs(&open_skeleton_fs(Path::new(path))?, &dir_path, &dest_path)
     } else if lower.ends_with(".skeleton.zst") || lower.ends_with(".iso.zst") || lower.ends_with(".img.zst") {
         extract_dir_from_fs(&open_zst_fs(Path::new(path))?, &dir_path, &dest_path)
     } else if lower.ends_with(".wbfs") {

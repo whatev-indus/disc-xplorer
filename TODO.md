@@ -10,4 +10,4 @@ Added in v0.2.3 (cross-referenced against SabreTools / Aaru / Wiimm):
 - AaruFormat (.aif) — detect-only (complex multi-codec format)
 - Redumper raw dumps (.sdram/.sbram) — detect-only (requires EFM/EDC decode)
 - WUX (Wii U compressed) + WUD (uncompressed) — SI partition browse/extract; title key auto-loaded from .key file (AES-128-CBC IV=0); GM partition pending
-- Skeleton / Skeleton.zst — full read + browse (zstd-compressed variant)
+- Skeleton / Skeleton.zst — full read + browse

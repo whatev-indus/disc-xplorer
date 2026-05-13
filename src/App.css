@@ -199,13 +199,14 @@ body {
 .btn-settings {
   background: transparent;
   border: none;
-  color: var(--text-muted);
+  color: var(--accent);
   font-size: 28px;
   cursor: pointer;
   padding: 0 4px;
   line-height: 1;
 }
-.btn-settings:hover { color: var(--text-bright); }
+.btn-settings:hover { color: var(--accent-hover); }
+.btn-settings--open, .btn-settings--open:hover { color: #b380cf; }
 
 .btn-open {
   padding: 4px 12px;
@@ -248,29 +249,29 @@ body {
 
 .btn-dump {
   padding: 4px 12px;
-  background: transparent;
-  color: var(--text);
-  border: 1px solid var(--border);
+  background: var(--accent);
+  color: #fff;
+  border: none;
   border-radius: 3px;
   cursor: pointer;
   font-size: 12px;
   font-family: var(--font);
 }
-.btn-dump:hover:not(:disabled) { background: var(--bg-hover); }
+.btn-dump:hover:not(:disabled) { background: var(--accent-hover); }
 .btn-dump:disabled { opacity: 0.35; cursor: default; }
 
 .btn-icon {
   padding: 4px 8px;
-  background: transparent;
-  color: var(--text);
-  border: 1px solid var(--border);
+  background: var(--accent);
+  color: #fff;
+  border: none;
   border-radius: 3px;
   cursor: pointer;
   font-size: 13px;
   font-family: var(--font);
 }
 
-.btn-icon:hover:not(:disabled) { background: var(--bg-hover); }
+.btn-icon:hover:not(:disabled) { background: var(--accent-hover); }
 .btn-icon:disabled { opacity: 0.35; cursor: default; }
 
 .separator {

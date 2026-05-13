@@ -63,11 +63,17 @@ fn probe_header<F: Read + Seek>(reader: &mut F, disc_offset: u64) -> Option<Disc
     reader.seek(SeekFrom::Start(disc_offset)).ok()?;
     let mut hdr = [0u8; 0x440];
     reader.read_exact(&mut hdr).ok()?;
-    if be_u32(&hdr, HDR_DVD_MAGIC_OFF) != DVD_MAGIC { return None; }
-    if be_u32(&hdr, HDR_WII_MAGIC_OFF) == WII_MAGIC {
+    // Wii partition data headers have Wii magic at 0x18 but no DVD magic at 0x1C
+    // (DVD magic only exists in the outer unencrypted disc header).
+    // Accept Wii magic alone, or DVD magic + optional Wii magic for GameCube/Wii.
+    let wii_magic = be_u32(&hdr, HDR_WII_MAGIC_OFF) == WII_MAGIC;
+    let dvd_magic = be_u32(&hdr, HDR_DVD_MAGIC_OFF) == DVD_MAGIC;
+    if wii_magic {
         Some(DiscKind::Wii)
-    } else {
+    } else if dvd_magic {
         Some(DiscKind::GameCube)
+    } else {
+        None
     }
 }
 
@@ -148,8 +154,14 @@ impl<F: Read + Seek> GcmFs<F> {
             .map_err(|e| format!("Read error: {e}"))?;
 
         let game_title = trim_null(&hdr[HDR_TITLE_OFF..HDR_TITLE_OFF + HDR_TITLE_LEN]);
-        let fst_byte_off = be_u32(&hdr, HDR_FST_OFF) as u64;
-        let fst_size = be_u32(&hdr, HDR_FST_SIZE) as usize;
+        let fst_byte_off_raw = be_u32(&hdr, HDR_FST_OFF) as u64;
+        let fst_size_raw = be_u32(&hdr, HDR_FST_SIZE) as usize;
+        // Wii partition data headers store offsets and sizes as value÷4 (>>2 convention).
+        // GameCube disc headers use direct byte values.
+        let (fst_byte_off, fst_size) = match disc_kind {
+            DiscKind::Wii       => (fst_byte_off_raw << 2, fst_size_raw << 2),
+            DiscKind::GameCube  => (fst_byte_off_raw,      fst_size_raw),
+        };
 
         if fst_size == 0 || fst_size > 64 * 1024 * 1024 {
             return Err(format!("FST size {fst_size} out of range"));

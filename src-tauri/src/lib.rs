@@ -27,6 +27,7 @@ mod pce_filesystem;
 mod threedo_filesystem;
 mod udf_filesystem;
 mod wbfs_reader;
+mod wii_partition;
 mod wux_reader;
 mod xdvdfs_filesystem;
 
@@ -278,6 +279,12 @@ fn detect_filesystems_raw(path: &Path) -> Vec<String> {
     if user_data_offset == 0 {
         if let Some(kind) = gcm_filesystem::detect_gcm_disc(path) {
             return vec![gcm_kind_label(kind)];
+        }
+        // Fallback: try Wii encrypted partition table (self-identifies without DVD magic)
+        if let Ok(f) = File::open(path) {
+            if wii_partition::WiiPartReader::open(f).is_ok() {
+                return vec!["Wii GCM".to_string()];
+            }
         }
     }
 
@@ -3837,6 +3844,25 @@ macro_rules! with_fs {
     }};
 }
 
+// Dispatch WBFS to GcmFs, transparently decrypting Wii partitions when needed.
+// Try Wii encrypted partition first (self-identifies via partition table at 0x40000),
+// fall back to plain GcmFs for GameCube discs that have the DVD magic directly visible.
+macro_rules! with_wbfs_gcm {
+    ($path:expr, $fs:ident, $body:expr) => {{
+        let path__ = $path;
+        let wii_result__ = wbfs_reader::WbfsReader::open(path__)
+            .and_then(|r| wii_partition::WiiPartReader::open(r))
+            .and_then(|p| gcm_filesystem::GcmFs::new(p, 0));
+        if let Ok(mut $fs) = wii_result__ {
+            $body
+        } else {
+            let rdr__ = wbfs_reader::WbfsReader::open(path__)?;
+            let mut $fs = gcm_filesystem::GcmFs::new(rdr__, 0)?;
+            $body
+        }
+    }};
+}
+
 // ── Tauri commands ────────────────────────────────────────────────────────────
 
 fn open_udf_fs(track: &DataTrack) -> Result<udf_filesystem::UdfFs, String> {
@@ -4841,7 +4867,7 @@ fn list_disc_contents(image_path: String, dir_path: String, filesystem: Option<S
     } else if lower.ends_with(".skeleton.zst") || lower.ends_with(".iso.zst") || lower.ends_with(".img.zst") {
         collect_entries(&open_zst_fs(Path::new(path))?, &dir_path)
     } else if lower.ends_with(".wbfs") {
-        open_gcm_wbfs(Path::new(path))?.list_directory(&dir_path)
+        with_wbfs_gcm!(Path::new(path), fs, fs.list_directory(&dir_path))
     } else if lower.ends_with(".wux") || lower.ends_with(".wud") {
         let (fst, _, _) = open_wiiu_si_fst(Path::new(path))?;
         wiiu_fst_list_dir(&fst, &dir_path)
@@ -4885,9 +4911,18 @@ fn list_disc_contents(image_path: String, dir_path: String, filesystem: Option<S
             let file = File::open(path).map_err(|e| format!("Cannot open file: {e}"))?;
             return xdvdfs_filesystem::XDVDFSFs::new(file, 0)?.list_directory(&dir_path);
         }
-        if fs_matches_gcm(&filesystem) && user_data_offset == 0 && gcm_filesystem::detect_gcm_disc(path_obj).is_some() {
-            let file = File::open(path).map_err(|e| format!("Cannot open file: {e}"))?;
-            return gcm_filesystem::GcmFs::new(file, 0)?.list_directory(&dir_path);
+        if fs_matches_gcm(&filesystem) && user_data_offset == 0 {
+            if let Ok(f) = File::open(path) {
+                if let Ok(part) = wii_partition::WiiPartReader::open(f) {
+                    if let Ok(mut wfs) = gcm_filesystem::GcmFs::new(part, 0) {
+                        return wfs.list_directory(&dir_path);
+                    }
+                }
+            }
+            if gcm_filesystem::detect_gcm_disc(path_obj).is_some() {
+                let file = File::open(path).map_err(|e| format!("Cannot open file: {e}"))?;
+                return gcm_filesystem::GcmFs::new(file, 0)?.list_directory(&dir_path);
+            }
         }
         if fs_matches_udf(&filesystem) && udf_filesystem::is_udf_disc(path_obj, 0, user_data_offset) {
             let file = File::open(path).map_err(|e| format!("Cannot open file: {e}"))?;
@@ -4974,7 +5009,7 @@ fn save_file(image_path: String, file_path: String, dest_path: String, filesyste
     } else if lower.ends_with(".skeleton.zst") || lower.ends_with(".iso.zst") || lower.ends_with(".img.zst") {
         extract_file_from_fs(&open_zst_fs(Path::new(path))?, &file_path, &dest_path)
     } else if lower.ends_with(".wbfs") {
-        open_gcm_wbfs(Path::new(path))?.extract_file(&file_path, &dest_path)
+        with_wbfs_gcm!(Path::new(path), fs, fs.extract_file(&file_path, &dest_path))
     } else if lower.ends_with(".wux") || lower.ends_with(".wud") {
         let (fst, mut reader, key) = open_wiiu_si_fst(Path::new(path))?;
         wiiu_fst_extract_file(&fst, &mut reader, &file_path, &dest_path, key.as_ref())
@@ -5016,9 +5051,18 @@ fn save_file(image_path: String, file_path: String, dest_path: String, filesyste
             let file = File::open(path).map_err(|e| format!("Cannot open file: {e}"))?;
             return xdvdfs_filesystem::XDVDFSFs::new(file, 0)?.extract_file(&file_path, &dest_path);
         }
-        if fs_matches_gcm(&filesystem) && user_data_offset == 0 && gcm_filesystem::detect_gcm_disc(path_obj).is_some() {
-            let file = File::open(path).map_err(|e| format!("Cannot open file: {e}"))?;
-            return gcm_filesystem::GcmFs::new(file, 0)?.extract_file(&file_path, &dest_path);
+        if fs_matches_gcm(&filesystem) && user_data_offset == 0 {
+            if let Ok(f) = File::open(path) {
+                if let Ok(part) = wii_partition::WiiPartReader::open(f) {
+                    if let Ok(mut wfs) = gcm_filesystem::GcmFs::new(part, 0) {
+                        return wfs.extract_file(&file_path, &dest_path);
+                    }
+                }
+            }
+            if gcm_filesystem::detect_gcm_disc(path_obj).is_some() {
+                let file = File::open(path).map_err(|e| format!("Cannot open file: {e}"))?;
+                return gcm_filesystem::GcmFs::new(file, 0)?.extract_file(&file_path, &dest_path);
+            }
         }
         if fs_matches_udf(&filesystem) && udf_filesystem::is_udf_disc(path_obj, 0, user_data_offset) {
             let file = File::open(path).map_err(|e| format!("Cannot open file: {e}"))?;
@@ -5108,7 +5152,7 @@ fn save_directory(image_path: String, dir_path: String, dest_path: String, files
     } else if lower.ends_with(".skeleton.zst") || lower.ends_with(".iso.zst") || lower.ends_with(".img.zst") {
         extract_dir_from_fs(&open_zst_fs(Path::new(path))?, &dir_path, &dest_path)
     } else if lower.ends_with(".wbfs") {
-        open_gcm_wbfs(Path::new(path))?.extract_directory(&dir_path, &dest_path)
+        with_wbfs_gcm!(Path::new(path), fs, fs.extract_directory(&dir_path, &dest_path))
     } else if lower.ends_with(".wux") || lower.ends_with(".wud") {
         let (fst, mut reader, key) = open_wiiu_si_fst(Path::new(path))?;
         wiiu_fst_extract_dir(&fst, &mut reader, &dir_path, &dest_path, key.as_ref())
@@ -5150,9 +5194,18 @@ fn save_directory(image_path: String, dir_path: String, dest_path: String, files
             let file = File::open(path).map_err(|e| format!("Cannot open file: {e}"))?;
             return xdvdfs_filesystem::XDVDFSFs::new(file, 0)?.extract_directory(&dir_path, &dest_path);
         }
-        if fs_matches_gcm(&filesystem) && user_data_offset == 0 && gcm_filesystem::detect_gcm_disc(path_obj).is_some() {
-            let file = File::open(path).map_err(|e| format!("Cannot open file: {e}"))?;
-            return gcm_filesystem::GcmFs::new(file, 0)?.extract_directory(&dir_path, &dest_path);
+        if fs_matches_gcm(&filesystem) && user_data_offset == 0 {
+            if let Ok(f) = File::open(path) {
+                if let Ok(part) = wii_partition::WiiPartReader::open(f) {
+                    if let Ok(mut wfs) = gcm_filesystem::GcmFs::new(part, 0) {
+                        return wfs.extract_directory(&dir_path, &dest_path);
+                    }
+                }
+            }
+            if gcm_filesystem::detect_gcm_disc(path_obj).is_some() {
+                let file = File::open(path).map_err(|e| format!("Cannot open file: {e}"))?;
+                return gcm_filesystem::GcmFs::new(file, 0)?.extract_directory(&dir_path, &dest_path);
+            }
         }
         if fs_matches_udf(&filesystem) && udf_filesystem::is_udf_disc(path_obj, 0, user_data_offset) {
             let file = File::open(path).map_err(|e| format!("Cannot open file: {e}"))?;

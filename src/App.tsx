@@ -607,7 +607,7 @@ function App() {
 
   async function openImage() {
     const selected = await open({
-      filters: [{ name: "Disc Images", extensions: ["iso", "img", "chd", "cue", "mds", "mdx", "nrg", "ccd", "cdi", "gdi", "toc", "b5t", "b6t", "bwt", "c2d", "pdi", "gi", "daa", "cso", "ciso", "ecm", "wbfs", "wux", "wud", "sdram", "sbram", "aif", "cif", "uif", "skeleton", "skeleton.zst", "iso.zst", "img.zst"] }],
+      filters: [{ name: "Disc Images", extensions: ["iso", "img", "chd", "cue", "mds", "mdx", "nrg", "ccd", "cdi", "gdi", "toc", "b5t", "b6t", "bwt", "c2d", "pdi", "gi", "daa", "cso", "ciso", "ecm", "wbfs", "wux", "wud", "sdram", "sbram", "aif", "cif", "uif", "skeleton", "zst"] }],
     });
     if (!selected) return;
     await openImageAtPath(selected as string);
@@ -1198,7 +1198,7 @@ function App() {
               Update Available — v{updateVersion}
             </a>
           )}
-          <button ref={settingsGearRef} className="btn-settings" title="Settings" onClick={() => setShowSettings(s => !s)}>⚙</button>
+          <button ref={settingsGearRef} className={`btn-settings${showSettings ? " btn-settings--open" : ""}`} title="Settings" onClick={() => setShowSettings(s => !s)}>⚙</button>
         </div>
       </div>
       {showSettings && (
@@ -1572,7 +1572,7 @@ underlying format specifications.`}</pre>
 
           {!imagePath && viewMode !== "empty-drive" && (
             <div className="empty-state">
-              <img src={appIcon} className="empty-icon" style={{ width: 240, height: 240, opacity: 0.85, marginBottom: 24, borderRadius: 40 }} />
+              <img src={appIcon} className="empty-icon" style={{ width: 240, height: 240, opacity: 0.85, marginBottom: 24, borderRadius: 40, userSelect: "none", pointerEvents: "none", WebkitUserSelect: "none" }} />
             </div>
           )}
 
@@ -1658,7 +1658,7 @@ underlying format specifications.`}</pre>
         <span className="statusbar-left">{statusText}</span>
         <a className="statusbar-brand" href="https://sites.google.com/view/whateverindustries/home" target="_blank" rel="noreferrer">whatev.indus</a>
         <span className="statusbar-right">
-          <button className="statusbar-version" onClick={checkForUpdate} title="Check for updates">v0.3.2</button>
+          <button className="statusbar-version" onClick={checkForUpdate} title="Check for updates">v0.3.3</button>
         </span>
       </div>
     </div>

@@ -1658,7 +1658,7 @@ underlying format specifications.`}</pre>
         <span className="statusbar-left">{statusText}</span>
         <a className="statusbar-brand" href="https://sites.google.com/view/whateverindustries/home" target="_blank" rel="noreferrer">whatev.indus</a>
         <span className="statusbar-right">
-          <button className="statusbar-version" onClick={checkForUpdate} title="Check for updates">v0.3.1</button>
+          <button className="statusbar-version" onClick={checkForUpdate} title="Check for updates">v0.3.2</button>
         </span>
       </div>
     </div>

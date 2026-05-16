@@ -261,24 +261,7 @@ jobs:
           name: Disc Xplorer ${{ steps.tag.outputs.TAG }}
           prerelease: ${{ contains(steps.tag.outputs.TAG, '-beta') || contains(steps.tag.outputs.TAG, '-alpha') }}
           draft: false
-          body: |
-            - Wii U GM partition browsing and extraction for `.wux`/`.wud` (thanks Mashell!)
-            - `.scram` — Redumper scrambled CD dump: full filesystem browsing and file extraction
-            - `.sdram` / `.sbram` — Redumper DVD/Blu-ray dumps: filesystem browsing and extraction implemented but untested
-
-            ---
-
-            ## Download
-
-            | Platform | File |
-            |----------|------|
-            | **macOS** (Apple Silicon) | `Disc.Xplorer_macOS_ARM_v${{ steps.tag.outputs.TAG }}.zip` |
-            | **Windows** (x64) | `Disc.Xplorer_Windows_x64_v${{ steps.tag.outputs.TAG }}.exe` |
-            | **Windows** (ARM) | `Disc.Xplorer_Windows_ARM_v${{ steps.tag.outputs.TAG }}.exe` |
-            | **Linux** (x64) | `Disc.Xplorer_Linux_x64_v${{ steps.tag.outputs.TAG }}.AppImage` |
-            | **Linux** (ARM) | `Disc.Xplorer_Linux_ARM_v${{ steps.tag.outputs.TAG }}.AppImage` |
-
-            > **Windows users:** The `.updater.zip` files are used internally by the in-app auto-updater; you do not need to download them manually.
+          body_path: RELEASE_NOTES.md
           files: |
             Disc Xplorer_macOS_ARM_*.zip
             Disc Xplorer.app.tar.gz

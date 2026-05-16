@@ -14,7 +14,7 @@ const BLOCK_SIZE: usize = 2048;
 // (LFSR resets to 1 at the start of each sector's scrambled region).
 static SCRAMBLE_TABLE: OnceLock<[u8; 2340]> = OnceLock::new();
 
-fn scramble_table() -> &'static [u8; 2340] {
+pub fn scramble_table() -> &'static [u8; 2340] {
     SCRAMBLE_TABLE.get_or_init(|| {
         let mut state: u16 = 1;
         let mut table = [0u8; 2340];

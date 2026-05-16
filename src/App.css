@@ -156,7 +156,7 @@ body {
 .toolbar {
   display: flex;
   align-items: center;
-  padding: 6px 10px;
+  padding: 5px 10px 3px;
   background: var(--bg-toolbar);
   border-bottom: 1px solid var(--border);
   flex-shrink: 0;
@@ -200,23 +200,29 @@ body {
   background: transparent;
   border: none;
   color: var(--accent);
-  font-size: 28px;
   cursor: pointer;
   padding: 0 4px;
-  line-height: 1;
+  display: flex;
+  align-items: center;
+  transition: color 150ms ease;
+}
+.btn-settings svg {
+  transition: transform 200ms ease;
 }
 .btn-settings:hover { color: var(--accent-hover); }
 .btn-settings--open, .btn-settings--open:hover { color: #b380cf; }
+.btn-settings--open svg { transform: rotate(90deg); }
 
 .btn-open {
-  padding: 4px 12px;
+  padding: 6px 12px;
   background: var(--accent);
   color: #fff;
   border: none;
   border-radius: 3px;
   cursor: pointer;
-  font-size: 12px;
+  font-size: 13px;
   font-family: var(--font);
+  line-height: 1;
 }
 
 .btn-open:hover { background: var(--accent-hover); }
@@ -261,7 +267,7 @@ body {
 .btn-dump:disabled { opacity: 0.35; cursor: default; }
 
 .btn-icon {
-  padding: 4px 8px;
+  padding: 6px 8px;
   background: var(--accent);
   color: #fff;
   border: none;
@@ -287,9 +293,9 @@ body {
   background: var(--bg-toolbar);
   border-bottom: 1px solid var(--border);
   padding: 8px 12px;
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px 32px;
   flex-shrink: 0;
 }
 
@@ -297,6 +303,7 @@ body {
   display: flex;
   align-items: center;
   gap: 12px;
+  align-self: start;
 }
 
 .settings-label {
@@ -974,6 +981,16 @@ th.col-save { text-align: center; }
 }
 
 /* ── Error ── */
+
+.warn {
+  margin: 12px;
+  padding: 8px 12px;
+  background: #2e2510;
+  border: 1px solid #6b5010;
+  border-radius: 4px;
+  color: #f5c842;
+  font-size: 12px;
+}
 
 .error {
   margin: 12px;

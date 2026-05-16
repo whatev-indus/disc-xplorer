@@ -15,7 +15,7 @@ use std::fs::{self, File};
 use std::io::{self, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use tauri::{Emitter, Manager};
 use chd::Chd;
 use chd::read::ChdReader;
@@ -94,6 +94,7 @@ struct TrackFile {
     lba_offset: u64,   // for single-BIN legacy mode
     start_lba: u64,    // absolute disc LBA of first sector (for multi-BIN dispatch)
     sector_count: u64, // 0 = unknown / unlimited
+    descramble: bool,  // ECMA-130 XOR on read (for .scram files)
 }
 
 pub struct MultiTrackBinReader {
@@ -107,7 +108,18 @@ impl MultiTrackBinReader {
         MultiTrackBinReader {
             tracks: vec![TrackFile {
                 file, track_offset, user_data_offset, stride, lba_offset,
-                start_lba: lba_offset, sector_count: 0,
+                start_lba: lba_offset, sector_count: 0, descramble: false,
+            }],
+            root_idx: 0,
+            multi_bin: false,
+        }
+    }
+
+    fn single_descrambled(file: File, track_offset: u64, user_data_offset: u64, stride: u64, lba_offset: u64) -> Self {
+        MultiTrackBinReader {
+            tracks: vec![TrackFile {
+                file, track_offset, user_data_offset, stride, lba_offset,
+                start_lba: lba_offset, sector_count: 0, descramble: true,
             }],
             root_idx: 0,
             multi_bin: false,
@@ -121,6 +133,18 @@ impl ISO9660Reader for MultiTrackBinReader {
             // Single-BIN: use lba_offset for multisession compat (same as old BinCueReader).
             let t = &mut self.tracks[self.root_idx];
             let adjusted = if lba >= t.lba_offset { lba - t.lba_offset } else { lba };
+            if t.descramble {
+                let pos = t.track_offset + adjusted * t.stride;
+                t.file.seek(SeekFrom::Start(pos))?;
+                let mut sector = [0u8; 2352];
+                t.file.read_exact(&mut sector)?;
+                let table = cdi_filesystem::scramble_table();
+                for i in 12..2352usize { sector[i] ^= table[i - 12]; }
+                let start = t.user_data_offset as usize;
+                let len = buf.len().min(2352 - start);
+                buf[..len].copy_from_slice(&sector[start..start + len]);
+                return Ok(len);
+            }
             let pos = t.track_offset + adjusted * t.stride + t.user_data_offset;
             t.file.seek(SeekFrom::Start(pos))?;
             return t.file.read(buf);
@@ -211,27 +235,42 @@ fn detect_filesystems_in_bin(bin_path: &Path, track_offset: u64, user_data_offse
     let stride = if user_data_offset > 0 { RAW_SECTOR_SIZE } else { 2048 };
     if let Ok(mut f) = File::open(bin_path) {
         let adj16 = if 16u64 >= lba_offset { 16 - lba_offset } else { 16 };
-        let pvd_pos = track_offset + adj16 * stride + user_data_offset;
-        let mut buf = [0u8; 2048];
-        if f.seek(SeekFrom::Start(pvd_pos)).is_ok() && f.read_exact(&mut buf).is_ok()
-            && &buf[1..6] == b"CD001"
-        {
-            result.push("ISO 9660".to_string());
-            for lba in 17u64..32 {
-                let adjusted = if lba >= lba_offset { lba - lba_offset } else { lba };
-                let pos = track_offset + adjusted * stride + user_data_offset;
-                if f.seek(SeekFrom::Start(pos)).is_err() { break; }
-                let mut buf2 = [0u8; 2048];
-                if f.read_exact(&mut buf2).is_err() { break; }
-                match buf2[0] {
-                    0xFF => break,
-                    0x02 => {
-                        let esc = &buf2[88..120];
-                        if esc.starts_with(b"%/@") || esc.starts_with(b"%/C") || esc.starts_with(b"%/E") {
-                            result.push("Joliet".to_string());
+        let read_ud = |f: &mut File, adj: u64| -> Option<[u8; 2048]> {
+            if descramble {
+                let pos = track_offset + adj * stride;
+                f.seek(SeekFrom::Start(pos)).ok()?;
+                let mut sector = [0u8; 2352];
+                f.read_exact(&mut sector).ok()?;
+                let table = cdi_filesystem::scramble_table();
+                for i in 12..2352usize { sector[i] ^= table[i - 12]; }
+                let start = user_data_offset as usize;
+                let mut buf = [0u8; 2048];
+                buf.copy_from_slice(&sector[start..start + 2048]);
+                Some(buf)
+            } else {
+                let pos = track_offset + adj * stride + user_data_offset;
+                f.seek(SeekFrom::Start(pos)).ok()?;
+                let mut buf = [0u8; 2048];
+                f.read_exact(&mut buf).ok()?;
+                Some(buf)
+            }
+        };
+        if let Some(buf) = read_ud(&mut f, adj16) {
+            if &buf[1..6] == b"CD001" {
+                result.push("ISO 9660".to_string());
+                for lba in 17u64..32 {
+                    let adjusted = if lba >= lba_offset { lba - lba_offset } else { lba };
+                    let Some(buf2) = read_ud(&mut f, adjusted) else { break };
+                    match buf2[0] {
+                        0xFF => break,
+                        0x02 => {
+                            let esc = &buf2[88..120];
+                            if esc.starts_with(b"%/@") || esc.starts_with(b"%/C") || esc.starts_with(b"%/E") {
+                                result.push("Joliet".to_string());
+                            }
                         }
+                        _ => {}
                     }
-                    _ => {}
                 }
             }
         }
@@ -378,6 +417,8 @@ fn get_disc_filesystems(image_path: String) -> Result<Vec<String>, String> {
         Ok(detect_filesystems_wbfs(path))
     } else if lower.ends_with(".wux") || lower.ends_with(".wud") {
         Ok(detect_filesystems_wux(path))
+    } else if lower.ends_with(".scram") {
+        Ok(detect_filesystems_scram(path))
     } else if lower.ends_with(".sdram") {
         Ok(detect_filesystems_redumper_dvd(path))
     } else if lower.ends_with(".sbram") {
@@ -2828,7 +2869,54 @@ fn read_sector_impl(image_path: &str, lba: u64) -> Result<SectorData, String> {
         let mut bytes = vec![0u8; 2048];
         reader.read_exact(&mut bytes).map_err(|e| format!("Read error: {e}"))?;
         return Ok(SectorData { bytes, sector_size: 2048, user_data_offset: 0, total_sectors, lba });
-    } else if lower.ends_with(".aif") || lower.ends_with(".sdram") || lower.ends_with(".sbram") {
+    } else if lower.ends_with(".scram") {
+        let track = parse_scram_for_data_track(path);
+        let file_len = fs::metadata(&track.bin_path).map_err(|e| format!("Cannot stat: {e}"))?.len();
+        let total_sectors = file_len.saturating_sub(track.track_offset) / RAW_SECTOR_SIZE;
+        if total_sectors == 0 { return Err("SCRAM image is empty".to_string()); }
+        if lba >= total_sectors {
+            return Err(format!("Sector {lba} out of range (0–{})", total_sectors - 1));
+        }
+        let byte_offset = track.track_offset + lba * RAW_SECTOR_SIZE;
+        let mut f = File::open(&track.bin_path).map_err(|e| format!("Cannot open: {e}"))?;
+        f.seek(SeekFrom::Start(byte_offset)).map_err(|e| format!("Seek error: {e}"))?;
+        let mut sector = [0u8; 2352];
+        f.read_exact(&mut sector).map_err(|e| format!("Read error: {e}"))?;
+        let table = cdi_filesystem::scramble_table();
+        for i in 12..2352usize { sector[i] ^= table[i - 12]; }
+        const SYNC: [u8; 12] = [0x00,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0x00];
+        let udo = if sector[..12] == SYNC { if sector[15] == 2 { 24u32 } else { 16u32 } } else { 0u32 };
+        return Ok(SectorData { bytes: sector.to_vec(), sector_size: 2352, user_data_offset: udo, total_sectors, lba });
+    } else if lower.ends_with(".sdram") {
+        let file_len = fs::metadata(path).map_err(|e| format!("Cannot stat: {e}"))?.len();
+        let total_sectors = file_len / SDRAM_RECORD_SIZE;
+        if total_sectors == 0 { return Err("SDRAM image is empty".to_string()); }
+        if lba >= total_sectors { return Err(format!("Sector {lba} out of range (0–{})", total_sectors - 1)); }
+        let mut f = File::open(path).map_err(|e| format!("Cannot open: {e}"))?;
+        let lba_abs = lba + SDRAM_LBA_ABS;
+        f.seek(SeekFrom::Start(lba_abs * SDRAM_RECORD_SIZE)).map_err(|e| format!("Seek error: {e}"))?;
+        let mut frame = [0u8; 2366];
+        f.read_exact(&mut frame).map_err(|e| format!("Read error: {e}"))?;
+        let mut df = recording_frame_to_df(&frame);
+        dvd_descramble(&mut df);
+        let mut bytes = vec![0u8; 2048];
+        bytes.copy_from_slice(&df[12..2060]);
+        return Ok(SectorData { bytes, sector_size: 2048, user_data_offset: 0, total_sectors, lba });
+    } else if lower.ends_with(".sbram") {
+        let file_len = fs::metadata(path).map_err(|e| format!("Cannot stat: {e}"))?.len();
+        let total_sectors = file_len / SBRAM_RECORD_SIZE;
+        if total_sectors == 0 { return Err("SBRAM image is empty".to_string()); }
+        if lba >= total_sectors { return Err(format!("Sector {lba} out of range (0–{})", total_sectors - 1)); }
+        let mut f = File::open(path).map_err(|e| format!("Cannot open: {e}"))?;
+        let lba_abs = lba + SBRAM_LBA_ABS;
+        f.seek(SeekFrom::Start(lba_abs * SBRAM_RECORD_SIZE)).map_err(|e| format!("Seek error: {e}"))?;
+        let mut frame = [0u8; 2052];
+        f.read_exact(&mut frame).map_err(|e| format!("Read error: {e}"))?;
+        let mut data = [0u8; 2048];
+        data.copy_from_slice(&frame[..2048]);
+        bd_descramble(&mut data, lba_abs);
+        return Ok(SectorData { bytes: data.to_vec(), sector_size: 2048, user_data_offset: 0, total_sectors, lba });
+    } else if lower.ends_with(".aif") {
         return Err("Sector view not supported for this format".to_string());
     } else {
         let udo = detect_raw_sector_offset(path).unwrap_or(0);
@@ -2872,7 +2960,7 @@ fn flat_info(image_path: &str) -> Option<FlatInfo> {
         || lower.ends_with(".ecm") || lower.ends_with(".uif") || lower.ends_with(".wbfs")
         || lower.ends_with(".wux") || lower.ends_with(".skeleton.zst")
         || lower.ends_with(".iso.zst") || lower.ends_with(".img.zst")
-        || lower.ends_with(".aif") || lower.ends_with(".sdram") || lower.ends_with(".sbram")
+        || lower.ends_with(".aif") || lower.ends_with(".scram") || lower.ends_with(".sdram") || lower.ends_with(".sbram")
         || lower.ends_with(".wud")
     {
         return None;
@@ -3954,9 +4042,14 @@ fn open_gcm_wbfs(path: &Path) -> Result<gcm_filesystem::GcmFs<wbfs_reader::WbfsR
 // is at logical disc offset 0x28000 and contains title.cert, title.tik,
 // title.tmd inside an FST under the "01/" content directory.
 //
+// Partition layout, key hierarchy, FST section header field order, and NUS
+// chunk-IV scheme derived from JNUSLib by Maschell
+// (https://github.com/Maschell/JNUSLib), used as reference only.
+//
 // FST layout (all multi-byte integers big-endian):
 //   Header 0x20 bytes: magic "FST\0", offsetFactor (u32), numSections (u32)
-//   Section headers (numSections × 0x20): [0x00] size_sectors, [0x04] base_sectors
+//   Section headers (numSections × 0x20): [0x00] offsetSector (1-indexed), [0x04] sizeSector
+//     content_base = partition_base + (offsetSector - 1) * 0x8000
 //   File entries (entry_count × 0x10), root entry first:
 //     [0x00] u8 flags (bit 0 = directory)
 //     [0x01-0x03] u24 name_off in string table
@@ -3969,7 +4062,19 @@ fn open_gcm_wbfs(path: &Path) -> Result<gcm_filesystem::GcmFs<wbfs_reader::WbfsR
 // File disc byte offset = SecHdr[content_idx].base_sectors * sector_size
 //                       + data_off * offsetFactor
 
-const WIIU_SI_FST_OFFSET: u64 = 0x28000;
+const WIIU_SI_BASE: u64 = 0x20000;       // SI partition starts here (volume header at this offset)
+const WIIU_SI_FST_OFFSET: u64 = 0x28000; // SI FST = SI_BASE + 1 block (0x8000 bytes)
+const WIIU_PARTITION_MAGIC: u32 = 0xCC93A4F5;
+// Wii U CAT-R (dev/kiosk) common key — used to decrypt the per-title key from a ticket.
+const WIIU_DEV_COMMON_KEY: [u8; 16] = [
+    0x2f, 0x5c, 0x1b, 0x29, 0x44, 0xe7, 0xfd, 0x6f,
+    0xc3, 0x97, 0x96, 0x4b, 0x05, 0x76, 0x91, 0xfa,
+];
+// Wii U retail common key — used to decrypt the per-title key from a retail ticket.
+const WIIU_RETAIL_COMMON_KEY: [u8; 16] = [
+    0xd7, 0xb0, 0x04, 0x02, 0x65, 0x9b, 0xa2, 0xab,
+    0xd2, 0xcb, 0x0d, 0xb2, 0x7f, 0xa2, 0xb6, 0x56,
+];
 
 trait WiiUDisc: Read + Seek + Send {}
 impl WiiUDisc for wux_reader::WuxReader {}
@@ -3984,11 +4089,12 @@ struct WiiUFstEntry {
 }
 
 struct WiiUFst {
-    entries:       Vec<WiiUFstEntry>,
-    string_table:  Vec<u8>,
-    sec_hdrs:      Vec<(u64, u64)>,  // (base_sectors, size_sectors)
-    sector_size:   u64,
-    offset_factor: u64,
+    entries:        Vec<WiiUFstEntry>,
+    string_table:   Vec<u8>,
+    sec_hdrs:       Vec<(u64, u64)>,  // (offset_sector, size_sector) — 1-indexed sector position
+    sector_size:    u64,
+    offset_factor:  u64,
+    partition_base: u64,              // absolute disc offset of the partition data area start
 }
 
 impl WiiUFst {
@@ -4003,10 +4109,14 @@ impl WiiUFst {
         self.entries[idx].flags & 1 != 0
     }
 
+    fn content_base(&self, content_idx: usize) -> u64 {
+        let (offset_sector, _) = self.sec_hdrs.get(content_idx).copied().unwrap_or((1, 0));
+        self.partition_base + offset_sector.saturating_sub(1) * self.sector_size
+    }
+
     fn disc_offset(&self, idx: usize) -> u64 {
         let e = &self.entries[idx];
-        let (base, _) = self.sec_hdrs.get(e.content_idx as usize).copied().unwrap_or((0, 0));
-        base * self.sector_size + e.data_off as u64 * self.offset_factor
+        self.content_base(e.content_idx as usize) + e.data_off as u64 * self.offset_factor
     }
 
     // Direct children of the directory at dir_idx.
@@ -4033,7 +4143,7 @@ impl WiiUFst {
     }
 }
 
-fn parse_wiiu_fst(buf: &[u8], sector_size: u64) -> Result<WiiUFst, String> {
+fn parse_wiiu_fst(buf: &[u8], sector_size: u64, partition_base: u64) -> Result<WiiUFst, String> {
     if buf.len() < 0x20 { return Err("WUX FST: buffer too small".to_string()); }
     if &buf[0..4] != b"FST\0" {
         return Err(format!("WUX FST: bad magic {:08X}",
@@ -4051,9 +4161,10 @@ fn parse_wiiu_fst(buf: &[u8], sector_size: u64) -> Result<WiiUFst, String> {
     let mut sec_hdrs = Vec::with_capacity(num_sec_hdrs);
     for i in 0..num_sec_hdrs {
         let b = sec_start + i * 0x20;
-        let size   = u32::from_be_bytes(buf[b..b+4].try_into().unwrap()) as u64;
-        let base   = u32::from_be_bytes(buf[b+4..b+8].try_into().unwrap()) as u64;
-        sec_hdrs.push((base, size));
+        // JNUSLib ContentFSTInfo: first u32 = offsetSector (1-indexed), second u32 = sizeSector
+        let offset_sector = u32::from_be_bytes(buf[b..b+4].try_into().unwrap()) as u64;
+        let size_sector   = u32::from_be_bytes(buf[b+4..b+8].try_into().unwrap()) as u64;
+        sec_hdrs.push((offset_sector, size_sector));
     }
 
     // Root entry at sec_end; its size field = total entry count.
@@ -4077,7 +4188,7 @@ fn parse_wiiu_fst(buf: &[u8], sector_size: u64) -> Result<WiiUFst, String> {
     }
 
     let string_table = buf[entries_end..].to_vec();
-    Ok(WiiUFst { entries, string_table, sec_hdrs, sector_size, offset_factor })
+    Ok(WiiUFst { entries, string_table, sec_hdrs, sector_size, offset_factor, partition_base })
 }
 
 // Load a Wii U title key from a same-named .key file alongside the disc image.
@@ -4098,6 +4209,230 @@ fn wiiu_decrypt_sector(key: &[u8; 16], data: &mut [u8]) {
     if let Ok(dec) = Decryptor::<Aes128>::new_from_slices(key, &iv) {
         let _ = dec.decrypt_padded_mut::<NoPadding>(data);
     }
+}
+
+// IV for a GM content chunk.  Each 0x10000-byte chunk is an independent AES-128-CBC stream.
+// IV bytes 8–15 = (offset_within_content >> 16) as u64 BE; bytes 0–7 are zero.
+fn wiiu_gm_chunk_iv(offset_within_content: u64) -> [u8; 16] {
+    let mut iv = [0u8; 16];
+    iv[8..16].copy_from_slice(&(offset_within_content >> 16).to_be_bytes());
+    iv
+}
+
+// Scan disc for the GM partition header (magic 0xCC93A4F5) at known standard offsets.
+fn find_gm_partition_base(reader: &mut dyn WiiUDisc) -> Option<u64> {
+    let candidates: &[u64] = &[0xC000_0000, 0x0004_8000];
+    let mut buf = [0u8; 4];
+    for &base in candidates {
+        if reader.seek(SeekFrom::Start(base)).is_ok()
+            && reader.read_exact(&mut buf).is_ok()
+            && u32::from_be_bytes(buf) == WIIU_PARTITION_MAGIC
+        {
+            return Some(base);
+        }
+    }
+    None
+}
+
+// Read `size` bytes from `disc_off` in the GM partition.
+// content_base: absolute disc offset of the start of the section this file belongs to.
+// Each 0x10000-byte chunk within the content is an independent AES-128-CBC stream;
+// IV bytes 8–15 = (chunk_start_within_content >> 16) as u64 BE.
+fn wiiu_gm_read_at<R: Read + Seek + ?Sized>(
+    reader: &mut R,
+    disc_off: u64,
+    content_base: u64,
+    size: u64,
+    title_key: &[u8; 16],
+) -> io::Result<Vec<u8>> {
+    const CHUNK: u64 = 0x10000;
+    let mut result = Vec::with_capacity(size as usize);
+    let mut remaining = size;
+    let mut cur = disc_off;
+    while remaining > 0 {
+        let off_in_content   = cur - content_base;
+        let chunk_start      = (off_in_content / CHUNK) * CHUNK;
+        let chunk_disc_off   = content_base + chunk_start;
+        let off_in_chunk     = (off_in_content - chunk_start) as usize;
+        let take             = ((CHUNK - off_in_chunk as u64).min(remaining)) as usize;
+        let iv = wiiu_gm_chunk_iv(chunk_start);
+        let mut chunk_buf = vec![0u8; CHUNK as usize];
+        reader.seek(SeekFrom::Start(chunk_disc_off))?;
+        reader.read_exact(&mut chunk_buf)?;
+        if let Ok(dec) = Decryptor::<Aes128>::new_from_slices(title_key, &iv) {
+            let _ = dec.decrypt_padded_mut::<NoPadding>(&mut chunk_buf);
+        }
+        result.extend_from_slice(&chunk_buf[off_in_chunk..off_in_chunk + take]);
+        remaining -= take as u64;
+        cur       += take as u64;
+    }
+    Ok(result)
+}
+
+// Derive the GM title key from the SI partition ticket.
+// Reads title.tik from SI (decrypting with disc_key if the partition is retail-encrypted),
+// then unwraps the per-title key using the retail or dev common key accordingly.
+fn wiiu_gm_derive_key_from_si(
+    si_fst: &WiiUFst,
+    reader: &mut dyn WiiUDisc,
+    disc_key: Option<&[u8; 16]>,
+) -> Result<[u8; 16], String> {
+    let tik_path = ["02/title.tik", "01/title.tik", "title.tik"]
+        .into_iter()
+        .find(|&p| si_fst.find_entry(p).map(|i| !si_fst.is_dir(i)).unwrap_or(false))
+        .ok_or_else(|| "WiiU GM: title.tik not found in SI partition".to_string())?;
+
+    let tik_idx   = si_fst.find_entry(tik_path).unwrap();
+    let disc_off  = si_fst.disc_offset(tik_idx);
+    let tik_size  = (si_fst.entries[tik_idx].size as u64).max(0x200);
+    // SI file data is disc-key encrypted with the same offset-based chunk IV scheme used for GM content.
+    // The IV is derived from the file's offset within its content section (not the absolute disc offset).
+    // In wudd: IV[8..16] = (asFileEntry->getOffset() >> 16) as u64 BE.
+    // Dev/kiosk discs have no disc key, so SI files are cleartext.
+    let tik_data = if let Some(key) = disc_key {
+        let content_idx  = si_fst.entries[tik_idx].content_idx as usize;
+        let content_base = si_fst.content_base(content_idx);
+        let data = wiiu_gm_read_at(reader, disc_off, content_base, tik_size, key)
+            .map_err(|e| format!("WiiU GM: failed to read {tik_path}: {e}"))?;
+        data
+    } else {
+        wiiu_read_at(reader, disc_off, tik_size, None)
+            .map_err(|e| format!("WiiU GM: failed to read {tik_path}: {e}"))?
+    };
+
+    if tik_data.len() < 0x1E4 {
+        return Err("WiiU GM: title.tik too small to contain title key".to_string());
+    }
+    if tik_data[0x1BF..0x1CF].iter().all(|&b| b == 0) {
+        return Err(
+            "WiiU GM: title.tik is not available in this disc (sparse sector) — \
+             GM partition inaccessible".to_string(),
+        );
+    }
+
+    let enc_key: [u8; 16] = tik_data[0x1BF..0x1CF].try_into().unwrap();
+    // IV = title_id (8 bytes at 0x1DC) padded to 16 bytes with zeros.
+    let mut iv = [0u8; 16];
+    iv[..8].copy_from_slice(&tik_data[0x1DC..0x1E4]);
+
+    let common_key = if disc_key.is_some() { &WIIU_RETAIL_COMMON_KEY } else { &WIIU_DEV_COMMON_KEY };
+    let mut key_buf = enc_key;
+    if let Ok(dec) = Decryptor::<Aes128>::new_from_slices(common_key, &iv) {
+        let _ = dec.decrypt_padded_mut::<NoPadding>(&mut key_buf);
+    }
+    Ok(key_buf)
+}
+
+// Open and parse the GM partition FST.
+// Returns (gm_fst, disc_reader, gm_title_key).
+fn open_wiiu_gm_fst(path: &Path) -> Result<(WiiUFst, Box<dyn WiiUDisc>, [u8; 16]), String> {
+    let (mut reader, sector_size) = open_wiiu_disc(path)?;
+    let disc_key = load_title_key(path);
+
+    // Parse the SI FST to locate the GM ticket.
+    let si_fst = {
+        reader.seek(SeekFrom::Start(WIIU_SI_FST_OFFSET))
+            .map_err(|e| format!("WiiU SI seek: {e}"))?;
+        let mut buf = vec![0u8; 0x8000];
+        let n = reader.read(&mut buf).map_err(|e| format!("WiiU SI read: {e}"))?;
+        buf.truncate(n);
+        if buf.starts_with(b"FST\0") {
+            parse_wiiu_fst(&buf, sector_size, WIIU_SI_FST_OFFSET)?
+        } else {
+            let key = disc_key.ok_or_else(|| {
+                "Wii U disc is encrypted; place a matching .key file alongside it".to_string()
+            })?;
+            let mut dec = buf;
+            wiiu_decrypt_sector(&key, &mut dec);
+            if !dec.starts_with(b"FST\0") {
+                return Err("Wii U SI FST decryption failed — wrong .key file?".to_string());
+            }
+            parse_wiiu_fst(&dec, sector_size, WIIU_SI_FST_OFFSET)?
+        }
+    };
+
+    // Derive the GM title key from the SI partition ticket.
+    let gm_title_key = wiiu_gm_derive_key_from_si(&si_fst, &mut *reader, disc_key.as_ref())?;
+
+    // Locate GM partition header (magic 0xCC93A4F5).
+    let gm_base = find_gm_partition_base(&mut *reader)
+        .ok_or_else(|| "WiiU: GM partition not found at known offsets".to_string())?;
+
+    // Read the cleartext partition volume header (64 bytes, all BE u32 fields):
+    //   [0x04] blockSize; [0x14] FSTSize (bytes); [0x18] FSTAddress (in blocks from partition start)
+    reader.seek(SeekFrom::Start(gm_base))
+        .map_err(|e| format!("WiiU GM header seek: {e}"))?;
+    let mut hdr_sector = vec![0u8; 0x8000];
+    reader.read_exact(&mut hdr_sector)
+        .map_err(|e| format!("WiiU GM header read: {e}"))?;
+
+    let block_size     = u32::from_be_bytes(hdr_sector[0x04..0x08].try_into().unwrap()) as u64;
+    let fst_size       = u32::from_be_bytes(hdr_sector[0x14..0x18].try_into().unwrap()) as u64;
+    let fst_block_addr = u32::from_be_bytes(hdr_sector[0x18..0x1C].try_into().unwrap()) as u64;
+    let fst_disc_off   = gm_base + fst_block_addr * block_size;
+
+    // Decrypt the FST using the NUS title-key scheme.
+    // Content 0 starts at fst_disc_off; chunk IV at content offset 0 = all-zeros.
+    let fst_read_len = ((fst_size + 0xFFFF) / 0x10000) * 0x10000;
+    let mut fst_buf = wiiu_gm_read_at(&mut *reader, fst_disc_off, fst_disc_off, fst_read_len, &gm_title_key)
+        .map_err(|e| format!("WiiU GM FST read: {e}"))?;
+    if !fst_buf.starts_with(b"FST\0") {
+        return Err("WiiU GM FST: bad magic after decryption — wrong title key?".to_string());
+    }
+    fst_buf.truncate(fst_size as usize);
+    // partition_base for GM = gm_base + block_size (the volume header sector).
+    // offsetSector values in the GM FST are 1-indexed from this base.
+    let fst = parse_wiiu_fst(&fst_buf, sector_size, gm_base + block_size)?;
+    Ok((fst, reader, gm_title_key))
+}
+
+fn wiiu_gm_fst_extract_file<R: Read + Seek>(
+    fst: &WiiUFst, reader: &mut R, file_path: &str, dest_path: &str,
+    title_key: &[u8; 16],
+) -> Result<(), String> {
+    let idx = fst.find_entry(file_path)
+        .ok_or_else(|| format!("WiiU GM: file not found: {file_path}"))?;
+    if fst.is_dir(idx) {
+        return Err(format!("WiiU GM: {file_path} is a directory"));
+    }
+    let e            = &fst.entries[idx];
+    let disc_off     = fst.disc_offset(idx);
+    let size         = e.size as u64;
+    let content_base = fst.content_base(e.content_idx as usize);
+    let data = wiiu_gm_read_at(reader, disc_off, content_base, size, title_key)
+        .map_err(|e| format!("WiiU GM file read: {e}"))?;
+    let mut out = File::create(dest_path)
+        .map_err(|e| format!("Create dest file: {e}"))?;
+    out.write_all(&data).map_err(|e| format!("Write: {e}"))?;
+    Ok(())
+}
+
+fn wiiu_gm_fst_extract_dir<R: Read + Seek>(
+    fst: &WiiUFst, reader: &mut R, dir_path: &str, dest_path: &str,
+    title_key: &[u8; 16],
+) -> Result<(), String> {
+    let dir_idx = fst.find_entry(dir_path)
+        .ok_or_else(|| format!("WiiU GM: directory not found: {dir_path}"))?;
+    if !fst.is_dir(dir_idx) {
+        return Err(format!("WiiU GM: {dir_path} is not a directory"));
+    }
+    fs::create_dir_all(dest_path)
+        .map_err(|e| format!("Create dir {dest_path}: {e}"))?;
+    for idx in fst.list_children(dir_idx) {
+        let name       = fst.name(idx).to_string();
+        let child_dest = format!("{dest_path}/{name}");
+        let child_src  = if dir_path == "/" || dir_path.is_empty() {
+            format!("/{name}")
+        } else {
+            format!("{dir_path}/{name}")
+        };
+        if fst.is_dir(idx) {
+            wiiu_gm_fst_extract_dir(fst, reader, &child_src, &child_dest, title_key)?;
+        } else {
+            wiiu_gm_fst_extract_file(fst, reader, &child_src, &child_dest, title_key)?;
+        }
+    }
+    Ok(())
 }
 
 fn open_wiiu_disc(path: &Path) -> Result<(Box<dyn WiiUDisc>, u64), String> {
@@ -4124,7 +4459,7 @@ fn open_wiiu_si_fst(path: &Path) -> Result<(WiiUFst, Box<dyn WiiUDisc>, Option<[
 
     // Try cleartext (CAT-R / dev discs).
     if buf.starts_with(b"FST\0") {
-        let fst = parse_wiiu_fst(&buf, sector_size)?;
+        let fst = parse_wiiu_fst(&buf, sector_size, WIIU_SI_FST_OFFSET)?;
         return Ok((fst, reader, None));
     }
 
@@ -4139,13 +4474,13 @@ fn open_wiiu_si_fst(path: &Path) -> Result<(WiiUFst, Box<dyn WiiUDisc>, Option<[
         return Err("Wii U SI FST decryption failed — wrong title key?".to_string());
     }
 
-    let fst = parse_wiiu_fst(&dec_buf, sector_size)?;
+    let fst = parse_wiiu_fst(&dec_buf, sector_size, WIIU_SI_FST_OFFSET)?;
     Ok((fst, reader, Some(title_key)))
 }
 
 // Read `size` bytes from `disc_off`, decrypting each 0x8000-byte sector with IV=0
 // if a title key is provided.
-fn wiiu_read_at<R: Read + Seek>(
+fn wiiu_read_at<R: Read + Seek + ?Sized>(
     reader: &mut R,
     disc_off: u64,
     size: u64,
@@ -4272,17 +4607,208 @@ fn detect_filesystems_wux(path: &Path) -> Vec<String> {
 }
 
 // ── Redumper raw dump support ─────────────────────────────────────────────────
-// .sdram — Redumper scrambled DVD dump (raw EFM/ECC encoded sectors)
-// .sbram — Redumper Blu-ray dump (2052-byte sectors: 2048 data + 4 EDC)
-// Neither format maps directly to 2048-byte logical ISO sectors without full
-// EFM decoding / EDC stripping; filesystem browsing is not yet supported.
+// .scram — Redumper scrambled CD dump: raw 2352-byte ECMA-130 sectors.
+//   Layout: sector index 0 = LBA -45150 (full lead-in reserve), data track
+//   at (track_lba + 45150) * 2352 + write_offset_bytes.  Drive read offset
+//   is already applied; disc write offset is not (parsed from companion .log).
+// .sdram — Redumper scrambled DVD dump (raw EFM/ECC encoded 2366-byte frames).
+//   Layout: frame index 0 = LBA -0x30000 (-196608).
+//   file_offset(lba) = (lba + 0x30000) * 2366.
+//   Each RecordingFrame (2366 bytes) contains 12 rows × (172 main_data +
+//   10 parity_inner) + 182 parity_outer.  Strip ECC → 2064-byte DataFrame
+//   (id[6] + cpr_mai[6] + main_data[2048] + edc[4]).  Descramble main_data
+//   with a 15-bit LFSR keyed on PSN.
+// .sbram — Redumper Blu-ray dump (2052-byte frames: 2048 data + 4 EDC).
+//   Layout: frame index 0 = LBA -0x100000 (-1048576).
+//   file_offset(lba) = (lba + 0x100000) * 2052.
+//   Descramble first 2048 bytes with a per-sector 16-bit LFSR (ISO/IEC 30190).
 
-fn detect_filesystems_redumper_dvd(_path: &Path) -> Vec<String> {
-    vec!["Redumper DVD dump".to_string()]
+const SCRAM_LBA_START: i64 = -45150; // cd_common.ixx: LBA_START
+const SDRAM_LBA_ABS: u64 = 0x30000;  // dvd/dvd.ixx: |LBA_START|
+const SDRAM_RECORD_SIZE: u64 = 2366; // RecordingFrame size
+const SBRAM_LBA_ABS: u64 = 0x100000; // dvd/bd.ixx: |LBA_START|
+const SBRAM_RECORD_SIZE: u64 = 2052; // DataFrame size (2048 data + 4 EDC)
+
+// DVD scramble table: 15-bit LFSR (dvd_scrambler.ixx), table covers 16×2048
+// bytes.  Polynomial: shift-left, feedback bit = sr[14] ^ sr[10], initial
+// state 0x0001.  Table indexed as (psn>>4 & 0xF)*2048 for a given sector.
+static DVD_SCRAMBLE_TABLE: OnceLock<[u8; 32768]> = OnceLock::new();
+
+fn dvd_scramble_table() -> &'static [u8; 32768] {
+    DVD_SCRAMBLE_TABLE.get_or_init(|| {
+        let mut sr: u16 = 1;
+        let mut table = [0u8; 32768];
+        for byte in table.iter_mut() {
+            let mut v = 0u8;
+            for b in 0..8u8 {
+                v |= ((sr & 1) as u8) << b;
+                let lsb = (sr >> 14) ^ (sr >> 10);
+                sr = ((sr << 1) | (lsb & 1)) & 0x7FFF;
+            }
+            *byte = v;
+        }
+        table
+    })
 }
 
-fn detect_filesystems_redumper_bd(_path: &Path) -> Vec<String> {
-    vec!["Redumper BD dump".to_string()]
+// Convert a 2366-byte DVD RecordingFrame to a 2064-byte DataFrame by stripping
+// ECC parity.  Each of the 12 rows is 172 main_data bytes followed by 10
+// parity_inner bytes; the 182-byte parity_outer trail is discarded.
+fn recording_frame_to_df(frame: &[u8; 2366]) -> [u8; 2064] {
+    let mut df = [0u8; 2064];
+    for i in 0..12usize {
+        let src = i * 182; // row stride = 172 + 10
+        let dst = i * 172;
+        df[dst..dst + 172].copy_from_slice(&frame[src..src + 172]);
+    }
+    df
+}
+
+// Descramble a DVD DataFrame in-place.  PSN is at df[1..4] (big-endian 24-bit,
+// after a 1-byte sector_type field).  XOR table offset = (psn>>4 & 0xF) * 2048.
+// Only the main_data region df[12..2060] is XORed.
+fn dvd_descramble(df: &mut [u8; 2064]) {
+    let psn = u32::from_be_bytes([0, df[1], df[2], df[3]]);
+    let offset = ((psn >> 4) & 0xF) as usize * 2048;
+    let table = dvd_scramble_table();
+    for i in 0..2048usize {
+        df[12 + i] ^= table[offset + i]; // offset+i <= 15*2048+2047 = 32767 < 32768
+    }
+}
+
+struct SdramReader { file: File }
+
+impl ISO9660Reader for SdramReader {
+    fn read_at(&mut self, buf: &mut [u8], lba: u64) -> io::Result<usize> {
+        let file_offset = (lba + SDRAM_LBA_ABS) * SDRAM_RECORD_SIZE;
+        self.file.seek(SeekFrom::Start(file_offset))?;
+        let mut frame = [0u8; 2366];
+        self.file.read_exact(&mut frame)?;
+        let mut df = recording_frame_to_df(&frame);
+        dvd_descramble(&mut df);
+        let len = buf.len().min(2048);
+        buf[..len].copy_from_slice(&df[12..12 + len]);
+        Ok(len)
+    }
+}
+
+// Descramble a 2048-byte BD sector in-place.  Seed = (lba + 0x100000) >> 5.
+// LFSR: 16-bit ISO/IEC 30190, init = (1<<15)|(seed & 0x7FFF),
+// feedback bit = sr[15]^sr[14]^sr[12]^sr[3], shift left.
+fn bd_descramble(buf: &mut [u8; 2048], lba: u64) {
+    let seed = ((lba + SBRAM_LBA_ABS) >> 5) as u16;
+    let mut sr: u16 = (1 << 15) | (seed & 0x7FFF);
+    for b in buf.iter_mut() {
+        let mut v = 0u8;
+        for bit in 0..8u8 {
+            v |= ((sr & 1) as u8) << bit;
+            let feedback = (sr >> 15) ^ (sr >> 14) ^ (sr >> 12) ^ (sr >> 3);
+            sr = ((sr << 1) | (feedback & 1)) & 0xFFFF;
+        }
+        *b ^= v;
+    }
+}
+
+struct SbramReader { file: File, lba_base: u64 }
+
+impl ISO9660Reader for SbramReader {
+    fn read_at(&mut self, buf: &mut [u8], lba: u64) -> io::Result<usize> {
+        let file_offset = (lba + SBRAM_LBA_ABS) * SBRAM_RECORD_SIZE;
+        self.file.seek(SeekFrom::Start(file_offset))?;
+        let mut frame = [0u8; 2052];
+        self.file.read_exact(&mut frame)?;
+        let mut data = [0u8; 2048];
+        data.copy_from_slice(&frame[..2048]);
+        bd_descramble(&mut data, self.lba_base + lba);
+        let len = buf.len().min(2048);
+        buf[..len].copy_from_slice(&data[..len]);
+        Ok(len)
+    }
+}
+
+fn parse_log_write_offset(path: &Path) -> i64 {
+    let log_path = path.with_extension("log");
+    let Ok(text) = fs::read_to_string(&log_path) else { return 0 };
+    // Redumper log contains an unambiguous "disc write offset: -30" line.
+    for line in text.lines() {
+        if let Some(pos) = line.find("disc write offset:") {
+            let after = line[pos + 18..].trim();
+            if let Some(num_str) = after.split_whitespace().next() {
+                if let Ok(n) = num_str.trim_end_matches(',').parse::<i64>() {
+                    return n;
+                }
+            }
+        }
+    }
+    0
+}
+
+fn parse_scram_for_data_track(path: &Path) -> DataTrack {
+    let write_offset_samples = parse_log_write_offset(path);
+    // file_offset = (track_lba - LBA_START) * CD_DATA_SIZE + write_offset * CD_SAMPLE_SIZE
+    // track_lba = 0 for track 1; CD_SAMPLE_SIZE = 4 bytes
+    let nominal = (-SCRAM_LBA_START) as i64 * RAW_SECTOR_SIZE as i64;
+    let track_offset = (nominal + write_offset_samples * 4).max(0) as u64;
+    DataTrack {
+        bin_path: path.to_path_buf(),
+        track_offset,
+        user_data_offset: 16, // MODE1/2352; CDi (MODE2 offset=24) checked separately
+        stride: RAW_SECTOR_SIZE,
+        lba_offset: 0,
+        descramble: true,
+        sector_count: 0,
+    }
+}
+
+fn detect_filesystems_scram(path: &Path) -> Vec<String> {
+    let track = parse_scram_for_data_track(path);
+    detect_filesystems_in_bin(&track.bin_path, track.track_offset, track.user_data_offset, track.lba_offset, track.descramble)
+}
+
+fn detect_filesystems_redumper_dvd(path: &Path) -> Vec<String> {
+    let Ok(file) = File::open(path) else { return vec!["ISO 9660".to_string()] };
+    let mut reader = SdramReader { file };
+    let mut buf = [0u8; 2048];
+    if reader.read_at(&mut buf, 16).is_err() { return vec!["ISO 9660".to_string()] }
+    if buf[0] != 1 || &buf[1..6] != b"CD001" { return vec!["ISO 9660".to_string()] }
+    let mut result = vec!["ISO 9660".to_string()];
+    for lba in 17u64..32 {
+        if reader.read_at(&mut buf, lba).is_err() { break; }
+        match buf[0] {
+            0xFF => break,
+            0x02 => {
+                let esc = &buf[88..120];
+                if esc.starts_with(b"%/@") || esc.starts_with(b"%/C") || esc.starts_with(b"%/E") {
+                    result.push("Joliet".to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+    result
+}
+
+fn detect_filesystems_redumper_bd(path: &Path) -> Vec<String> {
+    let Ok(file) = File::open(path) else { return vec!["ISO 9660".to_string()] };
+    let mut reader = SbramReader { file, lba_base: 0 };
+    let mut buf = [0u8; 2048];
+    if reader.read_at(&mut buf, 16).is_err() { return vec!["ISO 9660".to_string()] }
+    if buf[0] != 1 || &buf[1..6] != b"CD001" { return vec!["ISO 9660".to_string()] }
+    let mut result = vec!["ISO 9660".to_string()];
+    for lba in 17u64..32 {
+        if reader.read_at(&mut buf, lba).is_err() { break; }
+        match buf[0] {
+            0xFF => break,
+            0x02 => {
+                let esc = &buf[88..120];
+                if esc.starts_with(b"%/@") || esc.starts_with(b"%/C") || esc.starts_with(b"%/E") {
+                    result.push("Joliet".to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+    result
 }
 
 // ── BlindWrite 5/6 (.b5t/.b6t) support ──────────────────────────────────────
@@ -4728,7 +5254,11 @@ fn open_xdvdfs_chd(path: &Path) -> Result<xdvdfs_filesystem::XDVDFSFs<ChdReader<
 
 fn open_iso_fs(track: &DataTrack) -> Result<ISO9660<MultiTrackBinReader>, String> {
     let bin = File::open(&track.bin_path).map_err(|e| format!("Cannot open: {e}"))?;
-    let reader = MultiTrackBinReader::single(bin, track.track_offset, track.user_data_offset, track.stride, track.lba_offset);
+    let reader = if track.descramble {
+        MultiTrackBinReader::single_descrambled(bin, track.track_offset, track.user_data_offset, track.stride, track.lba_offset)
+    } else {
+        MultiTrackBinReader::single(bin, track.track_offset, track.user_data_offset, track.stride, track.lba_offset)
+    };
     ISO9660::new(reader).map_err(|e| format!("Invalid disc image: {e}"))
 }
 
@@ -4753,6 +5283,7 @@ fn open_iso_fs_for_cue(cue_path: &Path) -> Result<ISO9660<MultiTrackBinReader>, 
                 lba_offset: dt.lba_offset,
                 start_lba: dt.lba_offset,
                 sector_count: dt.sector_count,
+                descramble: false,
             });
         }
         let reader = MultiTrackBinReader { tracks: track_files, root_idx: 0, multi_bin: true };
@@ -4869,10 +5400,47 @@ fn list_disc_contents(image_path: String, dir_path: String, filesystem: Option<S
     } else if lower.ends_with(".wbfs") {
         with_wbfs_gcm!(Path::new(path), fs, fs.list_directory(&dir_path))
     } else if lower.ends_with(".wux") || lower.ends_with(".wud") {
-        let (fst, _, _) = open_wiiu_si_fst(Path::new(path))?;
-        wiiu_fst_list_dir(&fst, &dir_path)
-    } else if lower.ends_with(".sdram") || lower.ends_with(".sbram") {
-        Err("Redumper raw dumps require EFM/EDC decoding; browsing not yet supported".to_string())
+        let p = Path::new(path);
+        let norm = dir_path.trim_start_matches('/');
+        if norm.is_empty() {
+            Ok(vec![
+                DiscEntry { name: "SI".to_string(), is_dir: true, lba: 0, size: 0, size_bytes: 0, modified: String::new() },
+                DiscEntry { name: "GM".to_string(), is_dir: true, lba: 0, size: 0, size_bytes: 0, modified: String::new() },
+            ])
+        } else if norm == "SI" || norm.starts_with("SI/") {
+            let inner = norm.strip_prefix("SI").unwrap();
+            let inner = if inner.is_empty() { "" } else { inner };
+            let (fst, _, _) = open_wiiu_si_fst(p)?;
+            wiiu_fst_list_dir(&fst, inner)
+        } else if norm == "GM" || norm.starts_with("GM/") {
+            let inner = norm.strip_prefix("GM").unwrap();
+            let inner = if inner.is_empty() { "" } else { inner };
+            let (fst, _, _) = open_wiiu_gm_fst(p)?;
+            wiiu_fst_list_dir(&fst, inner)
+        } else {
+            Err(format!("WiiU: unknown partition path: {dir_path}"))
+        }
+    } else if lower.ends_with(".scram") {
+        let track = parse_scram_for_data_track(Path::new(path));
+        if cdi_filesystem::is_cdi_disc(&track.bin_path, track.track_offset, track.user_data_offset, track.lba_offset, track.descramble) {
+            open_cdi_fs(&track)?.list_directory(&dir_path)
+        } else if pce_filesystem::is_pce_disc(&track.bin_path, track.track_offset, track.user_data_offset) {
+            open_pce_fs(&track)?.list_directory(&dir_path)
+        } else if threedo_filesystem::is_threedo_disc(&track.bin_path, track.track_offset, track.user_data_offset) {
+            open_threedo_fs(&track)?.list_directory(&dir_path)
+        } else if fs_matches_udf(&filesystem) && udf_filesystem::is_udf_disc(&track.bin_path, track.track_offset, track.user_data_offset) {
+            open_udf_fs(&track)?.list_directory(&dir_path)
+        } else if fs_matches(&filesystem, "HFS") && hfs_filesystem::is_hfs_disc(&track.bin_path, track.track_offset, track.user_data_offset) {
+            open_hfs_fs(&track)?.list_directory(&dir_path)
+        } else {
+            collect_entries(&open_iso_fs(&track)?, &dir_path)
+        }
+    } else if lower.ends_with(".sdram") {
+        let file = File::open(path).map_err(|e| format!("Cannot open: {e}"))?;
+        collect_entries(&ISO9660::new(SdramReader { file }).map_err(|e| format!("Invalid SDRAM image: {e}"))?, &dir_path)
+    } else if lower.ends_with(".sbram") {
+        let file = File::open(path).map_err(|e| format!("Cannot open: {e}"))?;
+        collect_entries(&ISO9660::new(SbramReader { file, lba_base: 0 }).map_err(|e| format!("Invalid SBRAM image: {e}"))?, &dir_path)
     } else if lower.ends_with(".mdx") {
         let path_obj = Path::new(path);
         let track = parse_mdx_as_data_track(path_obj);
@@ -5011,10 +5579,44 @@ fn save_file(image_path: String, file_path: String, dest_path: String, filesyste
     } else if lower.ends_with(".wbfs") {
         with_wbfs_gcm!(Path::new(path), fs, fs.extract_file(&file_path, &dest_path))
     } else if lower.ends_with(".wux") || lower.ends_with(".wud") {
-        let (fst, mut reader, key) = open_wiiu_si_fst(Path::new(path))?;
-        wiiu_fst_extract_file(&fst, &mut reader, &file_path, &dest_path, key.as_ref())
-    } else if lower.ends_with(".sdram") || lower.ends_with(".sbram") {
-        Err("Redumper raw dumps require EFM/EDC decoding; browsing not yet supported".to_string())
+        let p = Path::new(path);
+        let norm = file_path.trim_start_matches('/');
+        if norm == "GM" || norm.starts_with("GM/") {
+            let inner = norm.strip_prefix("GM").unwrap();
+            let inner = if inner.is_empty() { "".to_string() } else { inner.to_string() };
+            let (fst, mut reader, key) = open_wiiu_gm_fst(p)?;
+            wiiu_gm_fst_extract_file(&fst, &mut reader, &inner, &dest_path, &key)
+        } else {
+            let inner = if norm == "SI" || norm.starts_with("SI/") {
+                let s = norm.strip_prefix("SI").unwrap();
+                if s.is_empty() { "".to_string() } else { s.to_string() }
+            } else {
+                file_path.clone()
+            };
+            let (fst, mut reader, key) = open_wiiu_si_fst(p)?;
+            wiiu_fst_extract_file(&fst, &mut reader, &inner, &dest_path, key.as_ref())
+        }
+    } else if lower.ends_with(".scram") {
+        let track = parse_scram_for_data_track(Path::new(path));
+        if cdi_filesystem::is_cdi_disc(&track.bin_path, track.track_offset, track.user_data_offset, track.lba_offset, track.descramble) {
+            open_cdi_fs(&track)?.extract_file(&file_path, &dest_path)
+        } else if pce_filesystem::is_pce_disc(&track.bin_path, track.track_offset, track.user_data_offset) {
+            open_pce_fs(&track)?.extract_file(&file_path, &dest_path)
+        } else if threedo_filesystem::is_threedo_disc(&track.bin_path, track.track_offset, track.user_data_offset) {
+            open_threedo_fs(&track)?.extract_file(&file_path, &dest_path)
+        } else if udf_filesystem::is_udf_disc(&track.bin_path, track.track_offset, track.user_data_offset) {
+            open_udf_fs(&track)?.extract_file(&file_path, &dest_path)
+        } else if hfs_filesystem::is_hfs_disc(&track.bin_path, track.track_offset, track.user_data_offset) {
+            open_hfs_fs(&track)?.extract_file(&file_path, &dest_path)
+        } else {
+            extract_file_from_fs(&open_iso_fs(&track)?, &file_path, &dest_path)
+        }
+    } else if lower.ends_with(".sdram") {
+        let file = File::open(path).map_err(|e| format!("Cannot open: {e}"))?;
+        extract_file_from_fs(&ISO9660::new(SdramReader { file }).map_err(|e| format!("Invalid SDRAM image: {e}"))?, &file_path, &dest_path)
+    } else if lower.ends_with(".sbram") {
+        let file = File::open(path).map_err(|e| format!("Cannot open: {e}"))?;
+        extract_file_from_fs(&ISO9660::new(SbramReader { file, lba_base: 0 }).map_err(|e| format!("Invalid SBRAM image: {e}"))?, &file_path, &dest_path)
     } else if lower.ends_with(".mdx") {
         let path_obj = Path::new(path);
         let track = parse_mdx_as_data_track(path_obj);
@@ -5154,10 +5756,44 @@ fn save_directory(image_path: String, dir_path: String, dest_path: String, files
     } else if lower.ends_with(".wbfs") {
         with_wbfs_gcm!(Path::new(path), fs, fs.extract_directory(&dir_path, &dest_path))
     } else if lower.ends_with(".wux") || lower.ends_with(".wud") {
-        let (fst, mut reader, key) = open_wiiu_si_fst(Path::new(path))?;
-        wiiu_fst_extract_dir(&fst, &mut reader, &dir_path, &dest_path, key.as_ref())
-    } else if lower.ends_with(".sdram") || lower.ends_with(".sbram") {
-        Err("Redumper raw dumps require EFM/EDC decoding; browsing not yet supported".to_string())
+        let p = Path::new(path);
+        let norm = dir_path.trim_start_matches('/');
+        if norm == "GM" || norm.starts_with("GM/") {
+            let inner = norm.strip_prefix("GM").unwrap();
+            let inner = if inner.is_empty() { "".to_string() } else { inner.to_string() };
+            let (fst, mut reader, key) = open_wiiu_gm_fst(p)?;
+            wiiu_gm_fst_extract_dir(&fst, &mut reader, &inner, &dest_path, &key)
+        } else {
+            let inner = if norm == "SI" || norm.starts_with("SI/") {
+                let s = norm.strip_prefix("SI").unwrap();
+                if s.is_empty() { "".to_string() } else { s.to_string() }
+            } else {
+                dir_path.clone()
+            };
+            let (fst, mut reader, key) = open_wiiu_si_fst(p)?;
+            wiiu_fst_extract_dir(&fst, &mut reader, &inner, &dest_path, key.as_ref())
+        }
+    } else if lower.ends_with(".scram") {
+        let track = parse_scram_for_data_track(Path::new(path));
+        if cdi_filesystem::is_cdi_disc(&track.bin_path, track.track_offset, track.user_data_offset, track.lba_offset, track.descramble) {
+            open_cdi_fs(&track)?.extract_directory(&dir_path, &dest_path)
+        } else if pce_filesystem::is_pce_disc(&track.bin_path, track.track_offset, track.user_data_offset) {
+            open_pce_fs(&track)?.extract_directory(&dir_path, &dest_path)
+        } else if threedo_filesystem::is_threedo_disc(&track.bin_path, track.track_offset, track.user_data_offset) {
+            open_threedo_fs(&track)?.extract_directory(&dir_path, &dest_path)
+        } else if udf_filesystem::is_udf_disc(&track.bin_path, track.track_offset, track.user_data_offset) {
+            open_udf_fs(&track)?.extract_directory(&dir_path, &dest_path)
+        } else if hfs_filesystem::is_hfs_disc(&track.bin_path, track.track_offset, track.user_data_offset) {
+            open_hfs_fs(&track)?.extract_directory(&dir_path, &dest_path)
+        } else {
+            extract_dir_from_fs(&open_iso_fs(&track)?, &dir_path, &dest_path)
+        }
+    } else if lower.ends_with(".sdram") {
+        let file = File::open(path).map_err(|e| format!("Cannot open: {e}"))?;
+        extract_dir_from_fs(&ISO9660::new(SdramReader { file }).map_err(|e| format!("Invalid SDRAM image: {e}"))?, &dir_path, &dest_path)
+    } else if lower.ends_with(".sbram") {
+        let file = File::open(path).map_err(|e| format!("Cannot open: {e}"))?;
+        extract_dir_from_fs(&ISO9660::new(SbramReader { file, lba_base: 0 }).map_err(|e| format!("Invalid SBRAM image: {e}"))?, &dir_path, &dest_path)
     } else if lower.ends_with(".mdx") {
         let path_obj = Path::new(path);
         let track = parse_mdx_as_data_track(path_obj);

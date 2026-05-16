@@ -11,7 +11,7 @@
 //   0x006:       Disc number
 //   0x007:       Revision
 //   0x018-0x01B: Wii magic (0x5D1C9EA3; 0x00000000 on GameCube)
-//   0x01C-0x01F: DVD magic (0xC2339F3D; present on both)
+//   0x01C-0x01F: DVD magic (0xC2339F3D; present on GameCube discs, zero on Wii)
 //   0x020-0x3FF: Game title (null-terminated ASCII, up to 992 bytes)
 //   0x420-0x423: Main DOL offset (u32 BE, direct byte offset)
 //   0x424-0x427: FST offset (u32 BE, direct byte offset from disc start)
@@ -34,6 +34,8 @@ use crate::DiscEntry;
 
 const DVD_MAGIC: u32 = 0xC233_9F3D;
 const WII_MAGIC: u32 = 0x5D1C_9EA3;
+// System Area magic: 0xC3F81A8E at offset 0x4FFFC (present on both GCN and Wii).
+// Could be used to validate a disc image is complete, but costs a 320 KB seek.
 
 const HDR_WII_MAGIC_OFF: usize = 0x18;
 const HDR_DVD_MAGIC_OFF: usize = 0x1C;

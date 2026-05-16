@@ -181,6 +181,7 @@ function App() {
   const [activeFilesystem, setActiveFilesystem] = useState<string>("");
   const [sidebarPath, setSidebarPath] = useState<string>("");
   const [error, setError] = useState<string | null>(null);
+  const [warn, setWarn] = useState<string | null>(null);
   const [statusText, setStatusText] = useState("No disc loaded");
   const [mountedDevice, setMountedDevice] = useState<string | null>(null);
   const [physicalDiscActive, setPhysicalDiscActive] = useState(false);
@@ -490,6 +491,12 @@ function App() {
     setSourceImagePath(path);
     setImageName(name);
     setError(null);
+    const lowerName = name.toLowerCase();
+    if ((lowerName.endsWith(".wux") || lowerName.endsWith(".wud")) && !wiiuKeyPath) {
+      setWarn("No Wii U common key set — encrypted disc content will not be accessible. Add your key file in Settings (⚙).");
+    } else {
+      setWarn(null);
+    }
     setEmptyDriveName(null);
     setMountedDevice(null);
     setPhysicalDiscActive(false);
@@ -607,7 +614,7 @@ function App() {
 
   async function openImage() {
     const selected = await open({
-      filters: [{ name: "Disc Images", extensions: ["iso", "img", "chd", "cue", "mds", "mdx", "nrg", "ccd", "cdi", "gdi", "toc", "b5t", "b6t", "bwt", "c2d", "pdi", "gi", "daa", "cso", "ciso", "ecm", "wbfs", "wux", "wud", "sdram", "sbram", "aif", "cif", "uif", "skeleton", "zst"] }],
+      filters: [{ name: "Disc Images", extensions: ["iso", "img", "chd", "cue", "mds", "mdx", "nrg", "ccd", "cdi", "gdi", "toc", "b5t", "b6t", "bwt", "c2d", "pdi", "gi", "daa", "cso", "ciso", "ecm", "wbfs", "wux", "wud", "scram", "sdram", "sbram", "aif", "cif", "uif", "skeleton", "zst"] }],
     });
     if (!selected) return;
     await openImageAtPath(selected as string);
@@ -618,7 +625,7 @@ function App() {
     getCurrentWebview().onDragDropEvent((event) => {
       if (event.payload.type === "drop") {
         setIsDragOver(false);
-        const supported = ["iso", "img", "chd", "cue", "mds", "mdx", "nrg", "ccd", "cdi", "gdi", "toc", "b5t", "b6t", "bwt", "c2d", "pdi", "gi", "daa", "cso", "ciso", "ecm", "wbfs", "wux", "wud", "sdram", "sbram", "aif", "cif", "uif", "skeleton", "skeleton.zst", "iso.zst", "img.zst"];
+        const supported = ["iso", "img", "chd", "cue", "mds", "mdx", "nrg", "ccd", "cdi", "gdi", "toc", "b5t", "b6t", "bwt", "c2d", "pdi", "gi", "daa", "cso", "ciso", "ecm", "wbfs", "wux", "wud", "scram", "sdram", "sbram", "aif", "cif", "uif", "skeleton", "skeleton.zst", "iso.zst", "img.zst"];
         const path = event.payload.paths.find((p) =>
           supported.some((ext) => p.toLowerCase().endsWith(`.${ext}`))
         );
@@ -1198,7 +1205,11 @@ function App() {
               Update Available — v{updateVersion}
             </a>
           )}
-          <button ref={settingsGearRef} className={`btn-settings${showSettings ? " btn-settings--open" : ""}`} title="Settings" onClick={() => setShowSettings(s => !s)}>⚙</button>
+          <button ref={settingsGearRef} className={`btn-settings${showSettings ? " btn-settings--open" : ""}`} title="Settings" onClick={() => setShowSettings(s => !s)}>
+            <svg viewBox="0 0 24 24" width="24" height="24" fill="currentColor">
+              <path fillRule="evenodd" d="M10.25,4.71L10.36,1.63L13.64,1.63L13.75,4.71A7.5,7.5,0,0,1,15.92,5.61L18.17,3.51L20.5,5.83L18.4,8.08A7.5,7.5,0,0,1,19.29,10.25L22.37,10.36L22.37,13.64L19.29,13.75A7.5,7.5,0,0,1,18.4,15.92L20.5,18.17L18.17,20.5L15.92,18.4A7.5,7.5,0,0,1,13.75,19.29L13.64,22.37L10.36,22.37L10.25,19.29A7.5,7.5,0,0,1,8.08,18.4L5.83,20.5L3.51,18.17L5.61,15.92A7.5,7.5,0,0,1,4.71,13.75L1.63,13.64L1.63,10.36L4.71,10.25A7.5,7.5,0,0,1,5.61,8.08L3.51,5.83L5.83,3.51L8.08,5.61A7.5,7.5,0,0,1,10.25,4.71ZM15.5,12A3.5,3.5,0,0,0,8.5,12A3.5,3.5,0,0,0,15.5,12Z" />
+            </svg>
+          </button>
         </div>
       </div>
       {showSettings && (
@@ -1208,6 +1219,17 @@ function App() {
             <button className="btn-open btn-open-secondary settings-path-btn" onClick={pickDownloadLocation}>
               {defaultDownloadPath || "Not set — click to choose"}
             </button>
+          </div>
+          <div className="settings-row">
+            <span className="settings-label">Theme</span>
+            <div className="settings-radio-group">
+              {(["system", "light", "dark"] as const).map(t => (
+                <label key={t} className="settings-radio">
+                  <input type="radio" name="theme" value={t} checked={theme === t} onChange={() => setTheme(t)} />
+                  {t.charAt(0).toUpperCase() + t.slice(1)}
+                </label>
+              ))}
+            </div>
           </div>
           <div className="settings-row">
             <span className="settings-label">Save Audio (PCM) as</span>
@@ -1251,17 +1273,6 @@ function App() {
               {redumperVersion && (
                 <span className="settings-hint">{redumperVersion}</span>
               )}
-            </div>
-          </div>
-          <div className="settings-row">
-            <span className="settings-label">Theme</span>
-            <div className="settings-radio-group">
-              {(["system", "light", "dark"] as const).map(t => (
-                <label key={t} className="settings-radio">
-                  <input type="radio" name="theme" value={t} checked={theme === t} onChange={() => setTheme(t)} />
-                  {t.charAt(0).toUpperCase() + t.slice(1)}
-                </label>
-              ))}
             </div>
           </div>
           <div className="settings-row">
@@ -1568,6 +1579,7 @@ underlying format specifications.`}</pre>
         )}
 
         <div className="content">
+          {warn && <div className="warn">{warn}</div>}
           {error && <div className="error">{error}</div>}
 
           {!imagePath && viewMode !== "empty-drive" && (
@@ -1658,7 +1670,7 @@ underlying format specifications.`}</pre>
         <span className="statusbar-left">{statusText}</span>
         <a className="statusbar-brand" href="https://sites.google.com/view/whateverindustries/home" target="_blank" rel="noreferrer">whatev.indus</a>
         <span className="statusbar-right">
-          <button className="statusbar-version" onClick={checkForUpdate} title="Check for updates">v0.3.3</button>
+          <button className="statusbar-version" onClick={checkForUpdate} title="Check for updates">v0.9.0</button>
         </span>
       </div>
     </div>

@@ -336,6 +336,7 @@ function App() {
       const path = file as string;
       setWiiuKeyPath(path);
       invoke("set_wiiu_key_path", { path });
+      setWarn(w => w?.includes("Wii U common key") ? null : w);
     }
   }
 
@@ -1647,7 +1648,7 @@ underlying format specifications.`}</pre>
                           <span className="entry-icon">{entry.is_dir ? "📁" : "📄"}</span>
                           {entry.name}
                         </td>
-                        <td className="col-lba">{entry.lba}</td>
+                        <td className="col-lba">{entry.is_dir && entry.lba === 0 ? "—" : entry.lba}</td>
                         <td className="col-size">{entry.size_bytes > 0 ? entry.size_bytes.toLocaleString() : "—"}</td>
                         <td className="col-modified">{entry.modified}</td>
                         <td className="col-save">

@@ -254,14 +254,15 @@ body {
 }
 
 .btn-dump {
-  padding: 4px 12px;
+  padding: 6px 12px;
   background: var(--accent);
   color: #fff;
   border: none;
   border-radius: 3px;
   cursor: pointer;
-  font-size: 12px;
+  font-size: 13px;
   font-family: var(--font);
+  line-height: 1;
 }
 .btn-dump:hover:not(:disabled) { background: var(--accent-hover); }
 .btn-dump:disabled { opacity: 0.35; cursor: default; }
@@ -275,6 +276,7 @@ body {
   cursor: pointer;
   font-size: 13px;
   font-family: var(--font);
+  line-height: 1;
 }
 
 .btn-icon:hover:not(:disabled) { background: var(--accent-hover); }
